@@ -9,6 +9,7 @@ This module contains passes for the compilation pipeline:
 """
 
 from .loop_unroll import LoopUnrollPass
+from .dce import DCEPass
 from .cse import CSEPass
 from .lowering import HIRToLIRPass
 from .phi_elimination import PhiEliminationPass
@@ -16,6 +17,7 @@ from .codegen import LIRToVLIWPass
 
 __all__ = [
     'LoopUnrollPass',
+    'DCEPass',
     'CSEPass',
     'HIRToLIRPass',
     'PhiEliminationPass',
