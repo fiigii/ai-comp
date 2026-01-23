@@ -13,6 +13,7 @@ from .dce import DCEPass
 from .cse import CSEPass
 from .simplify import SimplifyPass
 from .lowering import HIRToLIRPass
+from .simplify_cfg import SimplifyCFGPass
 from .phi_elimination import PhiEliminationPass
 from .codegen import LIRToVLIWPass
 
@@ -22,6 +23,7 @@ __all__ = [
     'CSEPass',
     'SimplifyPass',
     'HIRToLIRPass',
+    'SimplifyCFGPass',
     'PhiEliminationPass',
     'LIRToVLIWPass',
 ]

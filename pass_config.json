@@ -23,6 +23,15 @@
     "cse": {
       "enabled": true,
       "options": {}
+    },
+    "simplify-cfg": {
+      "enabled": true,
+      "options": {
+        "remove_unreachable": true,
+        "thread_trampolines": true,
+        "merge_blocks": true,
+        "simplify_cond_jump": true
+      }
     }
   }
 }
