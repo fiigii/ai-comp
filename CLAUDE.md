@@ -62,10 +62,45 @@ Header (words 0-6): rounds, n_nodes, batch_size, forest_height, forest_values_p,
 Arrays: forest_values[], inp_indices[], inp_values[]
 ```
 
+## Testing
+
+### Test Commands
+
+```bash
+# Run all IR compiler tests (correctness + regression tests)
+python3 -m pytest tests/test_ir.py -v
+
+# Run submission tests (validates correctness and shows cycle count)
+python3 tests/submission_tests.py
+
+# Run specific test class
+python3 -m pytest tests/test_ir.py::TestCompilerRegressions -v
+
+# Run with CLI flags
+python3 perf_takehome.py --trace --rounds 4 --batch-size 16
+```
+
+### Test Organization (tests/test_ir.py)
+
+- **TestIRCompiler**: End-to-end kernel correctness tests (small/medium/full sizes)
+- **TestIRCompilerSimplePrograms**: Unit tests for individual IR features (arithmetic, loops, if/else, select, bitwise ops)
+- **TestCompilerRegressions**: Regression tests for specific compiler bugs:
+  - `test_const_in_both_if_branches`: Constants used in both if/else branches
+  - `test_phi_swap_*`: Parallel copy semantics for swaps/rotations
+  - `test_no_explicit_zero_constant`: Programs without const 0
+  - `test_const_after_zero_iteration_loop`: Constants after 0-iteration loops
+
+### Adding Tests
+
+When fixing compiler bugs, always add a regression test that:
+1. Demonstrates the bug (would fail before the fix)
+2. Verifies the fix works correctly
+3. Prevents future regressions
+
 ## Validation
 
 Always validate submissions with:
 ```bash
 git diff origin/main tests/  # Must be empty
-python tests/submission_tests.py  # Use this cycle count
+python3 tests/submission_tests.py  # Use this cycle count
 ```
