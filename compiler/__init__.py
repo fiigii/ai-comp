@@ -38,9 +38,17 @@ from .lir import (
 from .pass_manager import (
     PassConfig,
     PassMetrics,
+    CompilerPass,
     Pass,
+    HIRPass,
+    LoweringPass,
+    LIRPass,
+    CodegenPass,
     PassManager,
+    CompilerPipeline,
     count_statements,
+    count_lir_instructions,
+    count_lir_phis,
 )
 
 # SSA utilities
@@ -58,7 +66,7 @@ from .compile import compile_hir_to_vliw
 from .printing import print_hir, print_lir, print_vliw
 
 # Passes
-from .passes.loop_unroll import LoopUnrollPass
+from .passes import LoopUnrollPass, HIRToLIRPass, PhiEliminationPass, LIRToVLIWPass
 
 __all__ = [
     # HIR
@@ -69,7 +77,9 @@ __all__ = [
     # LIR
     'LIROpcode', 'LIRInst', 'Phi', 'BasicBlock', 'LIRFunction',
     # Pass infrastructure
-    'PassConfig', 'PassMetrics', 'Pass', 'PassManager', 'count_statements',
+    'PassConfig', 'PassMetrics', 'CompilerPass', 'Pass', 'HIRPass',
+    'LoweringPass', 'LIRPass', 'CodegenPass', 'PassManager', 'CompilerPipeline',
+    'count_statements', 'count_lir_instructions', 'count_lir_phis',
     # SSA utilities
     'SSARenumberContext',
     # Compilation
@@ -77,5 +87,5 @@ __all__ = [
     # Printing
     'print_hir', 'print_lir', 'print_vliw',
     # Passes
-    'LoopUnrollPass',
+    'LoopUnrollPass', 'HIRToLIRPass', 'PhiEliminationPass', 'LIRToVLIWPass',
 ]
