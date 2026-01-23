@@ -96,7 +96,8 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        use_ir: bool = True, print_after_all: bool = False, pass_config: str = None
+        use_ir: bool = True, print_after_all: bool = False, print_metrics: bool = False,
+        pass_config: str = None
     ):
         """
         Build kernel instructions.
@@ -105,11 +106,12 @@ class KernelBuilder:
             use_ir: If True (default), use the IR compiler with control flow.
                     If False, use the original unrolled implementation.
             print_after_all: If True, print IR after each compilation pass (only for IR mode).
+            print_metrics: If True, print pass metrics and diagnostics (only for IR mode).
             pass_config: Optional path to JSON config file for pass options.
         """
         if use_ir:
             return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds,
-                                        print_after_all, pass_config)
+                                        print_after_all, print_metrics, pass_config)
         return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
 
     def _build_kernel_unrolled(
@@ -203,7 +205,7 @@ class KernelBuilder:
 
     def build_kernel_ir(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        print_after_all: bool = False, pass_config: str = None
+        print_after_all: bool = False, print_metrics: bool = False, pass_config: str = None
     ):
         """
         Build kernel using the IR compiler with control flow (loops).
@@ -211,8 +213,10 @@ class KernelBuilder:
 
         Args:
             print_after_all: If True, print IR after each compilation pass.
+            print_metrics: If True, print pass metrics and diagnostics.
             pass_config: Optional path to JSON config file for pass options.
         """
+        self._print_metrics = print_metrics  # Store for compile call
         self._pass_config = pass_config  # Store for compile call
         b = HIRBuilder()
 
@@ -318,7 +322,8 @@ class KernelBuilder:
         # Compile HIR -> LIR -> VLIW
         hir = b.build()
         self.instrs = compile_hir_to_vliw(hir, print_after_all=print_after_all,
-                                          config_path=self._pass_config)
+                                          config_path=self._pass_config,
+                                          print_metrics=self._print_metrics)
 
         # Note: scratch_debug won't be populated with IR compiler
         # For now, leave it empty (debug info not critical for correctness)
@@ -335,6 +340,7 @@ def do_kernel_test(
     prints: bool = False,
     print_vliw: bool = False,
     print_after_all: bool = False,
+    print_metrics: bool = False,
     use_ir: bool = True,
     pass_config: str = None,
 ):
@@ -346,7 +352,8 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
-                    use_ir=use_ir, print_after_all=print_after_all, pass_config=pass_config)
+                    use_ir=use_ir, print_after_all=print_after_all, print_metrics=print_metrics,
+                    pass_config=pass_config)
     if print_vliw:
         for i, instr in enumerate(kb.instrs):
             print(f"[{i:4d}] {json.dumps(instr)}")
@@ -441,7 +448,8 @@ if __name__ == "__main__":
     # Check if running with custom flags (not unittest flags)
     # Only route to argparse when a known custom flag is present
     custom_flags = {'--print-vliw', '--print-after-all', '--no-ir', '--trace',
-                    '--forest-height', '--rounds', '--batch-size', '--pass-config'}
+                    '--forest-height', '--rounds', '--batch-size', '--pass-config',
+                    '--print-metrics'}
     has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
 
     if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):
@@ -454,6 +462,8 @@ if __name__ == "__main__":
                             help="Print the final VLIW instructions")
         parser.add_argument("--print-after-all", action="store_true",
                             help="Print IR after each compilation pass")
+        parser.add_argument("--print-metrics", action="store_true",
+                            help="Print pass metrics and diagnostics")
         parser.add_argument("--no-ir", action="store_true",
                             help="Use the original unrolled kernel instead of IR")
         parser.add_argument("--trace", action="store_true",
@@ -475,6 +485,7 @@ if __name__ == "__main__":
             trace=args.trace,
             print_vliw=args.print_vliw,
             print_after_all=args.print_after_all,
+            print_metrics=args.print_metrics,
             use_ir=not args.no_ir,
             pass_config=args.pass_config,
         )
