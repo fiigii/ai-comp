@@ -144,8 +144,37 @@ class PassConfig:
     options: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class PassMetrics:
+    """Metrics collected by a pass during execution."""
+    ir_size_before: int = 0
+    ir_size_after: int = 0
+    ssa_count_before: int = 0
+    ssa_count_after: int = 0
+    custom: dict[str, Any] = field(default_factory=dict)
+    messages: list[str] = field(default_factory=list)
+
+
+def count_statements(hir: HIRFunction) -> int:
+    """Count total statements in HIR including nested structures."""
+    def count_in_body(body: list[Statement]) -> int:
+        total = 0
+        for stmt in body:
+            total += 1
+            if isinstance(stmt, ForLoop):
+                total += count_in_body(stmt.body)
+            elif isinstance(stmt, If):
+                total += count_in_body(stmt.then_body)
+                total += count_in_body(stmt.else_body)
+        return total
+    return count_in_body(hir.body)
+
+
 class Pass(ABC):
     """Base class for all HIR transformation passes."""
+
+    def __init__(self):
+        self._metrics: Optional[PassMetrics] = None
 
     @property
     @abstractmethod
@@ -158,6 +187,19 @@ class Pass(ABC):
         """Transform HIR and return new HIRFunction."""
         pass
 
+    def get_metrics(self) -> Optional[PassMetrics]:
+        """Return metrics from the last run, if collected."""
+        return self._metrics
+
+    def _init_metrics(self):
+        """Initialize metrics for a new run."""
+        self._metrics = PassMetrics()
+
+    def _add_metric_message(self, msg: str):
+        """Add a diagnostic message to metrics."""
+        if self._metrics:
+            self._metrics.messages.append(msg)
+
 
 @dataclass
 class PassManager:
@@ -165,6 +207,7 @@ class PassManager:
     passes: list[Pass] = field(default_factory=list)
     config: dict[str, PassConfig] = field(default_factory=dict)
     print_after_all: bool = False
+    print_metrics: bool = False
 
     def add_pass(self, p: Pass) -> None:
         """Register a pass."""
@@ -181,6 +224,39 @@ class PassManager:
                 options=opts.get("options", {})
             )
 
+    def _print_pass_metrics(self, p: Pass, cfg: PassConfig, before_size: int,
+                            before_ssa: int, hir: HIRFunction):
+        """Print metrics for a pass execution."""
+        after_size = count_statements(hir)
+        after_ssa = hir.num_ssa_values
+
+        print(f"\n=== Pass: {p.name} ===")
+        print(f"Config: {', '.join(f'{k}={v}' for k, v in cfg.options.items()) or '(default)'}")
+
+        # IR size change
+        if before_size > 0:
+            pct = ((after_size - before_size) / before_size) * 100
+            print(f"IR size: {before_size} -> {after_size} statements ({pct:+.0f}%)")
+        else:
+            print(f"IR size: {before_size} -> {after_size} statements")
+
+        # SSA count change
+        if before_ssa > 0:
+            pct = ((after_ssa - before_ssa) / before_ssa) * 100
+            print(f"SSA values: {before_ssa} -> {after_ssa} ({pct:+.0f}%)")
+        else:
+            print(f"SSA values: {before_ssa} -> {after_ssa}")
+
+        # Pass-specific metrics
+        metrics = p.get_metrics()
+        if metrics:
+            if metrics.custom:
+                print(f"Custom metrics: {metrics.custom}")
+            if metrics.messages:
+                print("Diagnostics:")
+                for msg in metrics.messages:
+                    print(f"  - {msg}")
+
     def run(self, hir: HIRFunction) -> HIRFunction:
         """Run all enabled passes in order."""
         if self.print_after_all:
@@ -190,8 +266,20 @@ class PassManager:
         for p in self.passes:
             cfg = self.config.get(p.name, PassConfig(name=p.name))
             if not cfg.enabled:
+                if self.print_metrics:
+                    print(f"\n=== Pass: {p.name} === (SKIPPED - disabled)")
                 continue
+
+            # Collect before metrics
+            before_size = count_statements(hir) if self.print_metrics else 0
+            before_ssa = hir.num_ssa_values if self.print_metrics else 0
+
             hir = p.run(hir, cfg)
+
+            # Print metrics
+            if self.print_metrics:
+                self._print_pass_metrics(p, cfg, before_size, before_ssa, hir)
+
             if self.print_after_all:
                 print(f"=== HIR (after {p.name}) ===")
                 print_hir(hir)
@@ -442,11 +530,25 @@ class LoopUnrollPass(Pass):
                         Loops with larger trip counts are skipped unless unroll_factor is set.
     """
 
+    def __init__(self):
+        super().__init__()
+        self._loops_processed = 0
+        self._loops_fully_unrolled = 0
+        self._loops_partially_unrolled = 0
+        self._loops_skipped = 0
+
     @property
     def name(self) -> str:
         return "loop-unroll"
 
     def run(self, hir: HIRFunction, config: PassConfig) -> HIRFunction:
+        # Initialize metrics
+        self._init_metrics()
+        self._loops_processed = 0
+        self._loops_fully_unrolled = 0
+        self._loops_partially_unrolled = 0
+        self._loops_skipped = 0
+
         unroll_factor = config.options.get("unroll_factor", None)  # None = full unroll
         # Very large default - fully unroll all static loops
         # If scratch space is exhausted, use a config file to set unroll_factor
@@ -457,6 +559,15 @@ class LoopUnrollPass(Pass):
 
         # Transform body recursively
         new_body = self._transform_statements(hir.body, unroll_factor, max_trip_count, ctx)
+
+        # Record custom metrics
+        if self._metrics:
+            self._metrics.custom = {
+                "loops_processed": self._loops_processed,
+                "fully_unrolled": self._loops_fully_unrolled,
+                "partially_unrolled": self._loops_partially_unrolled,
+                "skipped": self._loops_skipped,
+            }
 
         return HIRFunction(
             name=hir.name,
@@ -560,26 +671,43 @@ class LoopUnrollPass(Pass):
     def _unroll_loop(
         self, loop: ForLoop, factor: Optional[int], max_trip: int, ctx: SSARenumberContext
     ) -> list[Statement]:
-        """Unroll a single ForLoop if possible."""
+        """Unroll a single ForLoop if possible.
+
+        Uses bottom-up approach: transform inner loops first, then this loop.
+        """
+        self._loops_processed += 1
+
+        # FIRST: Transform the body (inner loops) before deciding about this loop
+        # This ensures inner loops are unrolled before outer loops (bottom-up)
+        transformed_body = self._transform_statements(loop.body, factor, max_trip, ctx)
+        transformed_yields = [self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields]
+
+        # Create a loop with the transformed body for potential use below
+        transformed_loop = ForLoop(
+            counter=loop.counter,
+            start=loop.start,
+            end=loop.end,
+            iter_args=loop.iter_args,
+            body_params=loop.body_params,
+            body=transformed_body,
+            yields=transformed_yields,
+            results=loop.results
+        )
+
         # Check if loop has static bounds
         if not isinstance(loop.start, Const) or not isinstance(loop.end, Const):
-            # Dynamic bounds - recurse into body but don't unroll
-            new_body = self._transform_statements(loop.body, factor, max_trip, ctx)
-            return [ForLoop(
-                counter=loop.counter,
-                start=loop.start,
-                end=loop.end,
-                iter_args=loop.iter_args,
-                body_params=loop.body_params,
-                body=new_body,
-                yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
-                results=loop.results
-            )]
+            # Dynamic bounds - can't unroll, return with transformed body
+            self._loops_skipped += 1
+            start_str = loop.start.value if isinstance(loop.start, Const) else "dynamic"
+            end_str = loop.end.value if isinstance(loop.end, Const) else "dynamic"
+            self._add_metric_message(f"Loop skipped: dynamic bounds (start={start_str}, end={end_str})")
+            return [transformed_loop]
 
         trip_count = loop.end.value - loop.start.value
 
         if trip_count <= 0:
             # Empty loop - just bind results to iter_args
+            self._add_metric_message(f"Loop eliminated: zero iterations (trip_count={trip_count})")
             for result_ssa, iter_arg in zip(loop.results, loop.iter_args):
                 ctx.bind_result(result_ssa.id, iter_arg)
             return []
@@ -588,41 +716,306 @@ class LoopUnrollPass(Pass):
         if factor is None:
             # Full unroll - but only if trip count is within limit
             if trip_count > max_trip:
-                # Too large for full unroll - just recurse into body
-                new_body = self._transform_statements(loop.body, factor, max_trip, ctx)
-                return [ForLoop(
-                    counter=loop.counter,
-                    start=loop.start,
-                    end=loop.end,
-                    iter_args=loop.iter_args,
-                    body_params=loop.body_params,
-                    body=new_body,
-                    yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
-                    results=loop.results
-                )]
+                # Too large for full unroll - return with transformed body
+                self._loops_skipped += 1
+                self._add_metric_message(f"Loop skipped: trip_count {trip_count} > max_trip_count {max_trip}")
+                return [transformed_loop]
             actual_factor = trip_count
         elif trip_count % factor != 0:
             # Factor doesn't divide evenly - skip unrolling this loop
-            new_body = self._transform_statements(loop.body, factor, max_trip, ctx)
-            return [ForLoop(
-                counter=loop.counter,
-                start=loop.start,
-                end=loop.end,
-                iter_args=loop.iter_args,
-                body_params=loop.body_params,
-                body=new_body,
-                yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
-                results=loop.results
-            )]
+            self._loops_skipped += 1
+            self._add_metric_message(f"Loop skipped: trip_count {trip_count} not divisible by factor {factor}")
+            return [transformed_loop]
         else:
             actual_factor = factor
 
-        # Fully unroll
+        # Fully unroll (using pre-transformed body)
         if actual_factor == trip_count:
-            return self._fully_unroll(loop, trip_count, ctx, factor, max_trip)
+            self._loops_fully_unrolled += 1
+            self._add_metric_message(f"Loop fully unrolled: trip_count={trip_count}")
+            return self._fully_unroll_pretransformed(transformed_loop, trip_count, ctx)
 
-        # Partial unroll - create loop with unrolled body
-        return self._partially_unroll(loop, actual_factor, ctx, factor, max_trip)
+        # Partial unroll (using pre-transformed body)
+        self._loops_partially_unrolled += 1
+        self._add_metric_message(f"Loop partially unrolled: trip_count={trip_count}, factor={actual_factor}")
+        return self._partially_unroll_pretransformed(transformed_loop, actual_factor, ctx)
+
+    def _fully_unroll_pretransformed(
+        self, loop: ForLoop, trip_count: int, ctx: SSARenumberContext
+    ) -> list[Statement]:
+        """Replace loop with trip_count copies of body.
+
+        The loop body is already transformed (inner loops already unrolled).
+        """
+        result = []
+
+        # Track current values for loop-carried variables
+        # Initially: current_params[i] = iter_args[i]
+        current_params = list(loop.iter_args)
+
+        for i in range(trip_count):
+            # Create remapping: counter -> const(start + i), body_params -> current_params
+            remap: dict[int, Operand] = {}
+
+            # Map counter to constant
+            counter_value = loop.start.value + i
+            counter_ssa = ctx.new_ssa(f"unroll_i{i}")
+            result.append(Op("const", counter_ssa, [Const(counter_value)], "load"))
+            remap[loop.counter.id] = counter_ssa
+
+            # Map body_params to current values
+            for param, current in zip(loop.body_params, current_params):
+                remap[param.id] = current
+
+            # Clone body with remapping (no recursion since body is already transformed)
+            cloned_body, new_yields = self._clone_body_no_recurse(
+                loop.body, loop.yields, remap, ctx
+            )
+            result.extend(cloned_body)
+
+            # Update current_params for next iteration
+            current_params = new_yields
+
+        # Bind results to final yields
+        for result_ssa, final_val in zip(loop.results, current_params):
+            ctx.bind_result(result_ssa.id, final_val)
+
+        return result
+
+    def _partially_unroll_pretransformed(
+        self, loop: ForLoop, factor: int, ctx: SSARenumberContext
+    ) -> list[Statement]:
+        """Create a new loop with factor copies of the body per iteration.
+
+        The loop body is already transformed (inner loops already unrolled).
+        """
+        trip_count = loop.end.value - loop.start.value
+        new_trip_count = trip_count // factor
+
+        # New loop SSA values
+        new_counter = ctx.new_ssa("unroll_i")
+        new_body_params = [ctx.new_ssa(f"unroll_param_{j}") for j in range(len(loop.body_params))]
+        new_results = [ctx.new_ssa(f"unroll_result_{j}") for j in range(len(loop.results))]
+
+        # Build unrolled body
+        unrolled_body: list[Statement] = []
+        current_params = list(new_body_params)
+
+        for j in range(factor):
+            remap: dict[int, Operand] = {}
+
+            # Compute counter for this unrolled iteration:
+            # original_counter = new_counter * factor + j + start
+            counter_ssa = ctx.new_ssa(f"iter_{j}_counter")
+
+            # First compute: new_counter * factor
+            if factor > 1:
+                scaled = ctx.new_ssa(f"scaled_{j}")
+                unrolled_body.append(Op("*", scaled, [new_counter, Const(factor)], "alu"))
+                # Then add offset: scaled + (start + j)
+                unrolled_body.append(Op("+", counter_ssa, [scaled, Const(loop.start.value + j)], "alu"))
+            else:
+                # factor == 1, just add start
+                unrolled_body.append(Op("+", counter_ssa, [new_counter, Const(loop.start.value)], "alu"))
+
+            remap[loop.counter.id] = counter_ssa
+
+            # Map body_params to current values
+            for param, current in zip(loop.body_params, current_params):
+                remap[param.id] = current
+
+            # Clone body with remapping (no recursion since body is already transformed)
+            cloned_body, new_yields = self._clone_body_no_recurse(
+                loop.body, loop.yields, remap, ctx
+            )
+            unrolled_body.extend(cloned_body)
+            current_params = new_yields
+
+        # Bind old results to new results so subsequent statements use the new ones
+        for old_result, new_result in zip(loop.results, new_results):
+            ctx.bind_result(old_result.id, new_result)
+
+        # Create new ForLoop with unrolled body
+        return [ForLoop(
+            counter=new_counter,
+            start=Const(0),
+            end=Const(new_trip_count),
+            iter_args=loop.iter_args,
+            body_params=new_body_params,
+            body=unrolled_body,
+            yields=current_params,
+            results=new_results
+        )]
+
+    def _clone_body_no_recurse(
+        self,
+        body: list[Statement],
+        yields: list[SSAValue],
+        remap: dict[int, Operand],
+        ctx: SSARenumberContext
+    ) -> tuple[list[Statement], list[SSAValue]]:
+        """Clone a body of statements without recursing into nested structures.
+
+        Unlike _clone_body_with_remap, this does not call _unroll_loop on nested
+        ForLoops because the body is already transformed.
+        """
+        cloned = []
+        for stmt in body:
+            cloned.extend(self._clone_stmt_no_recurse(stmt, remap, ctx))
+
+        # Remap yields
+        new_yields = [self._remap_operand(y, remap) for y in yields]
+        # Ensure yields are SSAValue (not Const)
+        final_yields = []
+        for y in new_yields:
+            if isinstance(y, SSAValue):
+                final_yields.append(y)
+            else:
+                # Const yield - need to create SSA for it
+                ssa = ctx.new_ssa("yield_const")
+                cloned.append(Op("const", ssa, [y], "load"))
+                final_yields.append(ssa)
+
+        return cloned, final_yields
+
+    def _clone_stmt_no_recurse(
+        self,
+        stmt: Statement,
+        remap: dict[int, Operand],
+        ctx: SSARenumberContext
+    ) -> list[Statement]:
+        """Clone a single statement without recursing into nested loop unrolling."""
+        if isinstance(stmt, Op):
+            new_operands = [self._remap_operand(op, remap) for op in stmt.operands]
+            if stmt.result:
+                new_result = ctx.new_ssa(stmt.result.name)
+                remap[stmt.result.id] = new_result
+            else:
+                new_result = None
+            return [Op(stmt.opcode, new_result, new_operands, stmt.engine)]
+
+        elif isinstance(stmt, ForLoop):
+            # Clone the ForLoop structure without recursing into unroll logic
+            new_counter = ctx.new_ssa(stmt.counter.name)
+            new_body_params = [ctx.new_ssa(p.name) for p in stmt.body_params]
+            new_results = [ctx.new_ssa(r.name) for r in stmt.results]
+
+            # Remap iter_args
+            new_iter_args = []
+            for arg in stmt.iter_args:
+                remapped = self._remap_operand(arg, remap)
+                if isinstance(remapped, SSAValue):
+                    new_iter_args.append(remapped)
+                else:
+                    # Create SSA for constant
+                    ssa = ctx.new_ssa("iter_arg_const")
+                    new_iter_args.append(ssa)
+
+            # Build inner remap for the loop body
+            inner_remap = dict(remap)
+            inner_remap[stmt.counter.id] = new_counter
+            for old_param, new_param in zip(stmt.body_params, new_body_params):
+                inner_remap[old_param.id] = new_param
+
+            # Clone body (no recurse into unroll)
+            cloned_body = []
+            for s in stmt.body:
+                cloned_body.extend(self._clone_stmt_no_recurse(s, inner_remap, ctx))
+
+            # Remap yields
+            new_yields = []
+            for y in stmt.yields:
+                remapped = self._remap_operand(y, inner_remap)
+                if isinstance(remapped, SSAValue):
+                    new_yields.append(remapped)
+                else:
+                    ssa = ctx.new_ssa("yield_const")
+                    cloned_body.append(Op("const", ssa, [remapped], "load"))
+                    new_yields.append(ssa)
+
+            # Remap start/end
+            new_start = self._remap_operand(stmt.start, remap) if isinstance(stmt.start, SSAValue) else stmt.start
+            new_end = self._remap_operand(stmt.end, remap) if isinstance(stmt.end, SSAValue) else stmt.end
+
+            new_loop = ForLoop(
+                counter=new_counter,
+                start=new_start,
+                end=new_end,
+                iter_args=new_iter_args,
+                body_params=new_body_params,
+                body=cloned_body,
+                yields=new_yields,
+                results=new_results
+            )
+
+            # Map old results to new results
+            for old_res, new_res in zip(stmt.results, new_results):
+                remap[old_res.id] = new_res
+
+            return [new_loop]
+
+        elif isinstance(stmt, If):
+            # Clone If statement
+            new_cond = self._remap_operand(stmt.cond, remap)
+            if not isinstance(new_cond, SSAValue):
+                # Create SSA for constant condition (unusual but handle it)
+                cond_ssa = ctx.new_ssa("cond_const")
+                new_cond = cond_ssa
+
+            # Clone branches
+            then_remap = dict(remap)
+            cloned_then = []
+            for s in stmt.then_body:
+                cloned_then.extend(self._clone_stmt_no_recurse(s, then_remap, ctx))
+
+            else_remap = dict(remap)
+            cloned_else = []
+            for s in stmt.else_body:
+                cloned_else.extend(self._clone_stmt_no_recurse(s, else_remap, ctx))
+
+            # Remap yields
+            new_then_yields = []
+            for y in stmt.then_yields:
+                remapped = self._remap_operand(y, then_remap)
+                if isinstance(remapped, SSAValue):
+                    new_then_yields.append(remapped)
+                else:
+                    ssa = ctx.new_ssa("then_yield_const")
+                    cloned_then.append(Op("const", ssa, [remapped], "load"))
+                    new_then_yields.append(ssa)
+
+            new_else_yields = []
+            for y in stmt.else_yields:
+                remapped = self._remap_operand(y, else_remap)
+                if isinstance(remapped, SSAValue):
+                    new_else_yields.append(remapped)
+                else:
+                    ssa = ctx.new_ssa("else_yield_const")
+                    cloned_else.append(Op("const", ssa, [remapped], "load"))
+                    new_else_yields.append(ssa)
+
+            # New results
+            new_results = [ctx.new_ssa(r.name) for r in stmt.results]
+            for old_res, new_res in zip(stmt.results, new_results):
+                remap[old_res.id] = new_res
+
+            return [If(
+                cond=new_cond,
+                then_body=cloned_then,
+                then_yields=new_then_yields,
+                else_body=cloned_else,
+                else_yields=new_else_yields,
+                results=new_results
+            )]
+
+        elif isinstance(stmt, Halt):
+            return [Halt()]
+
+        elif isinstance(stmt, Pause):
+            return [Pause()]
+
+        else:
+            return [stmt]
 
     def _fully_unroll(
         self, loop: ForLoop, trip_count: int, ctx: SSARenumberContext,
@@ -1695,7 +2088,8 @@ def print_vliw(bundles: list[dict]):
 def compile_hir_to_vliw(
     hir: HIRFunction,
     print_after_all: bool = False,
-    config_path: Optional[str] = None
+    config_path: Optional[str] = None,
+    print_metrics: bool = False
 ) -> list[dict]:
     """
     Full compilation from HIR to VLIW with optional debug printing.
@@ -1704,6 +2098,7 @@ def compile_hir_to_vliw(
         hir: The HIR function to compile
         print_after_all: If True, print IR after each compilation phase
         config_path: Optional path to JSON config file for pass options
+        print_metrics: If True, print pass metrics and diagnostics
     """
     if print_after_all:
         print("\n" + "=" * 60)
@@ -1712,7 +2107,7 @@ def compile_hir_to_vliw(
         print_hir(hir)
 
     # Phase 0: Run HIR optimization passes
-    pm = PassManager(print_after_all=print_after_all)
+    pm = PassManager(print_after_all=print_after_all, print_metrics=print_metrics)
     pm.add_pass(LoopUnrollPass())
 
     if config_path:
