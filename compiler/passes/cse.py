@@ -270,7 +270,8 @@ class CSEPass(Pass):
             body_params=loop.body_params,
             body=new_body,
             yields=new_yields,
-            results=loop.results
+            results=loop.results,
+            pragma_unroll=loop.pragma_unroll
         )
 
     def _transform_if(
@@ -416,7 +417,8 @@ class CSEPass(Pass):
                 body_params=stmt.body_params,
                 body=stmt.body,
                 yields=new_yields,
-                results=stmt.results
+                results=stmt.results,
+                pragma_unroll=stmt.pragma_unroll
             )
 
         elif isinstance(stmt, If):

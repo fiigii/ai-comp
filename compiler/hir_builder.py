@@ -117,13 +117,17 @@ class HIRBuilder:
         start: Operand,
         end: Operand,
         iter_args: list[SSAValue],
-        body_fn: Callable[[SSAValue, list[SSAValue]], list[SSAValue]]
+        body_fn: Callable[[SSAValue, list[SSAValue]], list[SSAValue]],
+        pragma_unroll: int = 0
     ) -> list[SSAValue]:
         """
         Build a for loop.
 
         body_fn receives (counter, body_params) and returns yield values.
         Returns the loop results (final values after loop exits).
+
+        Args:
+            pragma_unroll: Unroll pragma (0=full, 1=disabled, N>1=partial by factor N)
         """
         counter = self._new_ssa("i")
         body_params = [self._new_ssa(f"loop_param_{i}") for i in range(len(iter_args))]
@@ -148,6 +152,7 @@ class HIRBuilder:
             body=body,
             yields=yields,
             results=results,
+            pragma_unroll=pragma_unroll,
         )
         self._emit(loop)
         return results

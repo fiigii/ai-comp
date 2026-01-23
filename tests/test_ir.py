@@ -992,7 +992,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         print("Full unroll simple loop test passed!")
 
     def test_partial_unroll(self):
-        """Test partial unrolling with a specific factor."""
+        """Test partial unrolling with pragma_unroll."""
         from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, ForLoop, lower_to_lir, eliminate_phis, compile_to_vliw
@@ -1007,19 +1007,21 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
             new_s = b.add(s, i, "sum")
             return [new_s]
 
-        # Loop with 8 iterations
-        results = b.for_loop(start=Const(0), end=Const(8), iter_args=[init_sum], body_fn=body)
+        # Loop with 8 iterations, pragma_unroll=4 for partial unrolling
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(8),
+            iter_args=[init_sum],
+            body_fn=body,
+            pragma_unroll=4  # Partial unroll by factor 4
+        )
         b.store(addr, results[0])
 
         hir = b.build()
 
-        # Partial unroll with factor 4 (8/4 = 2 iterations remain)
+        # Run unroll pass (8/4 = 2 iterations remain)
         pm = PassManager()
         pm.add_pass(LoopUnrollPass())
-        pm.config["loop-unroll"] = PassConfig(
-            name="loop-unroll",
-            options={"unroll_factor": 4, "max_trip_count": 100}
-        )
         unrolled = pm.run(hir)
 
         # After partial unroll, there should still be a ForLoop with 2 iterations
@@ -1079,7 +1081,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         print("No unroll dynamic bounds test passed!")
 
     def test_skip_unroll_bad_factor(self):
-        """Test that unrolling is skipped when factor doesn't divide trip count."""
+        """Test that unrolling is skipped when pragma factor doesn't divide trip count."""
         from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, ForLoop
@@ -1094,22 +1096,24 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
             new_s = b.add(s, i, "sum")
             return [new_s]
 
-        # Loop with 10 iterations
-        results = b.for_loop(start=Const(0), end=Const(10), iter_args=[init_sum], body_fn=body)
+        # Loop with 10 iterations, pragma_unroll=3 (doesn't divide 10)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(10),
+            iter_args=[init_sum],
+            body_fn=body,
+            pragma_unroll=3  # 10 % 3 != 0, should skip unrolling
+        )
         b.store(addr, results[0])
 
         hir = b.build()
 
-        # Try partial unroll with factor 3 (10 % 3 != 0, should skip)
+        # Run unroll pass
         pm = PassManager()
         pm.add_pass(LoopUnrollPass())
-        pm.config["loop-unroll"] = PassConfig(
-            name="loop-unroll",
-            options={"unroll_factor": 3, "max_trip_count": 100}
-        )
         unrolled = pm.run(hir)
 
-        # Loop should still have 10 iterations (not unrolled)
+        # Loop should still have 10 iterations (not unrolled because 10 % 3 != 0)
         for_loops = [s for s in unrolled.body if isinstance(s, ForLoop)]
         self.assertEqual(len(for_loops), 1, "Loop should not be unrolled")
         loop = for_loops[0]
@@ -3414,6 +3418,286 @@ class TestDCEPass(unittest.TestCase):
         # Enabled should eliminate
         self.assertLess(count_statements(result_enabled), original_count)
         print("DCE config disable test passed!")
+
+
+class TestPragmaUnroll(unittest.TestCase):
+    """Tests for pragma_unroll loop directive."""
+
+    def _run_program(self, instrs, mem):
+        """Helper to run a compiled program."""
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    def _count_loops(self, hir):
+        """Count ForLoop statements in HIR."""
+        from compiler.hir import ForLoop
+        count = 0
+        def count_stmts(stmts):
+            nonlocal count
+            for stmt in stmts:
+                if isinstance(stmt, ForLoop):
+                    count += 1
+                    count_stmts(stmt.body)
+        count_stmts(hir.body)
+        return count
+
+    def test_pragma_unroll_disabled(self):
+        """Test that pragma_unroll=1 prevents unrolling."""
+        from compiler import HIRBuilder, PassManager, PassConfig, LoopUnrollPass, Const
+
+        b = HIRBuilder()
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        addr0 = b.const_load(0, "addr0")
+
+        init_val = b.const_load(0, "init_val")
+
+        def loop_body(i, params):
+            # Sum: val += 1
+            new_val = b.add(params[0], one, "new_val")
+            return [new_val]
+
+        # Loop with pragma_unroll=1 (disabled)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(4),
+            iter_args=[init_val],
+            body_fn=loop_body,
+            pragma_unroll=1  # Disable unrolling
+        )
+
+        b.store(addr0, results[0])
+        hir = b.build()
+
+        # Apply loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        result_hir = pm.run(hir)
+
+        # Loop should still exist (not unrolled)
+        loop_count = self._count_loops(result_hir)
+        self.assertEqual(loop_count, 1, "Loop with pragma_unroll=1 should not be unrolled")
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 4, "Loop result should be 4")
+
+        print("pragma_unroll=1 disabled test passed!")
+
+    def test_pragma_unroll_full(self):
+        """Test that pragma_unroll=0 causes full unroll."""
+        from compiler import HIRBuilder, PassManager, PassConfig, LoopUnrollPass, Const
+
+        b = HIRBuilder()
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        addr0 = b.const_load(0, "addr0")
+
+        init_val = b.const_load(0, "init_val")
+
+        def loop_body(i, params):
+            new_val = b.add(params[0], one, "new_val")
+            return [new_val]
+
+        # Loop with pragma_unroll=0 (full unroll, default)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(4),
+            iter_args=[init_val],
+            body_fn=loop_body,
+            pragma_unroll=0  # Full unroll
+        )
+
+        b.store(addr0, results[0])
+        hir = b.build()
+
+        # Apply loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        result_hir = pm.run(hir)
+
+        # Loop should be eliminated (fully unrolled)
+        loop_count = self._count_loops(result_hir)
+        self.assertEqual(loop_count, 0, "Loop with pragma_unroll=0 should be fully unrolled")
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 4, "Loop result should be 4")
+
+        print("pragma_unroll=0 full unroll test passed!")
+
+    def test_pragma_unroll_partial(self):
+        """Test that pragma_unroll=4 with 8 iters creates 2-iteration loop."""
+        from compiler import HIRBuilder, PassManager, PassConfig, LoopUnrollPass, Const
+        from compiler.hir import ForLoop
+
+        b = HIRBuilder()
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        addr0 = b.const_load(0, "addr0")
+
+        init_val = b.const_load(0, "init_val")
+
+        def loop_body(i, params):
+            new_val = b.add(params[0], one, "new_val")
+            return [new_val]
+
+        # Loop with pragma_unroll=4 (partial unroll)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(8),
+            iter_args=[init_val],
+            body_fn=loop_body,
+            pragma_unroll=4  # Partial unroll by 4
+        )
+
+        b.store(addr0, results[0])
+        hir = b.build()
+
+        # Apply loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        result_hir = pm.run(hir)
+
+        # Should have 1 loop with 2 iterations (8/4=2)
+        loop_count = self._count_loops(result_hir)
+        self.assertEqual(loop_count, 1, "Partial unroll should leave 1 loop")
+
+        # Check the loop has correct trip count
+        def find_loop(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, ForLoop):
+                    return stmt
+            return None
+        loop = find_loop(result_hir.body)
+        self.assertIsNotNone(loop)
+        self.assertEqual(loop.start.value, 0)
+        self.assertEqual(loop.end.value, 2)  # 8/4 = 2 iterations
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 8, "Loop result should be 8")
+
+        print("pragma_unroll=4 partial unroll test passed!")
+
+    def test_pragma_unroll_nested_mixed(self):
+        """Test outer=1 (disabled), inner=0 (full unroll) works correctly."""
+        from compiler import HIRBuilder, PassManager, PassConfig, LoopUnrollPass, Const
+        from compiler.hir import ForLoop
+
+        b = HIRBuilder()
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        addr0 = b.const_load(0, "addr0")
+
+        init_val = b.const_load(0, "init_val")
+
+        def inner_body(j, inner_params):
+            new_val = b.add(inner_params[0], one, "inner_val")
+            return [new_val]
+
+        def outer_body(i, outer_params):
+            # Inner loop with pragma_unroll=0 (full unroll)
+            results = b.for_loop(
+                start=Const(0),
+                end=Const(2),
+                iter_args=[outer_params[0]],
+                body_fn=inner_body,
+                pragma_unroll=0  # Full unroll inner
+            )
+            return results
+
+        # Outer loop with pragma_unroll=1 (disabled)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(3),
+            iter_args=[init_val],
+            body_fn=outer_body,
+            pragma_unroll=1  # Don't unroll outer
+        )
+
+        b.store(addr0, results[0])
+        hir = b.build()
+
+        # Apply loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        result_hir = pm.run(hir)
+
+        # Should have 1 outer loop (inner is unrolled away)
+        loop_count = self._count_loops(result_hir)
+        self.assertEqual(loop_count, 1, "Only outer loop should remain")
+
+        # Verify correctness: 3 outer iters * 2 inner iters = 6
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 6, "Result should be 6")
+
+        print("pragma_unroll nested mixed test passed!")
+
+    def test_pragma_unroll_non_divisible_skipped(self):
+        """Test that partial unroll is skipped when factor doesn't divide trip count."""
+        from compiler import HIRBuilder, PassManager, PassConfig, LoopUnrollPass, Const
+        from compiler.hir import ForLoop
+
+        b = HIRBuilder()
+        one = b.const_load(1, "one")
+        addr0 = b.const_load(0, "addr0")
+
+        init_val = b.const_load(0, "init_val")
+
+        def loop_body(i, params):
+            new_val = b.add(params[0], one, "new_val")
+            return [new_val]
+
+        # Loop with pragma_unroll=4 but trip_count=7 (not divisible)
+        results = b.for_loop(
+            start=Const(0),
+            end=Const(7),
+            iter_args=[init_val],
+            body_fn=loop_body,
+            pragma_unroll=4  # 7 not divisible by 4
+        )
+
+        b.store(addr0, results[0])
+        hir = b.build()
+
+        # Apply loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        result_hir = pm.run(hir)
+
+        # Loop should remain (unroll skipped due to non-divisibility)
+        loop_count = self._count_loops(result_hir)
+        self.assertEqual(loop_count, 1, "Loop should not be unrolled when factor doesn't divide")
+
+        # Check loop still has original trip count
+        def find_loop(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, ForLoop):
+                    return stmt
+            return None
+        loop = find_loop(result_hir.body)
+        self.assertIsNotNone(loop)
+        self.assertEqual(loop.end.value, 7, "Loop should have original trip count")
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 7, "Loop result should be 7")
+
+        print("pragma_unroll non-divisible skipped test passed!")
 
 
 if __name__ == "__main__":
