@@ -9,7 +9,7 @@ from typing import Optional
 
 from .hir import HIRFunction
 from .pass_manager import CompilerPipeline
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, PhiEliminationPass, LIRToVLIWPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, PhiEliminationPass, LIRToVLIWPass
 
 
 def compile_hir_to_vliw(
@@ -44,6 +44,7 @@ def compile_hir_to_vliw(
     pipeline.add_pass(CSEPass())             # HIR -> HIR
     pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-lowering cleanup)
     pipeline.add_pass(HIRToLIRPass())        # HIR -> LIR
+    pipeline.add_pass(SimplifyCFGPass())     # LIR -> LIR
     pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
     pipeline.add_pass(LIRToVLIWPass())       # LIR -> VLIW
 
