@@ -43,10 +43,17 @@ def linearize(lir: LIRFunction) -> tuple[list[LIRInst], dict[str, int]]:
                 worklist.append(block.terminator.operands[2])
 
     # Emit instructions in block order
-    for block in block_order:
+    for i, block in enumerate(block_order):
         label_map[block.name] = len(instructions)
         instructions.extend(block.instructions)
         if block.terminator:
+            # Omit unconditional jump to immediate next block (fallthrough)
+            if (
+                block.terminator.opcode == LIROpcode.JUMP
+                and i + 1 < len(block_order)
+                and block.terminator.operands[0] == block_order[i + 1].name
+            ):
+                continue
             instructions.append(block.terminator)
 
     return instructions, label_map
@@ -168,15 +175,21 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
     # Linearize
     instructions, label_map = linearize(lir)
 
-    # Handle COND_JUMP specially (expand to cond_jump + jump)
+    # Handle COND_JUMP specially (expand to cond_jump + optional jump)
     expanded = []
     for i, inst in enumerate(instructions):
         if inst.opcode == LIROpcode.COND_JUMP:
             cond, true_target, false_target = inst.operands
             # Emit conditional jump to true target
             expanded.append(LIRInst(LIROpcode.COND_JUMP, None, [cond, true_target], "flow"))
-            # Emit unconditional jump to false target
-            expanded.append(LIRInst(LIROpcode.JUMP, None, [false_target], "flow"))
+            # Emit unconditional jump to false target only if it isn't fallthrough
+            false_is_fallthrough = (
+                isinstance(false_target, str)
+                and false_target in label_map
+                and label_map[false_target] == i + 1
+            )
+            if not false_is_fallthrough:
+                expanded.append(LIRInst(LIROpcode.JUMP, None, [false_target], "flow"))
         else:
             expanded.append(inst)
 
@@ -186,10 +199,19 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
     old_to_new_idx = {}
     new_idx = 0
     old_idx = 0
-    for inst in instructions:
+    for i, inst in enumerate(instructions):
         old_to_new_idx[old_idx] = new_idx
         if inst.opcode == LIROpcode.COND_JUMP:
-            new_idx += 2  # cond_jump + jump
+            # cond_jump + optional jump
+            cond, true_target, false_target = inst.operands
+            false_is_fallthrough = (
+                isinstance(false_target, str)
+                and false_target in label_map
+                and label_map[false_target] == i + 1
+            )
+            new_idx += 1
+            if not false_is_fallthrough:
+                new_idx += 1
         else:
             new_idx += 1
         old_idx += 1
