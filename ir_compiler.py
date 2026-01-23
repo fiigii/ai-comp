@@ -140,7 +140,6 @@ class HIRBuilder:
     def __init__(self):
         self._ssa_counter = 0
         self._statements: list[Statement] = []
-        self._const_cache: dict[int, SSAValue] = {}
 
     def _new_ssa(self, name: Optional[str] = None) -> SSAValue:
         """Create a new SSA value."""
@@ -159,12 +158,15 @@ class HIRBuilder:
         return Const(value)
 
     def const_load(self, value: int, name: Optional[str] = None) -> SSAValue:
-        """Load an immediate constant into an SSA value (with caching)."""
-        if value in self._const_cache:
-            return self._const_cache[value]
+        """Load an immediate constant into an SSA value.
+
+        Note: We intentionally do NOT cache across different statement contexts
+        (if/else branches, loop bodies) because that would cause the const load
+        to only be emitted in one branch, leaving it undefined in the other.
+        Caching is safe to re-enable if constants are hoisted to entry block.
+        """
         result = self._new_ssa(name or f"c{value}")
         self._emit(Op("const", result, [Const(value)], "load"))
-        self._const_cache[value] = result
         return result
 
     # === ALU operations ===
@@ -411,6 +413,7 @@ class LIRFunction:
     """A complete LIR function (CFG)."""
     entry: str
     blocks: dict[str, BasicBlock] = field(default_factory=dict)
+    max_scratch_used: int = -1  # Highest scratch index allocated during lowering
 
 
 # =============================================================================
@@ -427,6 +430,7 @@ class LoweringContext:
         self._scratch_ptr = 0
         self._ssa_to_scratch: dict[int, int] = {}  # SSAValue.id -> scratch addr
         self._const_scratch: dict[int, int] = {}   # const value -> scratch addr
+        self._pending_consts: list[tuple[int, int]] = []  # (scratch_addr, value) - deferred const loads
 
     def new_block(self, prefix: str = "bb") -> BasicBlock:
         """Create a new basic block."""
@@ -466,13 +470,35 @@ class LoweringContext:
             raise ValueError(f"Unknown operand type: {op}")
 
     def get_const(self, value: int) -> int:
-        """Get scratch address for a constant (with caching)."""
+        """Get scratch address for a constant (with caching).
+
+        Constants are deferred and emitted to the entry block later to ensure
+        they dominate all uses (fixing the control-flow miscompilation bug).
+        """
         if value not in self._const_scratch:
             addr = self.alloc_scratch()
             self._const_scratch[value] = addr
-            # Emit const load
-            self.emit(LIRInst(LIROpcode.CONST, addr, [value], "load"))
+            # Defer const load - will be emitted to entry block later
+            self._pending_consts.append((addr, value))
         return self._const_scratch[value]
+
+    def emit_pending_consts(self):
+        """Emit all pending constant loads to the entry block.
+
+        This must be called after lowering is complete to ensure constants
+        are materialized in the entry block where they dominate all uses.
+        """
+        if not self._pending_consts:
+            return
+
+        entry_block = self.lir.blocks[self.lir.entry]
+        # Insert const loads at the beginning of the entry block
+        const_insts = [
+            LIRInst(LIROpcode.CONST, addr, [value], "load")
+            for addr, value in self._pending_consts
+        ]
+        entry_block.instructions = const_insts + entry_block.instructions
+        self._pending_consts = []
 
     def emit(self, inst: LIRInst):
         """Emit an instruction to the current block."""
@@ -501,6 +527,12 @@ def lower_to_lir(hir: HIRFunction) -> LIRFunction:
     # If the last block doesn't have a terminator, add halt
     if ctx.current_block and ctx.current_block.terminator is None:
         ctx.set_terminator(LIRInst(LIROpcode.HALT, None, [], "flow"))
+
+    # Emit all pending constants to entry block (ensures they dominate all uses)
+    ctx.emit_pending_consts()
+
+    # Record max scratch used for phi elimination temp allocation
+    ctx.lir.max_scratch_used = ctx._scratch_ptr - 1 if ctx._scratch_ptr > 0 else -1
 
     return ctx.lir
 
@@ -687,21 +719,110 @@ def _lower_if(if_stmt: If, ctx: LoweringContext):
 # Phi Elimination
 # =============================================================================
 
-def eliminate_phis(lir: LIRFunction):
+def _compute_parallel_copy_order(copies: list[tuple[int, int]], temp_scratch: int) -> list[tuple[int, int]]:
+    """
+    Compute a valid order for parallel copies that preserves semantics.
+
+    Args:
+        copies: List of (dest, src) pairs representing parallel copies
+        temp_scratch: Scratch location to use for breaking cycles
+
+    Returns:
+        List of (dest, src) pairs in a valid sequential order
+    """
+    if not copies:
+        return []
+
+    # Build maps for analysis
+    dest_to_src = {dest: src for dest, src in copies}
+    src_to_dests = {}
+    for dest, src in copies:
+        if src not in src_to_dests:
+            src_to_dests[src] = []
+        src_to_dests[src].append(dest)
+
+    result = []
+    remaining = set(dest_to_src.keys())
+
+    # Keep emitting safe copies until we can't anymore
+    while remaining:
+        # Find a copy whose dest is not a source for any remaining copy
+        safe_dest = None
+        for dest in remaining:
+            # Check if this dest is used as a source by another remaining copy
+            is_needed_as_source = False
+            for other_dest in remaining:
+                if other_dest != dest and dest_to_src[other_dest] == dest:
+                    is_needed_as_source = True
+                    break
+            if not is_needed_as_source:
+                safe_dest = dest
+                break
+
+        if safe_dest is not None:
+            # Emit this copy
+            result.append((safe_dest, dest_to_src[safe_dest]))
+            remaining.remove(safe_dest)
+        else:
+            # All remaining copies form cycles - break one using temp
+            # Pick any dest from remaining
+            cycle_dest = next(iter(remaining))
+            cycle_src = dest_to_src[cycle_dest]
+
+            # Save the dest value (about to be overwritten) to temp first
+            # This preserves the value for any other copy that reads from cycle_dest
+            result.append((temp_scratch, cycle_dest))
+
+            # Now we can safely overwrite cycle_dest
+            result.append((cycle_dest, cycle_src))
+            remaining.remove(cycle_dest)
+
+            # Update any copy that used cycle_dest as source to use temp instead
+            for dest in list(remaining):
+                if dest_to_src[dest] == cycle_dest:
+                    dest_to_src[dest] = temp_scratch
+
+    return result
+
+
+def eliminate_phis(lir: LIRFunction, temp_scratch: Optional[int] = None):
     """
     Replace phi nodes with copies at the end of predecessor blocks.
 
+    Uses a parallel copy algorithm to handle cycles (e.g., swaps) correctly.
     This must be done before linearization since the machine doesn't have phi.
+
+    Args:
+        lir: The LIR function to transform
+        temp_scratch: Scratch location for breaking cycles. If None, uses SCRATCH_SIZE-1.
     """
+    if temp_scratch is None:
+        temp_scratch = SCRATCH_SIZE - 1  # Reserve last scratch for temp
+
+    # Group phis by predecessor block
     for block in lir.blocks.values():
+        if not block.phis:
+            continue
+
+        # Collect copies per predecessor
+        pred_copies: dict[str, list[tuple[int, int]]] = {}  # pred_name -> [(dest, src)]
+
         for phi in block.phis:
             for pred_name, src_scratch in phi.incoming.items():
-                pred_block = lir.blocks[pred_name]
-                # Insert copy before terminator (add with zero)
-                # We need a zero constant - find or create one
-                # For simplicity, use COPY pseudo-op which codegen handles
-                copy_inst = LIRInst(LIROpcode.COPY, phi.dest, [src_scratch], "alu")
-                pred_block.instructions.append(copy_inst)
+                if pred_name not in pred_copies:
+                    pred_copies[pred_name] = []
+                pred_copies[pred_name].append((phi.dest, src_scratch))
+
+        # For each predecessor, compute safe copy order and emit
+        for pred_name, copies in pred_copies.items():
+            pred_block = lir.blocks[pred_name]
+            ordered_copies = _compute_parallel_copy_order(copies, temp_scratch)
+
+            for dest, src in ordered_copies:
+                if dest != src:  # Skip no-op copies
+                    copy_inst = LIRInst(LIROpcode.COPY, dest, [src], "alu")
+                    pred_block.instructions.append(copy_inst)
+
         block.phis = []
 
 
@@ -827,12 +948,11 @@ def _inst_to_slot(inst: LIRInst, zero_scratch: int) -> Optional[tuple]:
 
 
 def compile_to_vliw(lir: LIRFunction) -> list[dict]:
-    """Full compilation from LIR to VLIW bundles."""
-    # Eliminate phis first
-    eliminate_phis(lir)
+    """Full compilation from LIR to VLIW bundles.
 
-    # Find or create zero constant for copy operations
-    # We'll do this by scanning for a const 0, or adding one
+    Note: Phis must be eliminated before calling this function.
+    """
+    # Find zero constant for copy operations
     zero_scratch = None
     for block in lir.blocks.values():
         for inst in block.instructions:
@@ -842,10 +962,27 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
         if zero_scratch is not None:
             break
 
-    # If no zero constant found, we need to add one
-    # For simplicity, assume there's always a zero (we load 0 in most kernels)
+    # If no zero constant found, materialize one in the entry block
     if zero_scratch is None:
-        zero_scratch = 0  # Fallback, may cause issues
+        # Find the maximum used scratch address to allocate a new one
+        max_scratch = -1
+        for block in lir.blocks.values():
+            for inst in block.instructions:
+                if inst.dest is not None:
+                    max_scratch = max(max_scratch, inst.dest)
+                # Skip CONST operands - they are immediate values, not scratch indices
+                if inst.opcode != LIROpcode.CONST:
+                    for op in inst.operands:
+                        if isinstance(op, int) and op >= 0:
+                            max_scratch = max(max_scratch, op)
+
+        zero_scratch = max_scratch + 1
+        assert zero_scratch < SCRATCH_SIZE, "Out of scratch space for zero constant"
+
+        # Add const 0 at the beginning of entry block
+        entry_block = lir.blocks[lir.entry]
+        zero_inst = LIRInst(LIROpcode.CONST, zero_scratch, [0], "load")
+        entry_block.instructions.insert(0, zero_inst)
 
     # Linearize
     instructions, label_map = linearize(lir)
@@ -998,7 +1135,10 @@ def compile_hir_to_vliw(hir: HIRFunction, print_after_all: bool = False) -> list
         print_lir(lir)
 
     # Phase 2: Eliminate phis
-    eliminate_phis(lir)
+    # Use scratch slot after all allocated ones for phi temp (avoids collision)
+    temp_scratch = lir.max_scratch_used + 1 if lir.max_scratch_used >= 0 else 0
+    assert temp_scratch < SCRATCH_SIZE, "No room for phi temp scratch"
+    eliminate_phis(lir, temp_scratch=temp_scratch)
     if print_after_all:
         print("-" * 60)
         print("After phi elimination:")
