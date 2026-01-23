@@ -12,7 +12,13 @@
     },
     "simplify": {
       "enabled": true,
-      "options": {}
+      "options": {
+        "constant_folding": true,
+        "identities": true,
+        "strength_reduction": true,
+        "select_optimization": true,
+        "parity_pattern": true
+      }
     },
     "cse": {
       "enabled": true,
