@@ -5,7 +5,8 @@ Provides the compile_hir_to_vliw function that orchestrates the full
 compilation pipeline from HIR to VLIW bundles using the CompilerPipeline.
 """
 
-from typing import Optional
+import json
+import os
 
 from .hir import HIRFunction
 from .pass_manager import CompilerPipeline
@@ -15,7 +16,6 @@ from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass
 def compile_hir_to_vliw(
     hir: HIRFunction,
     print_after_all: bool = False,
-    config_path: Optional[str] = None,
     print_metrics: bool = False
 ) -> list[dict]:
     """
@@ -24,17 +24,22 @@ def compile_hir_to_vliw(
     Args:
         hir: The HIR function to compile
         print_after_all: If True, print IR after each compilation phase
-        config_path: Optional path to JSON config file for pass options
         print_metrics: If True, print pass metrics and diagnostics
 
     Returns:
         List of VLIW instruction bundles
     """
+    # Load config from compiler/pass_config.json
+    config_path = os.path.join(os.path.dirname(__file__), "pass_config.json")
+    with open(config_path) as f:
+        config_data = json.load(f)
+
     # Create pipeline with all passes in order
     pipeline = CompilerPipeline(
         print_after_all=print_after_all,
         print_metrics=print_metrics
     )
+    pipeline.set_config(config_data)
 
     # Register all passes in pipeline order
     pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-unroll cleanup)
@@ -47,10 +52,6 @@ def compile_hir_to_vliw(
     pipeline.add_pass(SimplifyCFGPass())     # LIR -> LIR
     pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
     pipeline.add_pass(LIRToVLIWPass())       # LIR -> VLIW
-
-    # Load config if provided
-    if config_path:
-        pipeline.load_config(config_path)
 
     # Run the full pipeline
     return pipeline.run(hir)

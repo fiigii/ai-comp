@@ -4,8 +4,6 @@ Tree Hash Kernel
 Implements the tree traversal + hash computation kernel using the IR compiler.
 """
 
-from typing import Optional
-
 from problem import HASH_STAGES
 
 from compiler import HIRBuilder, Const, compile_hir_to_vliw
@@ -18,7 +16,6 @@ def build_tree_hash_kernel(
     rounds: int,
     print_after_all: bool = False,
     print_metrics: bool = False,
-    pass_config: Optional[str] = None
 ) -> tuple[list[dict], dict]:
     """
     Build IR-based tree hash kernel.
@@ -39,7 +36,6 @@ def build_tree_hash_kernel(
         rounds: Number of rounds to process
         print_after_all: If True, print IR after each compilation pass
         print_metrics: If True, print pass metrics and diagnostics
-        pass_config: Optional path to JSON config file for pass options
 
     Returns:
         Tuple of (instructions, debug_info) where:
@@ -154,7 +150,6 @@ def build_tree_hash_kernel(
     instrs = compile_hir_to_vliw(
         hir,
         print_after_all=print_after_all,
-        config_path=pass_config,
         print_metrics=print_metrics
     )
 

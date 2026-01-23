@@ -67,19 +67,6 @@ class TestIRCompiler(unittest.TestCase):
         )
         print(f"Small test passed! Cycles: {machine.cycle}")
 
-    def _create_config_file(self, unroll_factor=None, max_trip_count=None):
-        """Create a temp config file for pass manager."""
-        import tempfile
-        config = {"passes": {"loop-unroll": {"enabled": True, "options": {}}}}
-        if unroll_factor is not None:
-            config["passes"]["loop-unroll"]["options"]["unroll_factor"] = unroll_factor
-        if max_trip_count is not None:
-            config["passes"]["loop-unroll"]["options"]["max_trip_count"] = max_trip_count
-        f = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-        json.dump(config, f)
-        f.close()
-        return f.name
-
     def test_ir_kernel_medium(self):
         """Test IR kernel on a medium example."""
         random.seed(123)
@@ -87,12 +74,8 @@ class TestIRCompiler(unittest.TestCase):
         inp = Input.generate(forest, 32, 8)
         mem = build_mem_image(forest, inp)
 
-        # Use config to limit unrolling (32*8=256 iterations would exhaust scratch)
-        config_path = self._create_config_file(max_trip_count=8)
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds,
-                           pass_config=config_path)
-        os.unlink(config_path)
+        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
 
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
@@ -119,12 +102,8 @@ class TestIRCompiler(unittest.TestCase):
         inp = Input.generate(forest, 256, 16)
         mem = build_mem_image(forest, inp)
 
-        # Use config to limit unrolling (256*16=4096 iterations would exhaust scratch)
-        config_path = self._create_config_file(max_trip_count=8)
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds,
-                           pass_config=config_path)
-        os.unlink(config_path)
+        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
 
         print(f"Generated {len(kb.instrs)} instructions")
 
@@ -161,13 +140,11 @@ class TestIRCompiler(unittest.TestCase):
         machine1.enable_debug = False
         machine1.run()
 
-        # Run IR kernel (use_ir=True) with limited unrolling (16*4=64 iterations)
-        config_path = self._create_config_file(max_trip_count=8)
+        # Run IR kernel (use_ir=True)
         mem2 = build_mem_image(forest, inp)
         kb2 = KernelBuilder()
         kb2.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds,
-                         use_ir=True, pass_config=config_path)
-        os.unlink(config_path)
+                         use_ir=True)
         machine2 = Machine(mem2, kb2.instrs, kb2.debug_info(), n_cores=N_CORES)
         machine2.enable_pause = False
         machine2.enable_debug = False
@@ -1205,10 +1182,8 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         self.assertEqual(machine.mem[10], 45)
         print("Skip unroll bad factor test passed!")
 
-    def test_pass_config_from_json(self):
-        """Test loading pass config from JSON."""
-        import tempfile
-        import os
+    def test_pass_config_set_config(self):
+        """Test setting pass config from dict."""
         from compiler import PassManager, PassConfig, LoopUnrollPass
 
         config_data = {
@@ -1223,22 +1198,14 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
             }
         }
 
-        # Write temp config file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(config_data, f)
-            config_path = f.name
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.set_config(config_data)
 
-        try:
-            pm = PassManager()
-            pm.add_pass(LoopUnrollPass())
-            pm.load_config(config_path)
-
-            self.assertIn("loop-unroll", pm.config)
-            self.assertEqual(pm.config["loop-unroll"].options["unroll_factor"], 2)
-            self.assertEqual(pm.config["loop-unroll"].options["max_trip_count"], 50)
-            print("Pass config from JSON test passed!")
-        finally:
-            os.unlink(config_path)
+        self.assertIn("loop-unroll", pm.config)
+        self.assertEqual(pm.config["loop-unroll"].options["unroll_factor"], 2)
+        self.assertEqual(pm.config["loop-unroll"].options["max_trip_count"], 50)
+        print("Pass config set_config test passed!")
 
     def test_unroll_remaps_if_yields(self):
         """Ensure unrolled loop results are remapped through If yields."""

@@ -8,7 +8,6 @@ Includes CompilerPipeline for full HIR -> LIR -> VLIW compilation.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Any, Union
-import json
 
 from .hir import HIRFunction, ForLoop, If, Statement
 from .lir import LIRFunction
@@ -170,10 +169,8 @@ class PassManager:
         """Register a pass."""
         self.passes.append(p)
 
-    def load_config(self, config_path: str) -> None:
-        """Load pass configs from JSON file."""
-        with open(config_path) as f:
-            data = json.load(f)
+    def set_config(self, data: dict) -> None:
+        """Set pass configs from a dict (e.g., parsed JSON)."""
         for pass_name, opts in data.get("passes", {}).items():
             self.config[pass_name] = PassConfig(
                 name=pass_name,
@@ -280,10 +277,8 @@ class CompilerPipeline:
         """Register a pass in the pipeline."""
         self.passes.append(p)
 
-    def load_config(self, config_path: str) -> None:
-        """Load pass configs from JSON file."""
-        with open(config_path) as f:
-            data = json.load(f)
+    def set_config(self, data: dict) -> None:
+        """Set pass configs from a dict (e.g., parsed JSON)."""
         for pass_name, opts in data.get("passes", {}).items():
             self.config[pass_name] = PassConfig(
                 name=pass_name,
