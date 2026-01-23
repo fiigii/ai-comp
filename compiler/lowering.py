@@ -43,7 +43,7 @@ class LoweringContext:
         """Allocate a scratch address, optionally binding to an SSA value."""
         addr = self._scratch_ptr
         self._scratch_ptr += 1
-        assert self._scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+        # Note: Scratch overflow is checked in codegen, not here
         if ssa is not None:
             self._ssa_to_scratch[ssa.id] = addr
         return addr

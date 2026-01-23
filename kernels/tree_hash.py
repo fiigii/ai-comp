@@ -127,21 +127,23 @@ def build_tree_hash_kernel(
 
             return []  # No loop-carried values
 
-        # Batch loop (use Const bounds for unrolling)
+        # Batch loop: pragma_unroll=4 for partial unroll by factor 4
         b.for_loop(
             start=zero_const,
             end=batch_const,
             iter_args=[],
-            body_fn=batch_body
+            body_fn=batch_body,
+            pragma_unroll=4
         )
         return []  # No loop-carried values
 
-    # Round loop (use Const bounds for unrolling)
+    # Round loop: pragma_unroll=1 to disable unrolling on outer loop
     b.for_loop(
         start=zero_const,
         end=rounds_const,
         iter_args=[],
-        body_fn=round_body
+        body_fn=round_body,
+        pragma_unroll=1
     )
 
     # Final pause (sync with reference_kernel2 second yield)

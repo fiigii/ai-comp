@@ -7,7 +7,6 @@
     "loop-unroll": {
       "enabled": true,
       "options": {
-        "unroll_factor": 4,
         "max_trip_count": 10000
       }
     },

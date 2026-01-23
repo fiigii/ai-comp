@@ -73,6 +73,7 @@ class ForLoop:
     body_params:  SSA values available in body (from back-edge phi)
     yields:       Values at end of each iteration (fed back to body_params)
     results:      SSA values available after loop (final carried values)
+    pragma_unroll: Unroll pragma (0=full, 1=disabled, N>1=partial by factor N)
     """
     counter: SSAValue
     start: Operand
@@ -82,6 +83,7 @@ class ForLoop:
     body: list  # list[Statement]
     yields: list[SSAValue]
     results: list[SSAValue]
+    pragma_unroll: int = 1  # 0=full, 1=disabled (default), N>1=partial
 
     def __repr__(self):
         return f"ForLoop({self.counter}, {self.start}..{self.end}, body={len(self.body)} stmts)"

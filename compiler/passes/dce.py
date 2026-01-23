@@ -341,7 +341,8 @@ class DCEPass(Pass):
             body_params=loop.body_params,
             body=new_body,
             yields=loop.yields,
-            results=loop.results
+            results=loop.results,
+            pragma_unroll=loop.pragma_unroll
         )
 
     def _filter_if(self, if_stmt: If, live: set[int]) -> If | None:

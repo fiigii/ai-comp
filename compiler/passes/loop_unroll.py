@@ -17,16 +17,16 @@ class LoopUnrollPass(Pass):
     """
     Unroll ForLoops with static trip counts.
 
-    By default, fully unroll loops with static (Const) bounds.
-    If 'unroll_factor' is set in config, partially unroll instead.
-    The factor must divide the trip count evenly; otherwise skip unrolling.
+    Each loop can have a pragma_unroll attribute controlling its unrolling:
+    - pragma_unroll=0: Full unroll (default, backward compatible)
+    - pragma_unroll=1: Disable unrolling on this loop
+    - pragma_unroll=N (N>1): Partial unroll by factor N
+
     Loops with dynamic bounds are left unchanged.
 
     Options:
-        unroll_factor: If set, partially unroll by this factor (must divide trip count).
-                       If None, attempt full unroll.
-        max_trip_count: Maximum trip count to fully unroll (default: 32).
-                        Loops with larger trip counts are skipped unless unroll_factor is set.
+        max_trip_count: Maximum trip count to fully unroll (default: 10000000).
+                        Loops with larger trip counts are skipped.
     """
 
     def __init__(self):
@@ -48,16 +48,15 @@ class LoopUnrollPass(Pass):
         self._loops_partially_unrolled = 0
         self._loops_skipped = 0
 
-        unroll_factor = config.options.get("unroll_factor", None)  # None = full unroll
         # Very large default - fully unroll all static loops
-        # If scratch space is exhausted, use a config file to set unroll_factor
+        # If scratch space is exhausted, use pragma_unroll on individual loops
         max_trip_count = config.options.get("max_trip_count", 10000000)
 
         # Create SSA renumber context starting from current max
         ctx = SSARenumberContext(hir.num_ssa_values)
 
         # Transform body recursively
-        new_body = self._transform_statements(hir.body, unroll_factor, max_trip_count, ctx)
+        new_body = self._transform_statements(hir.body, max_trip_count, ctx)
 
         # Record custom metrics
         if self._metrics:
@@ -75,7 +74,7 @@ class LoopUnrollPass(Pass):
         )
 
     def _transform_statements(
-        self, stmts: list[Statement], factor: Optional[int], max_trip: int, ctx: SSARenumberContext
+        self, stmts: list[Statement], max_trip: int, ctx: SSARenumberContext
     ) -> list[Statement]:
         """Transform a list of statements, unrolling loops as appropriate."""
         result = []
@@ -84,9 +83,9 @@ class LoopUnrollPass(Pass):
             stmt = self._apply_bindings(stmt, ctx.result_bindings)
 
             if isinstance(stmt, ForLoop):
-                result.extend(self._unroll_loop(stmt, factor, max_trip, ctx))
+                result.extend(self._unroll_loop(stmt, max_trip, ctx))
             elif isinstance(stmt, If):
-                result.append(self._transform_if(stmt, factor, max_trip, ctx))
+                result.append(self._transform_if(stmt, max_trip, ctx))
             else:
                 result.append(stmt)
         return result
@@ -130,7 +129,8 @@ class LoopUnrollPass(Pass):
                 body_params=stmt.body_params,
                 body=stmt.body,
                 yields=new_yields,
-                results=stmt.results
+                results=stmt.results,
+                pragma_unroll=stmt.pragma_unroll
             )
 
         elif isinstance(stmt, If):
@@ -153,11 +153,11 @@ class LoopUnrollPass(Pass):
         return stmt
 
     def _transform_if(
-        self, if_stmt: If, factor: Optional[int], max_trip: int, ctx: SSARenumberContext
+        self, if_stmt: If, max_trip: int, ctx: SSARenumberContext
     ) -> If:
         """Recursively transform If statement bodies."""
-        then_body = self._transform_statements(if_stmt.then_body, factor, max_trip, ctx)
-        else_body = self._transform_statements(if_stmt.else_body, factor, max_trip, ctx)
+        then_body = self._transform_statements(if_stmt.then_body, max_trip, ctx)
+        else_body = self._transform_statements(if_stmt.else_body, max_trip, ctx)
         return If(
             cond=if_stmt.cond,
             then_body=then_body,
@@ -168,20 +168,22 @@ class LoopUnrollPass(Pass):
         )
 
     def _unroll_loop(
-        self, loop: ForLoop, factor: Optional[int], max_trip: int, ctx: SSARenumberContext
+        self, loop: ForLoop, max_trip: int, ctx: SSARenumberContext
     ) -> list[Statement]:
         """Unroll a single ForLoop if possible.
 
         Uses bottom-up approach: transform inner loops first, then this loop.
+        Respects per-loop pragma_unroll setting.
         """
         self._loops_processed += 1
 
         # FIRST: Transform the body (inner loops) before deciding about this loop
         # This ensures inner loops are unrolled before outer loops (bottom-up)
-        transformed_body = self._transform_statements(loop.body, factor, max_trip, ctx)
+        transformed_body = self._transform_statements(loop.body, max_trip, ctx)
         transformed_yields = [self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields]
 
         # Create a loop with the transformed body for potential use below
+        # Preserve pragma_unroll from original loop
         transformed_loop = ForLoop(
             counter=loop.counter,
             start=loop.start,
@@ -190,8 +192,15 @@ class LoopUnrollPass(Pass):
             body_params=loop.body_params,
             body=transformed_body,
             yields=transformed_yields,
-            results=loop.results
+            results=loop.results,
+            pragma_unroll=loop.pragma_unroll
         )
+
+        # Check pragma_unroll=1 (unrolling disabled)
+        if loop.pragma_unroll == 1:
+            self._loops_skipped += 1
+            self._add_metric_message(f"Loop skipped: pragma_unroll=1")
+            return [transformed_loop]
 
         # Check if loop has static bounds
         if not isinstance(loop.start, Const) or not isinstance(loop.end, Const):
@@ -211,8 +220,11 @@ class LoopUnrollPass(Pass):
                 ctx.bind_result(result_ssa.id, iter_arg)
             return []
 
-        # Determine actual unroll factor
-        if factor is None:
+        # Read pragma from loop
+        pragma = loop.pragma_unroll
+
+        # Determine actual unroll factor based on pragma
+        if pragma == 0:
             # Full unroll - but only if trip count is within limit
             if trip_count > max_trip:
                 # Too large for full unroll - return with transformed body
@@ -220,13 +232,14 @@ class LoopUnrollPass(Pass):
                 self._add_metric_message(f"Loop skipped: trip_count {trip_count} > max_trip_count {max_trip}")
                 return [transformed_loop]
             actual_factor = trip_count
-        elif trip_count % factor != 0:
-            # Factor doesn't divide evenly - skip unrolling this loop
-            self._loops_skipped += 1
-            self._add_metric_message(f"Loop skipped: trip_count {trip_count} not divisible by factor {factor}")
-            return [transformed_loop]
         else:
-            actual_factor = factor
+            # Partial unroll by pragma factor
+            if trip_count % pragma != 0:
+                # Factor doesn't divide evenly - skip unrolling this loop
+                self._loops_skipped += 1
+                self._add_metric_message(f"Loop skipped: trip_count {trip_count} not divisible by pragma_unroll {pragma}")
+                return [transformed_loop]
+            actual_factor = pragma
 
         # Fully unroll (using pre-transformed body)
         if actual_factor == trip_count:
@@ -335,6 +348,7 @@ class LoopUnrollPass(Pass):
             ctx.bind_result(old_result.id, new_result)
 
         # Create new ForLoop with unrolled body
+        # Set pragma_unroll=1 to prevent re-unrolling
         return [ForLoop(
             counter=new_counter,
             start=Const(0),
@@ -343,7 +357,8 @@ class LoopUnrollPass(Pass):
             body_params=new_body_params,
             body=unrolled_body,
             yields=current_params,
-            results=new_results
+            results=new_results,
+            pragma_unroll=1
         )]
 
     def _clone_body_no_recurse(
@@ -444,7 +459,8 @@ class LoopUnrollPass(Pass):
                 body_params=new_body_params,
                 body=cloned_body,
                 yields=new_yields,
-                results=new_results
+                results=new_results,
+                pragma_unroll=stmt.pragma_unroll
             )
 
             # Map old results to new results
@@ -611,6 +627,7 @@ class LoopUnrollPass(Pass):
             ctx.bind_result(old_result.id, new_result)
 
         # Create new ForLoop with unrolled body
+        # Set pragma_unroll=1 to prevent re-unrolling
         return [ForLoop(
             counter=new_counter,
             start=Const(0),
@@ -619,7 +636,8 @@ class LoopUnrollPass(Pass):
             body_params=new_body_params,
             body=unrolled_body,
             yields=current_params,
-            results=new_results
+            results=new_results,
+            pragma_unroll=1
         )]
 
     def _clone_body_with_remap(
@@ -721,11 +739,12 @@ class LoopUnrollPass(Pass):
                 body_params=new_body_params,
                 body=cloned_body,
                 yields=new_yields,
-                results=new_results
+                results=new_results,
+                pragma_unroll=stmt.pragma_unroll
             )
 
             # Recursively unroll nested loop if it has static bounds
-            replacement = self._unroll_loop(new_loop, nested_factor, max_trip, ctx)
+            replacement = self._unroll_loop(new_loop, max_trip, ctx)
             # Ensure subsequent uses reference the post-unroll replacements.
             for old_res, new_res in zip(stmt.results, new_results):
                 remap[old_res.id] = self._resolve_ssa_binding(new_res, ctx.result_bindings)
