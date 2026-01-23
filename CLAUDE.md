@@ -67,28 +67,37 @@ Arrays: forest_values[], inp_indices[], inp_values[]
 ### Test Commands
 
 ```bash
-# Run all IR compiler tests (correctness + regression tests)
-python3 -m pytest tests/test_ir.py -v
+# Run all compiler tests
+python3 -m pytest compiler/tests/ -v
 
 # Run submission tests (validates correctness and shows cycle count)
 python3 tests/submission_tests.py
 
+# Run specific test file
+python3 -m pytest compiler/tests/test_regressions.py -v
+
 # Run specific test class
-python3 -m pytest tests/test_ir.py::TestCompilerRegressions -v
+python3 -m pytest compiler/tests/test_regressions.py::TestCompilerRegressions -v
 
 # Run with CLI flags
 python3 perf_takehome.py --trace --rounds 4 --batch-size 16
 ```
 
-### Test Organization (tests/test_ir.py)
+### Test Organization (compiler/tests/)
 
-- **TestIRCompiler**: End-to-end kernel correctness tests (small/medium/full sizes)
-- **TestIRCompilerSimplePrograms**: Unit tests for individual IR features (arithmetic, loops, if/else, select, bitwise ops)
-- **TestCompilerRegressions**: Regression tests for specific compiler bugs:
-  - `test_const_in_both_if_branches`: Constants used in both if/else branches
-  - `test_phi_swap_*`: Parallel copy semantics for swaps/rotations
-  - `test_no_explicit_zero_constant`: Programs without const 0
-  - `test_const_after_zero_iteration_loop`: Constants after 0-iteration loops
+Tests are organized by functionality:
+
+- **test_kernel.py**: End-to-end kernel correctness tests (small/medium/full sizes)
+- **test_simple_programs.py**: Unit tests for individual IR features (arithmetic, loops, if/else, select, bitwise ops)
+- **test_regressions.py**: Regression tests for specific compiler bugs
+- **test_loop_unroll.py**: Pass manager and loop unroll tests (including pragma unroll)
+- **test_cse.py**: Common subexpression elimination pass tests
+- **test_simplify.py**: Simplify pass tests (constant folding, identity ops, strength reduction)
+- **test_dce.py**: Dead code elimination pass tests
+- **test_simplify_cfg.py**: Control flow graph simplification pass tests
+- **test_codegen.py**: Code generation optimization tests
+
+Shared fixtures and imports are in `conftest.py`.
 
 ### Adding Tests
 
