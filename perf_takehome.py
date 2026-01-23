@@ -98,8 +98,7 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        use_ir: bool = True, print_after_all: bool = False, print_metrics: bool = False,
-        pass_config: str = None
+        use_ir: bool = True, print_after_all: bool = False, print_metrics: bool = False
     ):
         """
         Build kernel instructions.
@@ -109,17 +108,10 @@ class KernelBuilder:
                     If False, use the original unrolled implementation.
             print_after_all: If True, print IR after each compilation pass (only for IR mode).
             print_metrics: If True, print pass metrics and diagnostics (only for IR mode).
-            pass_config: Optional path to JSON config file for pass options.
-                         If None, auto-loads pass_config.json from the project root if it exists.
         """
         if use_ir:
-            # Auto-load pass_config.json if no config specified and the file exists
-            if pass_config is None:
-                default_config = os.path.join(os.path.dirname(__file__), "pass_config.json")
-                if os.path.exists(default_config):
-                    pass_config = default_config
             return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds,
-                                        print_after_all, print_metrics, pass_config)
+                                        print_after_all, print_metrics)
         return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
 
     def _build_kernel_unrolled(
@@ -213,7 +205,7 @@ class KernelBuilder:
 
     def build_kernel_ir(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        print_after_all: bool = False, print_metrics: bool = False, pass_config: str = None
+        print_after_all: bool = False, print_metrics: bool = False
     ):
         """
         Build kernel using the IR compiler with control flow (loops).
@@ -222,7 +214,6 @@ class KernelBuilder:
         Args:
             print_after_all: If True, print IR after each compilation pass.
             print_metrics: If True, print pass metrics and diagnostics.
-            pass_config: Optional path to JSON config file for pass options.
         """
         self.instrs, _ = build_tree_hash_kernel(
             forest_height=forest_height,
@@ -231,7 +222,6 @@ class KernelBuilder:
             rounds=rounds,
             print_after_all=print_after_all,
             print_metrics=print_metrics,
-            pass_config=pass_config
         )
         # Note: scratch_debug won't be populated with IR compiler
         # For now, leave it empty (debug info not critical for correctness)
@@ -250,7 +240,6 @@ def do_kernel_test(
     print_after_all: bool = False,
     print_metrics: bool = False,
     use_ir: bool = True,
-    pass_config: str = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -260,8 +249,7 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
-                    use_ir=use_ir, print_after_all=print_after_all, print_metrics=print_metrics,
-                    pass_config=pass_config)
+                    use_ir=use_ir, print_after_all=print_after_all, print_metrics=print_metrics)
     if print_vliw:
         for i, instr in enumerate(kb.instrs):
             print(f"[{i:4d}] {json.dumps(instr)}")
@@ -356,7 +344,7 @@ if __name__ == "__main__":
     # Check if running with custom flags (not unittest flags)
     # Only route to argparse when a known custom flag is present
     custom_flags = {'--print-vliw', '--print-after-all', '--no-ir', '--trace',
-                    '--forest-height', '--rounds', '--batch-size', '--pass-config',
+                    '--forest-height', '--rounds', '--batch-size',
                     '--print-metrics'}
     has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
 
@@ -376,8 +364,6 @@ if __name__ == "__main__":
                             help="Use the original unrolled kernel instead of IR")
         parser.add_argument("--trace", action="store_true",
                             help="Enable execution trace")
-        parser.add_argument("--pass-config", type=str, default=None,
-                            help="Path to JSON config file for pass options")
         parser.add_argument("--forest-height", type=int, default=10,
                             help="Forest height (default: 10)")
         parser.add_argument("--rounds", type=int, default=16,
@@ -395,7 +381,6 @@ if __name__ == "__main__":
             print_after_all=args.print_after_all,
             print_metrics=args.print_metrics,
             use_ir=not args.no_ir,
-            pass_config=args.pass_config,
         )
     else:
         # Run unittest by default
