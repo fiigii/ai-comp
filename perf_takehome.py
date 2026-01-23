@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import json
 import random
 import unittest
 
@@ -34,6 +35,13 @@ from problem import (
     reference_kernel,
     build_mem_image,
     reference_kernel2,
+)
+
+from ir_compiler import (
+    HIRBuilder,
+    lower_to_lir,
+    compile_to_vliw,
+    compile_hir_to_vliw,
 )
 
 
@@ -86,9 +94,26 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        use_ir: bool = True, print_after_all: bool = False
+    ):
+        """
+        Build kernel instructions.
+
+        Args:
+            use_ir: If True (default), use the IR compiler with control flow.
+                    If False, use the original unrolled implementation.
+            print_after_all: If True, print IR after each compilation pass (only for IR mode).
+        """
+        if use_ir:
+            return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds, print_after_all)
+        return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
+
+    def _build_kernel_unrolled(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
+        Original unrolled kernel implementation.
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
@@ -173,6 +198,125 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+    def build_kernel_ir(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        print_after_all: bool = False
+    ):
+        """
+        Build kernel using the IR compiler with control flow (loops).
+        This uses SSA-form HIR which is lowered to LIR and then to VLIW.
+
+        Args:
+            print_after_all: If True, print IR after each compilation pass.
+        """
+        b = HIRBuilder()
+
+        # Load header values from memory (addresses 0-6)
+        def load_header(idx: int, name: str):
+            addr = b.const_load(idx, f"addr_{name}")
+            return b.load(addr, name)
+
+        rounds_val = load_header(0, "rounds")
+        n_nodes_val = load_header(1, "n_nodes")
+        batch_size_val = load_header(2, "batch_size")
+        forest_height_val = load_header(3, "forest_height")
+        forest_values_p = load_header(4, "forest_values_p")
+        inp_indices_p = load_header(5, "inp_indices_p")
+        inp_values_p = load_header(6, "inp_values_p")
+
+        # Constants
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        two = b.const_load(2, "two")
+
+        # Use compile-time constants for loop bounds
+        rounds_end = b.const_load(rounds, "rounds_end")
+        batch_end = b.const_load(batch_size, "batch_end")
+
+        # Hash stage constants
+        hash_consts = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            c1 = b.const_load(val1, f"hash_c1_{val1:x}")
+            c3 = b.const_load(val3, f"hash_c3_{val3}")
+            hash_consts.append((c1, c3))
+
+        # First pause (sync with reference_kernel2 first yield)
+        b.pause()
+
+        # Outer loop: rounds
+        def round_body(round_i, round_params):
+            # Inner loop: batch elements
+            def batch_body(batch_i, batch_params):
+                # idx = mem[inp_indices_p + i]
+                idx_addr = b.add(inp_indices_p, batch_i, "idx_addr")
+                idx = b.load(idx_addr, "idx")
+
+                # val = mem[inp_values_p + i]
+                val_addr = b.add(inp_values_p, batch_i, "val_addr")
+                val = b.load(val_addr, "val")
+
+                # node_val = mem[forest_values_p + idx]
+                node_addr = b.add(forest_values_p, idx, "node_addr")
+                node_val = b.load(node_addr, "node_val")
+
+                # val = val ^ node_val
+                val = b.xor(val, node_val, "xored")
+
+                # Hash computation (6 stages)
+                for i, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
+                    c1, c3 = hash_consts[i]
+                    t1 = b.alu(op1, val, c1, f"h{i}_t1")
+                    t2 = b.alu(op3, val, c3, f"h{i}_t2")
+                    val = b.alu(op2, t1, t2, f"h{i}_val")
+
+                # idx = 2*idx + (1 if val%2==0 else 2)
+                mod_val = b.mod(val, two, "mod_val")
+                is_even = b.eq(mod_val, zero, "is_even")
+                offset = b.select(is_even, one, two, "offset")
+                idx_doubled = b.mul(idx, two, "idx_doubled")
+                next_idx = b.add(idx_doubled, offset, "next_idx")
+
+                # Wrap: idx = 0 if idx >= n_nodes else idx
+                in_bounds = b.lt(next_idx, n_nodes_val, "in_bounds")
+                final_idx = b.select(in_bounds, next_idx, zero, "final_idx")
+
+                # Store back
+                idx_store_addr = b.add(inp_indices_p, batch_i, "idx_store_addr")
+                b.store(idx_store_addr, final_idx)
+
+                val_store_addr = b.add(inp_values_p, batch_i, "val_store_addr")
+                b.store(val_store_addr, val)
+
+                return []  # No loop-carried values
+
+            # Batch loop
+            b.for_loop(
+                start=zero,
+                end=batch_end,
+                iter_args=[],
+                body_fn=batch_body
+            )
+            return []  # No loop-carried values
+
+        # Round loop
+        b.for_loop(
+            start=zero,
+            end=rounds_end,
+            iter_args=[],
+            body_fn=round_body
+        )
+
+        # Final pause (sync with reference_kernel2 second yield)
+        b.pause()
+
+        # Compile HIR -> LIR -> VLIW
+        hir = b.build()
+        self.instrs = compile_hir_to_vliw(hir, print_after_all=print_after_all)
+
+        # Note: scratch_debug won't be populated with IR compiler
+        # For now, leave it empty (debug info not critical for correctness)
+
+
 BASELINE = 147734
 
 def do_kernel_test(
@@ -182,6 +326,9 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    print_vliw: bool = False,
+    print_after_all: bool = False,
+    use_ir: bool = True,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -190,8 +337,11 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
+                    use_ir=use_ir, print_after_all=print_after_all)
+    if print_vliw:
+        for i, instr in enumerate(kb.instrs):
+            print(f"[{i:4d}] {json.dumps(instr)}")
 
     value_trace = {}
     machine = Machine(
@@ -271,5 +421,47 @@ class Tests(unittest.TestCase):
 # To run the proper checks to see which thresholds you pass:
 #    python tests/submission_tests.py
 
+# Command line flags:
+#    --print-vliw        Print the final VLIW instructions
+#    --print-after-all   Print IR after each compilation pass
+#    --no-ir             Use the original unrolled kernel instead of IR
+
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    import argparse
+
+    # Check if running with unittest arguments or custom flags
+    if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):
+        # Running a specific test
+        unittest.main()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--print-vliw", "--print-after-all", "--no-ir", "-h", "--help"):
+        # Custom flags - run do_kernel_test directly
+        parser = argparse.ArgumentParser(description="Performance engineering take-home")
+        parser.add_argument("--print-vliw", action="store_true",
+                            help="Print the final VLIW instructions")
+        parser.add_argument("--print-after-all", action="store_true",
+                            help="Print IR after each compilation pass")
+        parser.add_argument("--no-ir", action="store_true",
+                            help="Use the original unrolled kernel instead of IR")
+        parser.add_argument("--trace", action="store_true",
+                            help="Enable execution trace")
+        parser.add_argument("--forest-height", type=int, default=10,
+                            help="Forest height (default: 10)")
+        parser.add_argument("--rounds", type=int, default=16,
+                            help="Number of rounds (default: 16)")
+        parser.add_argument("--batch-size", type=int, default=256,
+                            help="Batch size (default: 256)")
+        args = parser.parse_args()
+
+        do_kernel_test(
+            args.forest_height,
+            args.rounds,
+            args.batch_size,
+            trace=args.trace,
+            print_vliw=args.print_vliw,
+            print_after_all=args.print_after_all,
+            use_ir=not args.no_ir,
+        )
+    else:
+        # Run unittest by default
+        unittest.main()
