@@ -481,6 +481,12 @@ class LoopUnrollPass(Pass):
                 result.append(stmt)
         return result
 
+    def _resolve_ssa_binding(self, value: SSAValue, bindings: dict[int, SSAValue]) -> SSAValue:
+        """Resolve SSA bindings transitively (old -> new -> ...)."""
+        while value.id in bindings:
+            value = bindings[value.id]
+        return value
+
     def _apply_bindings(self, stmt: Statement, bindings: dict[int, SSAValue]) -> Statement:
         """Apply SSA value bindings to a statement's operands."""
         if not bindings:
@@ -490,7 +496,7 @@ class LoopUnrollPass(Pass):
             new_operands = []
             for op in stmt.operands:
                 if isinstance(op, SSAValue) and op.id in bindings:
-                    new_operands.append(bindings[op.id])
+                    new_operands.append(self._resolve_ssa_binding(op, bindings))
                 else:
                     new_operands.append(op)
             return Op(stmt.opcode, stmt.result, new_operands, stmt.engine)
@@ -500,30 +506,37 @@ class LoopUnrollPass(Pass):
             new_iter_args = []
             for arg in stmt.iter_args:
                 if arg.id in bindings:
-                    new_iter_args.append(bindings[arg.id])
+                    new_iter_args.append(self._resolve_ssa_binding(arg, bindings))
                 else:
                     new_iter_args.append(arg)
+            new_yields = [self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.yields]
             return ForLoop(
                 counter=stmt.counter,
                 start=stmt.start if not isinstance(stmt.start, SSAValue) or stmt.start.id not in bindings
-                      else bindings[stmt.start.id],
+                      else self._resolve_ssa_binding(stmt.start, bindings),
                 end=stmt.end if not isinstance(stmt.end, SSAValue) or stmt.end.id not in bindings
-                    else bindings[stmt.end.id],
+                    else self._resolve_ssa_binding(stmt.end, bindings),
                 iter_args=new_iter_args,
                 body_params=stmt.body_params,
                 body=stmt.body,
-                yields=stmt.yields,
+                yields=new_yields,
                 results=stmt.results
             )
 
         elif isinstance(stmt, If):
-            new_cond = bindings.get(stmt.cond.id, stmt.cond)
+            new_cond = self._resolve_ssa_binding(stmt.cond, bindings) if stmt.cond.id in bindings else stmt.cond
+            new_then_yields = [
+                self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.then_yields
+            ]
+            new_else_yields = [
+                self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.else_yields
+            ]
             return If(
                 cond=new_cond,
                 then_body=stmt.then_body,
-                then_yields=stmt.then_yields,
+                then_yields=new_then_yields,
                 else_body=stmt.else_body,
-                else_yields=stmt.else_yields,
+                else_yields=new_else_yields,
                 results=stmt.results
             )
 
@@ -533,12 +546,14 @@ class LoopUnrollPass(Pass):
         self, if_stmt: If, factor: Optional[int], max_trip: int, ctx: SSARenumberContext
     ) -> If:
         """Recursively transform If statement bodies."""
+        then_body = self._transform_statements(if_stmt.then_body, factor, max_trip, ctx)
+        else_body = self._transform_statements(if_stmt.else_body, factor, max_trip, ctx)
         return If(
             cond=if_stmt.cond,
-            then_body=self._transform_statements(if_stmt.then_body, factor, max_trip, ctx),
-            then_yields=if_stmt.then_yields,
-            else_body=self._transform_statements(if_stmt.else_body, factor, max_trip, ctx),
-            else_yields=if_stmt.else_yields,
+            then_body=then_body,
+            then_yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in if_stmt.then_yields],
+            else_body=else_body,
+            else_yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in if_stmt.else_yields],
             results=if_stmt.results
         )
 
@@ -557,7 +572,7 @@ class LoopUnrollPass(Pass):
                 iter_args=loop.iter_args,
                 body_params=loop.body_params,
                 body=new_body,
-                yields=loop.yields,
+                yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
                 results=loop.results
             )]
 
@@ -582,7 +597,7 @@ class LoopUnrollPass(Pass):
                     iter_args=loop.iter_args,
                     body_params=loop.body_params,
                     body=new_body,
-                    yields=loop.yields,
+                    yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
                     results=loop.results
                 )]
             actual_factor = trip_count
@@ -596,7 +611,7 @@ class LoopUnrollPass(Pass):
                 iter_args=loop.iter_args,
                 body_params=loop.body_params,
                 body=new_body,
-                yields=loop.yields,
+                yields=[self._resolve_ssa_binding(y, ctx.result_bindings) for y in loop.yields],
                 results=loop.results
             )]
         else:
@@ -802,10 +817,6 @@ class LoopUnrollPass(Pass):
                     cloned_body.append(Op("const", ssa, [remapped], "load"))
                     new_yields.append(ssa)
 
-            # Update outer remap with results
-            for old_res, new_res in zip(stmt.results, new_results):
-                remap[old_res.id] = new_res
-
             # Remap start/end
             new_start = self._remap_operand(stmt.start, remap) if isinstance(stmt.start, SSAValue) else stmt.start
             new_end = self._remap_operand(stmt.end, remap) if isinstance(stmt.end, SSAValue) else stmt.end
@@ -822,7 +833,11 @@ class LoopUnrollPass(Pass):
             )
 
             # Recursively unroll nested loop if it has static bounds
-            return self._unroll_loop(new_loop, nested_factor, max_trip, ctx)
+            replacement = self._unroll_loop(new_loop, nested_factor, max_trip, ctx)
+            # Ensure subsequent uses reference the post-unroll replacements.
+            for old_res, new_res in zip(stmt.results, new_results):
+                remap[old_res.id] = self._resolve_ssa_binding(new_res, ctx.result_bindings)
+            return replacement
 
         elif isinstance(stmt, If):
             # Clone If statement
