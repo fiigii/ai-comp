@@ -2902,6 +2902,199 @@ class TestSimplifyPass(unittest.TestCase):
         self.assertEqual(count_statements(result_disabled), original_count)
         print("Simplify config disable test passed!")
 
+    # --- Peephole Optimization Tests ---
+
+    def test_simplify_mod2_to_and1(self):
+        """Test %(x, 2) -> &(x, 1) strength reduction."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        x = b.load(addr0, "x")
+        two = b.const_load(2, "two")
+        result = b.mod(x, two, "result")  # x % 2
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        # Apply simplify pass
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        # Verify the mod was converted to and
+        # Check by running the program - should get same result
+        instrs = compile_hir_to_vliw(simplified)
+
+        # Test with various values
+        for val in [0, 1, 2, 3, 4, 5, 100, 255]:
+            mem = [val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            self.assertEqual(machine.mem[0], val % 2, f"Failed for input {val}")
+
+        print("Simplify mod2 to and1 test passed!")
+
+    def test_simplify_mul2_to_shift(self):
+        """Test *(x, 2) -> <<(x, 1) strength reduction."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        x = b.load(addr0, "x")
+        two = b.const_load(2, "two")
+        result = b.mul(x, two, "result")  # x * 2
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        # Apply simplify pass
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        # Verify by running the program
+        instrs = compile_hir_to_vliw(simplified)
+
+        for val in [0, 1, 2, 3, 100, 1000]:
+            mem = [val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            expected = (val * 2) & 0xFFFFFFFF  # 32-bit wrap
+            self.assertEqual(machine.mem[0], expected, f"Failed for input {val}")
+
+        print("Simplify mul2 to shift test passed!")
+
+    def test_simplify_mul_power_of_2(self):
+        """Test *(x, 16) -> <<(x, 4) and other powers of 2."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        # Test multiply by 16 (2^4)
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        x = b.load(addr0, "x")
+        sixteen = b.const_load(16, "sixteen")
+        result = b.mul(x, sixteen, "result")  # x * 16
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(simplified)
+
+        for val in [0, 1, 2, 5, 100]:
+            mem = [val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            expected = (val * 16) & 0xFFFFFFFF
+            self.assertEqual(machine.mem[0], expected, f"Failed for input {val}")
+
+        print("Simplify mul power of 2 test passed!")
+
+    def test_simplify_select_to_multiply(self):
+        """Test select(cond, x, 0) -> *(x, cond) when cond is boolean."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        y = b.load(addr1, "y")
+
+        # cond = x < 5 (produces 0 or 1)
+        five = b.const_load(5, "five")
+        cond = b.lt(x, five, "cond")
+
+        # select(cond, y, 0) should become y * cond
+        zero = b.const_load(0, "zero")
+
+        def then_fn():
+            return [y]
+
+        def else_fn():
+            return [zero]
+
+        results = b.if_stmt(cond, then_fn, else_fn)
+        b.store(addr0, results[0])
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(simplified)
+
+        # Test: when x < 5, result should be y; when x >= 5, result should be 0
+        test_cases = [
+            (0, 42, 42),   # 0 < 5, so select y=42
+            (3, 100, 100), # 3 < 5, so select y=100
+            (5, 42, 0),    # 5 >= 5, so select 0
+            (10, 100, 0),  # 10 >= 5, so select 0
+        ]
+
+        for x_val, y_val, expected in test_cases:
+            mem = [x_val, y_val] + [0] * 98
+            machine = self._run_program(instrs, mem)
+            self.assertEqual(machine.mem[0], expected,
+                           f"Failed for x={x_val}, y={y_val}, expected {expected}")
+
+        print("Simplify select to multiply test passed!")
+
+    def test_simplify_parity_pattern(self):
+        """Test full parity pattern: %(x,2) + ==(mod,0) + select(even,1,2) -> &(x,1) + 1."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        x = b.load(addr0, "x")
+
+        # Parity pattern: offset = select(x % 2 == 0, 1, 2)
+        two = b.const_load(2, "two")
+        mod = b.mod(x, two, "mod")  # x % 2 -> & 1 (boolean)
+
+        zero = b.const_load(0, "zero")
+        even = b.eq(mod, zero, "even")  # == 0, tracked as negated boolean
+
+        one = b.const_load(1, "one")
+        two_const = b.const_load(2, "two_const")
+
+        # select(even, 1, 2) should become (x & 1) + 1
+        def then_fn():
+            return [one]
+
+        def else_fn():
+            return [two_const]
+
+        results = b.if_stmt(even, then_fn, else_fn)
+        b.store(addr0, results[0])
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(simplified)
+
+        # Test: when x is even, result is 1; when x is odd, result is 2
+        test_cases = [
+            (0, 1),   # 0 is even -> 1
+            (1, 2),   # 1 is odd -> 2
+            (2, 1),   # 2 is even -> 1
+            (3, 2),   # 3 is odd -> 2
+            (100, 1), # 100 is even -> 1
+            (101, 2), # 101 is odd -> 2
+        ]
+
+        for x_val, expected in test_cases:
+            mem = [x_val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            self.assertEqual(machine.mem[0], expected,
+                           f"Failed for x={x_val}, expected {expected}")
+
+        print("Simplify parity pattern test passed!")
+
 
 class TestDCEPass(unittest.TestCase):
     """Test Dead Code Elimination pass."""

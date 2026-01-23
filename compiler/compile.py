@@ -40,8 +40,9 @@ def compile_hir_to_vliw(
     pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-unroll cleanup)
     pipeline.add_pass(LoopUnrollPass())      # HIR -> HIR
     pipeline.add_pass(SimplifyPass())        # HIR -> HIR (constant fold & identities)
+    pipeline.add_pass(DCEPass())             # HIR -> HIR (post-peephole cleanup)
     pipeline.add_pass(CSEPass())             # HIR -> HIR
-    pipeline.add_pass(DCEPass())             # HIR -> HIR (post-CSE cleanup)
+    pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-lowering cleanup)
     pipeline.add_pass(HIRToLIRPass())        # HIR -> LIR
     pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
     pipeline.add_pass(LIRToVLIWPass())       # LIR -> VLIW
