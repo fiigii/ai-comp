@@ -39,6 +39,7 @@ from problem import (
 
 from ir_compiler import (
     HIRBuilder,
+    Const,
     lower_to_lir,
     compile_to_vliw,
     compile_hir_to_vliw,
@@ -95,7 +96,7 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        use_ir: bool = True, print_after_all: bool = False
+        use_ir: bool = True, print_after_all: bool = False, pass_config: str = None
     ):
         """
         Build kernel instructions.
@@ -104,9 +105,11 @@ class KernelBuilder:
             use_ir: If True (default), use the IR compiler with control flow.
                     If False, use the original unrolled implementation.
             print_after_all: If True, print IR after each compilation pass (only for IR mode).
+            pass_config: Optional path to JSON config file for pass options.
         """
         if use_ir:
-            return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds, print_after_all)
+            return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds,
+                                        print_after_all, pass_config)
         return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
 
     def _build_kernel_unrolled(
@@ -200,7 +203,7 @@ class KernelBuilder:
 
     def build_kernel_ir(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        print_after_all: bool = False
+        print_after_all: bool = False, pass_config: str = None
     ):
         """
         Build kernel using the IR compiler with control flow (loops).
@@ -208,7 +211,9 @@ class KernelBuilder:
 
         Args:
             print_after_all: If True, print IR after each compilation pass.
+            pass_config: Optional path to JSON config file for pass options.
         """
+        self._pass_config = pass_config  # Store for compile call
         b = HIRBuilder()
 
         # Load header values from memory (addresses 0-6)
@@ -224,14 +229,15 @@ class KernelBuilder:
         inp_indices_p = load_header(5, "inp_indices_p")
         inp_values_p = load_header(6, "inp_values_p")
 
-        # Constants
+        # Constants (as SSAValues for use in computations)
         zero = b.const_load(0, "zero")
         one = b.const_load(1, "one")
         two = b.const_load(2, "two")
 
-        # Use compile-time constants for loop bounds
-        rounds_end = b.const_load(rounds, "rounds_end")
-        batch_end = b.const_load(batch_size, "batch_end")
+        # Compile-time constants for loop bounds (as Const for unrolling)
+        rounds_const = Const(rounds)
+        batch_const = Const(batch_size)
+        zero_const = Const(0)
 
         # Hash stage constants
         hash_consts = []
@@ -289,19 +295,19 @@ class KernelBuilder:
 
                 return []  # No loop-carried values
 
-            # Batch loop
+            # Batch loop (use Const bounds for unrolling)
             b.for_loop(
-                start=zero,
-                end=batch_end,
+                start=zero_const,
+                end=batch_const,
                 iter_args=[],
                 body_fn=batch_body
             )
             return []  # No loop-carried values
 
-        # Round loop
+        # Round loop (use Const bounds for unrolling)
         b.for_loop(
-            start=zero,
-            end=rounds_end,
+            start=zero_const,
+            end=rounds_const,
             iter_args=[],
             body_fn=round_body
         )
@@ -311,7 +317,8 @@ class KernelBuilder:
 
         # Compile HIR -> LIR -> VLIW
         hir = b.build()
-        self.instrs = compile_hir_to_vliw(hir, print_after_all=print_after_all)
+        self.instrs = compile_hir_to_vliw(hir, print_after_all=print_after_all,
+                                          config_path=self._pass_config)
 
         # Note: scratch_debug won't be populated with IR compiler
         # For now, leave it empty (debug info not critical for correctness)
@@ -329,6 +336,7 @@ def do_kernel_test(
     print_vliw: bool = False,
     print_after_all: bool = False,
     use_ir: bool = True,
+    pass_config: str = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -338,7 +346,7 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
-                    use_ir=use_ir, print_after_all=print_after_all)
+                    use_ir=use_ir, print_after_all=print_after_all, pass_config=pass_config)
     if print_vliw:
         for i, instr in enumerate(kb.instrs):
             print(f"[{i:4d}] {json.dumps(instr)}")
@@ -450,6 +458,8 @@ if __name__ == "__main__":
                             help="Use the original unrolled kernel instead of IR")
         parser.add_argument("--trace", action="store_true",
                             help="Enable execution trace")
+        parser.add_argument("--pass-config", type=str, default=None,
+                            help="Path to JSON config file for pass options")
         parser.add_argument("--forest-height", type=int, default=10,
                             help="Forest height (default: 10)")
         parser.add_argument("--rounds", type=int, default=16,
@@ -466,6 +476,7 @@ if __name__ == "__main__":
             print_vliw=args.print_vliw,
             print_after_all=args.print_after_all,
             use_ir=not args.no_ir,
+            pass_config=args.pass_config,
         )
     else:
         # Run unittest by default
