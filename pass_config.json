@@ -11,6 +11,10 @@
         "max_trip_count": 10000
       }
     },
+    "simplify": {
+      "enabled": true,
+      "options": {}
+    },
     "cse": {
       "enabled": true,
       "options": {}

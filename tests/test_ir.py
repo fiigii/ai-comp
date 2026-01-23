@@ -2133,6 +2133,702 @@ class TestCSEPass(unittest.TestCase):
 
         print("CSE config enabled/disabled test passed!")
 
+    # --- Commutative Op Canonicalization Tests ---
+
+    def test_cse_commutative_add(self):
+        """Test that a + b and b + a are merged (commutative)."""
+        from compiler import HIRBuilder, PassManager, CSEPass, count_statements
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        addr2 = b.const_load(2, "addr2")
+        a = b.load(addr0, "a")
+        val_b = b.load(addr1, "b")
+
+        # a + b
+        result1 = b.add(a, val_b, "result1")
+        # b + a (same operation, different order - should be eliminated)
+        result2 = b.add(val_b, a, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+        original_count = count_statements(hir)
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # One addition should be eliminated due to commutativity
+        self.assertLess(count_statements(transformed), original_count)
+        print("CSE commutative add test passed!")
+
+    def test_cse_commutative_mul(self):
+        """Test that a * b and b * a are merged (commutative)."""
+        from compiler import HIRBuilder, PassManager, CSEPass, count_statements, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        a = b.load(addr0, "a")
+        val_b = b.load(addr1, "b")
+
+        # a * b
+        result1 = b.mul(a, val_b, "result1")
+        # b * a (should be eliminated)
+        result2 = b.mul(val_b, a, "result2")
+
+        sum_results = b.add(result1, result2, "sum")
+        b.store(addr0, sum_results)
+
+        hir = b.build()
+        original_count = count_statements(hir)
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # One mul should be eliminated
+        self.assertLess(count_statements(transformed), original_count)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [3, 4] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        # 3 * 4 = 12, result1 + result2 = 12 + 12 = 24
+        self.assertEqual(machine.mem[0], 24)
+        print("CSE commutative mul test passed!")
+
+    def test_cse_commutative_xor(self):
+        """Test that a ^ b and b ^ a are merged (commutative)."""
+        from compiler import HIRBuilder, PassManager, CSEPass, count_statements
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        a = b.load(addr0, "a")
+        val_b = b.load(addr1, "b")
+
+        # a ^ b
+        result1 = b.xor(a, val_b, "result1")
+        # b ^ a (should be eliminated)
+        result2 = b.xor(val_b, a, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+        original_count = count_statements(hir)
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # One xor should be eliminated
+        self.assertLess(count_statements(transformed), original_count)
+        print("CSE commutative xor test passed!")
+
+    def test_cse_non_commutative_sub_not_merged(self):
+        """Test that a - b and b - a are NOT merged (non-commutative)."""
+        from compiler import HIRBuilder, PassManager, CSEPass, count_statements, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        addr2 = b.const_load(2, "addr2")
+        a = b.load(addr0, "a")
+        val_b = b.load(addr1, "b")
+
+        # a - b
+        result1 = b.sub(a, val_b, "result1")
+        # b - a (different operation, should NOT be eliminated)
+        result2 = b.sub(val_b, a, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [10, 4, 0] + [0] * 97
+        machine = self._run_program(instrs, mem)
+        # a - b = 10 - 4 = 6, b - a = 4 - 10 = -6 (wraps in 32-bit)
+        self.assertEqual(machine.mem[0], 6)
+        self.assertEqual(machine.mem[1], (4 - 10) & 0xFFFFFFFF)
+        print("CSE non-commutative sub not merged test passed!")
+
+    def test_cse_non_commutative_div_not_merged(self):
+        """Test that a // b and b // a are NOT merged (non-commutative)."""
+        from compiler import HIRBuilder, PassManager, CSEPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        a = b.load(addr0, "a")
+        val_b = b.load(addr1, "b")
+
+        # a // b
+        result1 = b.div(a, val_b, "result1")
+        # b // a (different operation, should NOT be eliminated)
+        result2 = b.div(val_b, a, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [20, 4, 0] + [0] * 97
+        machine = self._run_program(instrs, mem)
+        # a // b = 20 // 4 = 5, b // a = 4 // 20 = 0
+        self.assertEqual(machine.mem[0], 5)
+        self.assertEqual(machine.mem[1], 0)
+        print("CSE non-commutative div not merged test passed!")
+
+    # --- Memory Epoch Tracking Tests ---
+
+    def test_cse_multiple_loads_same_epoch(self):
+        """Test that multiple loads with same address in same epoch are CSE'd."""
+        from compiler import HIRBuilder, PassManager, CSEPass, count_statements
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+
+        # Multiple loads from same address, no store between
+        val1 = b.load(addr0, "val1")
+        val2 = b.load(addr0, "val2")  # Same epoch, should be eliminated
+        val3 = b.load(addr0, "val3")  # Same epoch, should be eliminated
+
+        result = b.add(val1, b.add(val2, val3, "sum23"), "result")
+        b.store(addr1, result)
+
+        hir = b.build()
+        original_count = count_statements(hir)
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Two loads should be eliminated
+        self.assertLess(count_statements(transformed), original_count)
+        print("CSE multiple loads same epoch test passed!")
+
+    def test_cse_loads_different_epochs_not_merged(self):
+        """Test that loads with different epochs are NOT merged."""
+        from compiler import HIRBuilder, PassManager, CSEPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        val99 = b.const_load(99, "val99")
+
+        # Load, store, load - different epochs
+        val1 = b.load(addr0, "val1")
+        b.store(addr0, val99)  # Increments epoch
+        val2 = b.load(addr0, "val2")  # Different epoch, should NOT be eliminated
+
+        b.store(addr1, val2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        # After store, addr0 = 99, so val2 = 99
+        self.assertEqual(machine.mem[1], 99)
+        print("CSE loads different epochs not merged test passed!")
+
+    def test_cse_epoch_propagates_from_loop(self):
+        """Test that store in loop increments parent epoch."""
+        from compiler import HIRBuilder, PassManager, CSEPass, Const, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+
+        # Load before loop
+        val_before = b.load(addr0, "val_before")
+
+        def loop_body(i, params):
+            # Store in loop should affect epoch
+            b.store(addr0, i)
+            return []
+
+        b.for_loop(start=Const(0), end=Const(3), iter_args=[], body_fn=loop_body)
+
+        # Load after loop - should NOT be CSE'd with val_before
+        val_after = b.load(addr0, "val_after")
+        b.store(addr1, val_after)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        # After loop, addr0 = 2 (last iteration), so val_after = 2
+        self.assertEqual(machine.mem[1], 2)
+        print("CSE epoch propagates from loop test passed!")
+
+    def test_cse_epoch_propagates_from_if(self):
+        """Test that store in branch increments parent epoch."""
+        from compiler import HIRBuilder, PassManager, CSEPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        val99 = b.const_load(99, "val99")
+
+        # Load before if
+        val_before = b.load(addr0, "val_before")
+
+        cond = b.load(addr1, "cond")
+
+        def then_fn():
+            b.store(addr0, val99)
+            return []
+
+        def else_fn():
+            return []
+
+        b.if_stmt(cond, then_fn, else_fn)
+
+        # Load after if - should NOT be CSE'd with val_before
+        val_after = b.load(addr0, "val_after")
+        b.store(addr1, val_after)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(CSEPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness with cond = 1 (then branch)
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 1] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        # After then branch, addr0 = 99, so val_after = 99
+        self.assertEqual(machine.mem[1], 99)
+        print("CSE epoch propagates from if test passed!")
+
+
+class TestSimplifyPass(unittest.TestCase):
+    """Test Simplify pass (constant folding and algebraic identities)."""
+
+    def _run_program(self, instrs, mem):
+        """Helper to run a compiled program."""
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    # --- Constant Folding Tests ---
+
+    def test_constant_fold_add(self):
+        """Test that Const(10) + Const(20) -> Const(30)."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        val10 = b.const_load(10, "val10")
+        val20 = b.const_load(20, "val20")
+
+        result = b.add(val10, val20, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        # Verify correctness
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 30)
+        print("Constant fold add test passed!")
+
+    def test_constant_fold_all_ops(self):
+        """Test constant folding for all supported operations."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr = [b.const_load(i, f"addr{i}") for i in range(12)]
+
+        val10 = b.const_load(10, "val10")
+        val3 = b.const_load(3, "val3")
+
+        # Test all foldable ops
+        r_add = b.add(val10, val3, "r_add")       # 10 + 3 = 13
+        r_sub = b.sub(val10, val3, "r_sub")       # 10 - 3 = 7
+        r_mul = b.mul(val10, val3, "r_mul")       # 10 * 3 = 30
+        r_div = b.div(val10, val3, "r_div")       # 10 // 3 = 3
+        r_mod = b.mod(val10, val3, "r_mod")       # 10 % 3 = 1
+        r_xor = b.xor(val10, val3, "r_xor")       # 10 ^ 3 = 9
+        r_and = b.and_(val10, val3, "r_and")      # 10 & 3 = 2
+        r_or = b.or_(val10, val3, "r_or")         # 10 | 3 = 11
+        r_shl = b.shl(val10, val3, "r_shl")       # 10 << 3 = 80
+        r_shr = b.shr(val10, val3, "r_shr")       # 10 >> 3 = 1
+        r_lt = b.lt(val3, val10, "r_lt")          # 3 < 10 = 1
+        r_eq = b.eq(val3, val3, "r_eq")           # 3 == 3 = 1
+
+        b.store(addr[0], r_add)
+        b.store(addr[1], r_sub)
+        b.store(addr[2], r_mul)
+        b.store(addr[3], r_div)
+        b.store(addr[4], r_mod)
+        b.store(addr[5], r_xor)
+        b.store(addr[6], r_and)
+        b.store(addr[7], r_or)
+        b.store(addr[8], r_shl)
+        b.store(addr[9], r_shr)
+        b.store(addr[10], r_lt)
+        b.store(addr[11], r_eq)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [0] * 100
+        machine = self._run_program(instrs, mem)
+
+        self.assertEqual(machine.mem[0], 13)   # add
+        self.assertEqual(machine.mem[1], 7)    # sub
+        self.assertEqual(machine.mem[2], 30)   # mul
+        self.assertEqual(machine.mem[3], 3)    # div
+        self.assertEqual(machine.mem[4], 1)    # mod
+        self.assertEqual(machine.mem[5], 9)    # xor
+        self.assertEqual(machine.mem[6], 2)    # and
+        self.assertEqual(machine.mem[7], 11)   # or
+        self.assertEqual(machine.mem[8], 80)   # shl
+        self.assertEqual(machine.mem[9], 1)    # shr
+        self.assertEqual(machine.mem[10], 1)   # lt
+        self.assertEqual(machine.mem[11], 1)   # eq
+        print("Constant fold all ops test passed!")
+
+    # --- Algebraic Identity Tests ---
+
+    def test_identity_add_zero(self):
+        """Test that x + 0 -> x and 0 + x -> x."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+
+        # x + 0 -> x
+        result1 = b.add(x, zero, "result1")
+        # 0 + x -> x
+        result2 = b.add(zero, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 42)
+        self.assertEqual(machine.mem[1], 42)
+        print("Identity add zero test passed!")
+
+    def test_identity_mul_one(self):
+        """Test that x * 1 -> x and 1 * x -> x."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        one = b.const_load(1, "one")
+
+        # x * 1 -> x
+        result1 = b.mul(x, one, "result1")
+        # 1 * x -> x
+        result2 = b.mul(one, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 42)
+        self.assertEqual(machine.mem[1], 42)
+        print("Identity mul one test passed!")
+
+    def test_identity_mul_zero(self):
+        """Test that x * 0 -> 0 and 0 * x -> 0."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+
+        # x * 0 -> 0
+        result1 = b.mul(x, zero, "result1")
+        # 0 * x -> 0
+        result2 = b.mul(zero, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 99] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 0)
+        self.assertEqual(machine.mem[1], 0)
+        print("Identity mul zero test passed!")
+
+    def test_identity_xor_zero(self):
+        """Test that x ^ 0 -> x and 0 ^ x -> x."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+
+        # x ^ 0 -> x
+        result1 = b.xor(x, zero, "result1")
+        # 0 ^ x -> x
+        result2 = b.xor(zero, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 42)
+        self.assertEqual(machine.mem[1], 42)
+        print("Identity xor zero test passed!")
+
+    def test_identity_and_zero(self):
+        """Test that x & 0 -> 0 and 0 & x -> 0."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+
+        # x & 0 -> 0
+        result1 = b.and_(x, zero, "result1")
+        # 0 & x -> 0
+        result2 = b.and_(zero, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 99] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 0)
+        self.assertEqual(machine.mem[1], 0)
+        print("Identity and zero test passed!")
+
+    def test_identity_or_zero(self):
+        """Test that x | 0 -> x and 0 | x -> x."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+
+        # x | 0 -> x
+        result1 = b.or_(x, zero, "result1")
+        # 0 | x -> x
+        result2 = b.or_(zero, x, "result2")
+
+        b.store(addr0, result1)
+        b.store(addr1, result2)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [42, 0] + [0] * 98
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 42)
+        self.assertEqual(machine.mem[1], 42)
+        print("Identity or zero test passed!")
+
+    # --- Integration Tests ---
+
+    def test_simplify_preserves_semantics(self):
+        """Test that simplify pass preserves program semantics."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass, compile_hir_to_vliw
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        x = b.load(addr0, "x")
+        y = b.load(addr1, "y")
+
+        # Expression with simplifiable subexpressions
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+
+        # (x + 0) * (y * 1) + (10 + 20)
+        t1 = b.add(x, zero, "t1")
+        t2 = b.mul(y, one, "t2")
+        t3 = b.mul(t1, t2, "t3")
+        val10 = b.const_load(10, "val10")
+        val20 = b.const_load(20, "val20")
+        t4 = b.add(val10, val20, "t4")
+        result = b.add(t3, t4, "result")
+
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        # Without simplify
+        instrs_no_simplify = compile_hir_to_vliw(hir)
+        mem_no_simplify = [5, 7] + [0] * 98
+        machine_no_simplify = self._run_program(instrs_no_simplify, mem_no_simplify)
+
+        # With simplify
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        transformed = pm.run(hir)
+        instrs_simplify = compile_hir_to_vliw(transformed)
+        mem_simplify = [5, 7] + [0] * 98
+        machine_simplify = self._run_program(instrs_simplify, mem_simplify)
+
+        # Both should produce same result: (5 * 7) + 30 = 35 + 30 = 65
+        self.assertEqual(machine_no_simplify.mem[0], machine_simplify.mem[0])
+        self.assertEqual(machine_simplify.mem[0], 65)
+        print("Simplify preserves semantics test passed!")
+
+    def test_simplify_metrics(self):
+        """Test that simplify pass reports correct metrics."""
+        from compiler import HIRBuilder, PassManager, SimplifyPass
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        x = b.load(addr0, "x")
+        zero = b.const_load(0, "zero")
+        val10 = b.const_load(10, "val10")
+        val20 = b.const_load(20, "val20")
+
+        # x + 0 -> identity simplification
+        t1 = b.add(x, zero, "t1")
+        # 10 + 20 -> constant fold
+        t2 = b.add(val10, val20, "t2")
+
+        result = b.add(t1, t2, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        simplify_pass = SimplifyPass()
+        pm = PassManager()
+        pm.add_pass(simplify_pass)
+        pm.run(hir)
+
+        metrics = simplify_pass.get_metrics()
+        self.assertIsNotNone(metrics)
+        self.assertIn("constants_folded", metrics.custom)
+        self.assertIn("identities_simplified", metrics.custom)
+        self.assertGreater(metrics.custom["constants_folded"], 0)
+        self.assertGreater(metrics.custom["identities_simplified"], 0)
+        print(f"Simplify metrics: {metrics.custom}")
+        print("Simplify metrics test passed!")
+
+    def test_simplify_config_disable(self):
+        """Test that simplify pass can be disabled via config."""
+        from compiler import HIRBuilder, PassManager, PassConfig, SimplifyPass, count_statements
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        val10 = b.const_load(10, "val10")
+        val20 = b.const_load(20, "val20")
+
+        # This would normally be folded
+        result = b.add(val10, val20, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+        original_count = count_statements(hir)
+
+        # With simplify disabled
+        pm_disabled = PassManager()
+        pm_disabled.add_pass(SimplifyPass())
+        pm_disabled.config["simplify"] = PassConfig(name="simplify", enabled=False)
+        result_disabled = pm_disabled.run(hir)
+
+        # Disabled should not change anything
+        self.assertEqual(count_statements(result_disabled), original_count)
+        print("Simplify config disable test passed!")
+
 
 class TestDCEPass(unittest.TestCase):
     """Test Dead Code Elimination pass."""

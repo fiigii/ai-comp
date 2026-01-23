@@ -24,8 +24,9 @@ class CSEContext:
     # Maps SSAValue.id -> its value number (tuple)
     ssa_to_value_number: dict[int, tuple] = field(default_factory=dict)
 
-    # True after any store operation (invalidates load CSE)
-    memory_clobbered: bool = False
+    # Memory epoch counter (increments on store operations)
+    # Enables finer-grained load CSE: loads with same address and epoch can be merged
+    mem_epoch: int = 0
 
     # Parent context for nested scopes
     parent: Optional['CSEContext'] = None
@@ -46,22 +47,20 @@ class CSEContext:
             return self.parent.get_value_number(ssa_id)
         return None
 
-    def is_memory_clobbered(self) -> bool:
-        """Check if memory has been clobbered in this context or any parent."""
-        if self.memory_clobbered:
-            return True
+    def get_mem_epoch(self) -> int:
+        """Get current memory epoch (including parent epochs)."""
         if self.parent is not None:
-            return self.parent.is_memory_clobbered()
-        return False
+            return self.parent.get_mem_epoch() + self.mem_epoch
+        return self.mem_epoch
+
+    def increment_epoch(self):
+        """Increment memory epoch (called on store)."""
+        self.mem_epoch += 1
 
     def record(self, value_number: tuple, ssa: SSAValue):
         """Record a new expression -> SSA mapping."""
         self.expr_to_ssa[value_number] = ssa
         self.ssa_to_value_number[ssa.id] = value_number
-
-    def clobber_memory(self):
-        """Mark memory as clobbered."""
-        self.memory_clobbered = True
 
     def child_context(self) -> 'CSEContext':
         """Create a child context for nested scopes."""
@@ -80,6 +79,9 @@ CSE_SAFE_OPS = {
 
 # Load ops that can be CSE'd when memory isn't clobbered
 LOAD_OPS = {"load"}
+
+# Commutative operations (a op b == b op a)
+COMMUTATIVE_OPS = {"+", "*", "^", "&", "|", "=="}
 
 
 class CSEPass(Pass):
@@ -183,9 +185,9 @@ class CSEPass(Pass):
         """
         self._expressions_analyzed += 1
 
-        # Store operations are never CSE'd and clobber memory
+        # Store operations are never CSE'd and increment memory epoch
         if op.opcode == "store":
-            ctx.clobber_memory()
+            ctx.increment_epoch()
             return op
 
         # Check if this is a CSE-able operation
@@ -196,12 +198,7 @@ class CSEPass(Pass):
             # Unknown op, can't CSE but keep it
             return op
 
-        # For load ops, check if memory has been clobbered
-        if is_load_op and ctx.is_memory_clobbered():
-            # Memory may have changed, can't CSE
-            return op
-
-        # Compute value number for this expression
+        # Compute value number for this expression (epoch included for loads)
         value_number = self._make_value_number_key(op, ctx)
 
         if value_number is None:
@@ -256,9 +253,8 @@ class CSEPass(Pass):
         # Transform loop body
         new_body = self._transform_statements(loop.body, child_ctx, ssa_ctx)
 
-        # Propagate memory clobber up to parent
-        if child_ctx.memory_clobbered:
-            ctx.clobber_memory()
+        # Propagate memory epoch up to parent
+        ctx.mem_epoch += child_ctx.mem_epoch
 
         # Resolve yields through bindings
         new_yields = [
@@ -293,9 +289,8 @@ class CSEPass(Pass):
         new_then_body = self._transform_statements(if_stmt.then_body, then_ctx, ssa_ctx)
         new_else_body = self._transform_statements(if_stmt.else_body, else_ctx, ssa_ctx)
 
-        # Propagate memory clobber from either branch
-        if then_ctx.memory_clobbered or else_ctx.memory_clobbered:
-            ctx.clobber_memory()
+        # Propagate memory epoch up (use max since either branch could execute)
+        ctx.mem_epoch += max(then_ctx.mem_epoch, else_ctx.mem_epoch)
 
         # Resolve yields through bindings
         new_then_yields = [
@@ -333,6 +328,15 @@ class CSEPass(Pass):
             if vn is None:
                 return None
             operand_vns.append(vn)
+
+        # Canonicalize commutative operations by sorting operands
+        if op.opcode in COMMUTATIVE_OPS and len(operand_vns) == 2:
+            operand_vns = sorted(operand_vns, key=lambda x: str(x))
+
+        # Include memory epoch for load operations
+        # This enables loads with same address but different epochs to have different value numbers
+        if op.opcode in LOAD_OPS:
+            return (op.opcode, tuple(operand_vns), ctx.get_mem_epoch())
 
         return (op.opcode, tuple(operand_vns))
 
