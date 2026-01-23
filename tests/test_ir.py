@@ -22,7 +22,7 @@ from problem import (
     DebugInfo,
 )
 from perf_takehome import KernelBuilder
-from ir_compiler import (
+from compiler import (
     HIRBuilder,
     compile_hir_to_vliw,
     lower_to_lir,
@@ -749,7 +749,7 @@ class TestCompilerRegressions(unittest.TestCase):
         needs it internally for COPY operations. Previously this would use
         scratch[0] which might contain another value.
         """
-        from ir_compiler import lower_to_lir, eliminate_phis, compile_to_vliw
+        from compiler import lower_to_lir, eliminate_phis, compile_to_vliw
 
         b = HIRBuilder()
 
@@ -838,7 +838,7 @@ class TestCompilerRegressions(unittest.TestCase):
         must not treat CONST immediate values as scratch indices. A large
         constant (e.g., 100000) should not inflate max_scratch.
         """
-        from ir_compiler import lower_to_lir, eliminate_phis, compile_to_vliw
+        from compiler import lower_to_lir, eliminate_phis, compile_to_vliw
 
         b = HIRBuilder()
 
@@ -942,7 +942,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_full_unroll_simple_loop(self):
         """Test that a simple loop with static bounds gets fully unrolled."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, ForLoop, lower_to_lir, eliminate_phis, compile_to_vliw
         )
@@ -993,7 +993,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_partial_unroll(self):
         """Test partial unrolling with a specific factor."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, ForLoop, lower_to_lir, eliminate_phis, compile_to_vliw
         )
@@ -1045,7 +1045,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_no_unroll_dynamic_bounds(self):
         """Test that loops with dynamic bounds are not unrolled."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             ForLoop
         )
@@ -1080,7 +1080,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_skip_unroll_bad_factor(self):
         """Test that unrolling is skipped when factor doesn't divide trip count."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, ForLoop
         )
@@ -1131,7 +1131,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         """Test loading pass config from JSON."""
         import tempfile
         import os
-        from ir_compiler import PassManager, PassConfig, LoopUnrollPass
+        from compiler import PassManager, PassConfig, LoopUnrollPass
 
         config_data = {
             "passes": {
@@ -1164,7 +1164,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_unroll_remaps_if_yields(self):
         """Ensure unrolled loop results are remapped through If yields."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, lower_to_lir, eliminate_phis, compile_to_vliw
         )
@@ -1211,7 +1211,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
     def test_unroll_remaps_forloop_yields(self):
         """Ensure unrolled loop results are remapped through enclosing ForLoop yields."""
-        from ir_compiler import (
+        from compiler import (
             PassManager, PassConfig, LoopUnrollPass,
             Const, lower_to_lir, eliminate_phis, compile_to_vliw
         )
