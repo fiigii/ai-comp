@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Split compiler --print-metrics output into per-pass files."""
+"""Split compiler --print-metrics or --print-after-all output into per-pass files."""
 
 import argparse
 import re
@@ -20,26 +20,56 @@ def sanitize_filename(name: str) -> str:
     return sanitized or 'unknown'
 
 
-def parse_metrics(content: str) -> list[tuple[str, str]]:
-    """Parse metrics content into list of (pass_name, section_content)."""
-    # Pattern to match pass headers like "=== Pass: dce (HIR → HIR) ==="
-    pattern = r'^=== Pass: (\S+)'
+def parse_sections(content: str) -> list[tuple[str, str]]:
+    """Parse content into list of (pass_name, section_content).
+
+    Supports formats:
+    - --print-metrics: "=== Pass: NAME ... ===" headers
+    - --print-after-all: "After NAME:" headers (preceded by dashes)
+    - Combined: both metrics and IR dump for same pass in one section
+    """
+    # Pattern for --print-metrics format (primary section delimiter)
+    metrics_pattern = r'^=== Pass: (\S+)'
+    # Pattern for --print-after-all format
+    after_all_pattern = r'^After (\S+):$'
 
     sections = []
     current_name = None
     current_lines = []
+    prev_line_is_dashes = False
 
     for line in content.splitlines(keepends=True):
-        match = re.match(pattern, line)
-        if match:
+        # Check for --print-metrics format
+        metrics_match = re.match(metrics_pattern, line)
+        # Check for --print-after-all format (requires preceding dash line)
+        after_match = re.match(after_all_pattern, line.strip())
+
+        if metrics_match:
             # Save previous section
             if current_name:
                 sections.append((current_name, ''.join(current_lines)))
             # Start new section
-            current_name = match.group(1)
+            current_name = metrics_match.group(1)
             current_lines = [line]
+            prev_line_is_dashes = False
+        elif after_match and prev_line_is_dashes:
+            after_name = after_match.group(1).rstrip(':')
+            # If this "After X:" matches current section, just continue (don't start new)
+            if current_name == after_name:
+                current_lines.append(line)
+                prev_line_is_dashes = False
+            else:
+                # Different name - save previous and start new section
+                if current_name:
+                    sections.append((current_name, ''.join(current_lines)))
+                current_name = after_name
+                current_lines = ['-' * 60 + '\n', line]
+                prev_line_is_dashes = False
         elif current_name:
             current_lines.append(line)
+            prev_line_is_dashes = line.strip().startswith('---') and line.strip().replace('-', '') == ''
+        else:
+            prev_line_is_dashes = line.strip().startswith('---') and line.strip().replace('-', '') == ''
 
     # Save final section
     if current_name:
@@ -61,7 +91,7 @@ def main():
         content = sys.stdin.read()
 
     # Parse sections
-    sections = parse_metrics(content)
+    sections = parse_sections(content)
 
     # Create output directory
     out_dir = Path(args.output_dir)
