@@ -133,7 +133,7 @@ def build_tree_hash_kernel(
             end=batch_const,
             iter_args=[],
             body_fn=batch_body,
-            pragma_unroll=4
+            pragma_unroll=16
         )
         return []  # No loop-carried values
 

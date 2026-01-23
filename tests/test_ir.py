@@ -936,6 +936,75 @@ class TestCompilerRegressions(unittest.TestCase):
 
         print("Phi temp scratch safety test passed!")
 
+    def test_simplify_32bit_wrap(self):
+        """
+        Regression test for P1: SimplifyPass 32-bit wrap semantics.
+
+        Constant folding must apply 32-bit wrap semantics (mask with 0xFFFFFFFF)
+        because the VM uses mod 2**32 arithmetic. Without this, values that
+        overflow 32 bits would be incorrect in subsequent operations.
+        """
+        from compiler.hir import Const
+
+        b = HIRBuilder()
+        # 0xFFFFFFFF + 1 should wrap to 0, then >> 1 = 0
+        max_val = b.const_load(0xFFFFFFFF, "max")
+        one = b.const_load(1, "one")
+        added = b.add(max_val, one, "added")  # Should fold to 0
+        shifted = b.shr(added, one, "shifted")  # 0 >> 1 = 0
+        addr = b.const_load(0, "addr")
+        b.store(addr, shifted)
+
+        hir = b.build()
+        instrs = compile_hir_to_vliw(hir)
+
+        mem = [0] * 10
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[0], 0, "32-bit wrap should make (0xFFFFFFFF+1)>>1 = 0")
+
+        print("SimplifyPass 32-bit wrap test passed!")
+
+    def test_cse_no_load_hoist_across_loop_stores(self):
+        """
+        Regression test for P1: CSE load hoisting across loop iterations.
+
+        Loads inside loops must NOT CSE with pre-loop loads when the loop body
+        contains stores. Each iteration may modify memory, so loads must be
+        re-executed. This is achieved by incrementing the memory epoch when
+        entering a loop body.
+        """
+        from compiler.hir import Const
+
+        b = HIRBuilder()
+        addr = b.const_load(0, "addr")
+        zero = b.const_load(0, "zero")
+        one = b.const_load(1, "one")
+        two = b.const_load(2, "two")
+
+        # store 0 to addr
+        b.store(addr, zero)
+        # pre_val = load(addr) -> 0
+        pre_val = b.load(addr, "pre_val")
+
+        def loop_body(i, params):
+            # Each iteration: load, increment, store
+            val = b.load(addr, "val")  # Should NOT CSE with pre_val
+            new_val = b.add(val, one, "new_val")
+            b.store(addr, new_val)
+            return []
+
+        b.for_loop(start=Const(0), end=two, iter_args=[], body_fn=loop_body)
+
+        hir = b.build()
+        instrs = compile_hir_to_vliw(hir)
+
+        mem = [0] * 10
+        machine = self._run_program(instrs, mem)
+        # After 2 iterations: 0 -> 1 -> 2
+        self.assertEqual(machine.mem[0], 2, "Loop should increment twice")
+
+        print("CSE no load hoist across loop stores test passed!")
+
 
 class TestPassManagerAndLoopUnroll(unittest.TestCase):
     """Test pass manager and loop unrolling functionality."""

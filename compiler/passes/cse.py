@@ -90,12 +90,14 @@ class CSEPass(Pass):
 
     Eliminates redundant computations by tracking expressions and their values:
     - Safe for CSE: ALU ops, const, select
-    - Conditional CSE: load (only when memory hasn't been clobbered by a store)
+    - Conditional CSE: load (only within the same memory epoch)
     - Never CSE'd: store (has side effects)
 
-    Memory operations are handled conservatively:
-    - Any store operation invalidates ALL subsequent load CSE opportunities
-    - This is safe but may miss some optimization opportunities
+    Memory operations use epoch-based tracking:
+    - Each store increments the memory epoch
+    - Loads include the current epoch in their value number
+    - Loads with different epochs cannot be CSE'd together
+    - Loop bodies start with a fresh epoch to prevent cross-iteration CSE
     """
 
     def __init__(self):
@@ -242,8 +244,11 @@ class CSEPass(Pass):
     ) -> ForLoop:
         """Transform a ForLoop, handling nested scope for CSE."""
         # Create child context for loop body
-        # Loop body params get fresh value numbers each iteration
         child_ctx = ctx.child_context()
+
+        # Increment epoch to prevent load CSE from parent scope
+        # (loop body may execute multiple times with stores between iterations)
+        child_ctx.increment_epoch()
 
         # Give body_params fresh value numbers (they're unique per iteration)
         for param in loop.body_params:

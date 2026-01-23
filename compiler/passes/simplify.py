@@ -159,6 +159,9 @@ class SimplifyPass(Pass):
 
         fold_fn = FOLDABLE_OPS[opcode]
         result = fold_fn(left_val, right_val)
+        # Apply 32-bit wrap semantics (VM uses mod 2**32)
+        if result is not None:
+            result = result & 0xFFFFFFFF
         return result
 
     def _try_simplify_identity(
