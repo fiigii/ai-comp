@@ -10,6 +10,7 @@ sys.path.insert(0, parentdir)
 
 import unittest
 import random
+import json
 
 from problem import (
     Machine,
@@ -61,6 +62,19 @@ class TestIRCompiler(unittest.TestCase):
         )
         print(f"Small test passed! Cycles: {machine.cycle}")
 
+    def _create_config_file(self, unroll_factor=None, max_trip_count=None):
+        """Create a temp config file for pass manager."""
+        import tempfile
+        config = {"passes": {"loop-unroll": {"enabled": True, "options": {}}}}
+        if unroll_factor is not None:
+            config["passes"]["loop-unroll"]["options"]["unroll_factor"] = unroll_factor
+        if max_trip_count is not None:
+            config["passes"]["loop-unroll"]["options"]["max_trip_count"] = max_trip_count
+        f = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(config, f)
+        f.close()
+        return f.name
+
     def test_ir_kernel_medium(self):
         """Test IR kernel on a medium example."""
         random.seed(123)
@@ -68,8 +82,12 @@ class TestIRCompiler(unittest.TestCase):
         inp = Input.generate(forest, 32, 8)
         mem = build_mem_image(forest, inp)
 
+        # Use config to limit unrolling (32*8=256 iterations would exhaust scratch)
+        config_path = self._create_config_file(max_trip_count=8)
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds,
+                           pass_config=config_path)
+        os.unlink(config_path)
 
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
@@ -96,8 +114,12 @@ class TestIRCompiler(unittest.TestCase):
         inp = Input.generate(forest, 256, 16)
         mem = build_mem_image(forest, inp)
 
+        # Use config to limit unrolling (256*16=4096 iterations would exhaust scratch)
+        config_path = self._create_config_file(max_trip_count=8)
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds,
+                           pass_config=config_path)
+        os.unlink(config_path)
 
         print(f"Generated {len(kb.instrs)} instructions")
 
@@ -134,10 +156,13 @@ class TestIRCompiler(unittest.TestCase):
         machine1.enable_debug = False
         machine1.run()
 
-        # Run IR kernel (use_ir=True, the default)
+        # Run IR kernel (use_ir=True) with limited unrolling (16*4=64 iterations)
+        config_path = self._create_config_file(max_trip_count=8)
         mem2 = build_mem_image(forest, inp)
         kb2 = KernelBuilder()
-        kb2.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds, use_ir=True)
+        kb2.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds,
+                         use_ir=True, pass_config=config_path)
+        os.unlink(config_path)
         machine2 = Machine(mem2, kb2.instrs, kb2.debug_info(), n_cores=N_CORES)
         machine2.enable_pause = False
         machine2.enable_debug = False
@@ -910,6 +935,232 @@ class TestCompilerRegressions(unittest.TestCase):
         self.assertEqual(machine.mem[1], 100, "After swap, b should be 100")
 
         print("Phi temp scratch safety test passed!")
+
+
+class TestPassManagerAndLoopUnroll(unittest.TestCase):
+    """Test pass manager and loop unrolling functionality."""
+
+    def test_full_unroll_simple_loop(self):
+        """Test that a simple loop with static bounds gets fully unrolled."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            Const, ForLoop, lower_to_lir, eliminate_phis, compile_to_vliw
+        )
+
+        b = HIRBuilder()
+        zero = b.const_load(0, "zero")
+        addr = b.const_load(10, "addr")
+
+        # Simple loop: for i in 0..4: (no body, just count iterations)
+        init_sum = b.const_load(0, "init_sum")
+
+        def body(i, params):
+            s = params[0]
+            new_s = b.add(s, i, "sum")
+            return [new_s]
+
+        # Use Const for bounds so it can be unrolled
+        results = b.for_loop(start=Const(0), end=Const(4), iter_args=[init_sum], body_fn=body)
+        b.store(addr, results[0])
+
+        hir = b.build()
+
+        # Run loop unroll pass
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        # Set max_trip_count high enough for full unroll
+        pm.config["loop-unroll"] = PassConfig(name="loop-unroll", options={"max_trip_count": 100})
+        unrolled = pm.run(hir)
+
+        # After full unroll, there should be no ForLoop in the body
+        has_for_loop = any(isinstance(s, ForLoop) for s in unrolled.body)
+        self.assertFalse(has_for_loop, "Loop should be fully unrolled")
+
+        # Compile directly without running pass manager again
+        lir = lower_to_lir(unrolled)
+        eliminate_phis(lir)
+        instrs = compile_to_vliw(lir)
+
+        mem = [0] * 20
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+
+        # Sum of 0+1+2+3 = 6
+        self.assertEqual(machine.mem[10], 6)
+        print("Full unroll simple loop test passed!")
+
+    def test_partial_unroll(self):
+        """Test partial unrolling with a specific factor."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            Const, ForLoop, lower_to_lir, eliminate_phis, compile_to_vliw
+        )
+
+        b = HIRBuilder()
+        addr = b.const_load(10, "addr")
+        init_sum = b.const_load(0, "init_sum")
+
+        def body(i, params):
+            s = params[0]
+            new_s = b.add(s, i, "sum")
+            return [new_s]
+
+        # Loop with 8 iterations
+        results = b.for_loop(start=Const(0), end=Const(8), iter_args=[init_sum], body_fn=body)
+        b.store(addr, results[0])
+
+        hir = b.build()
+
+        # Partial unroll with factor 4 (8/4 = 2 iterations remain)
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.config["loop-unroll"] = PassConfig(
+            name="loop-unroll",
+            options={"unroll_factor": 4, "max_trip_count": 100}
+        )
+        unrolled = pm.run(hir)
+
+        # After partial unroll, there should still be a ForLoop with 2 iterations
+        for_loops = [s for s in unrolled.body if isinstance(s, ForLoop)]
+        self.assertEqual(len(for_loops), 1, "Should have one loop remaining")
+        loop = for_loops[0]
+        self.assertEqual(loop.end.value, 2, "Loop should have 2 iterations after unroll by 4")
+
+        # Compile directly without running pass manager again
+        lir = lower_to_lir(unrolled)
+        eliminate_phis(lir)
+        instrs = compile_to_vliw(lir)
+
+        mem = [0] * 20
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+
+        # Sum of 0+1+2+3+4+5+6+7 = 28
+        self.assertEqual(machine.mem[10], 28)
+        print("Partial unroll test passed!")
+
+    def test_no_unroll_dynamic_bounds(self):
+        """Test that loops with dynamic bounds are not unrolled."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            ForLoop
+        )
+
+        b = HIRBuilder()
+        # Load bound from memory (dynamic)
+        addr0 = b.const_load(0, "addr0")
+        bound = b.load(addr0, "bound")
+        addr10 = b.const_load(10, "addr10")
+        init_sum = b.const_load(0, "init_sum")
+
+        def body(i, params):
+            s = params[0]
+            new_s = b.add(s, i, "sum")
+            return [new_s]
+
+        results = b.for_loop(start=b.const_load(0), end=bound, iter_args=[init_sum], body_fn=body)
+        b.store(addr10, results[0])
+
+        hir = b.build()
+
+        # Try to unroll
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.config["loop-unroll"] = PassConfig(name="loop-unroll", options={"max_trip_count": 100})
+        unrolled = pm.run(hir)
+
+        # Loop should still exist (not unrolled because bounds are dynamic)
+        for_loops = [s for s in unrolled.body if isinstance(s, ForLoop)]
+        self.assertEqual(len(for_loops), 1, "Dynamic loop should not be unrolled")
+        print("No unroll dynamic bounds test passed!")
+
+    def test_skip_unroll_bad_factor(self):
+        """Test that unrolling is skipped when factor doesn't divide trip count."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            Const, ForLoop
+        )
+
+        b = HIRBuilder()
+        addr = b.const_load(10, "addr")
+        init_sum = b.const_load(0, "init_sum")
+
+        def body(i, params):
+            s = params[0]
+            new_s = b.add(s, i, "sum")
+            return [new_s]
+
+        # Loop with 10 iterations
+        results = b.for_loop(start=Const(0), end=Const(10), iter_args=[init_sum], body_fn=body)
+        b.store(addr, results[0])
+
+        hir = b.build()
+
+        # Try partial unroll with factor 3 (10 % 3 != 0, should skip)
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.config["loop-unroll"] = PassConfig(
+            name="loop-unroll",
+            options={"unroll_factor": 3, "max_trip_count": 100}
+        )
+        unrolled = pm.run(hir)
+
+        # Loop should still have 10 iterations (not unrolled)
+        for_loops = [s for s in unrolled.body if isinstance(s, ForLoop)]
+        self.assertEqual(len(for_loops), 1, "Loop should not be unrolled")
+        loop = for_loops[0]
+        self.assertEqual(loop.end.value, 10, "Loop should still have 10 iterations")
+
+        # But it should still produce correct result
+        instrs = compile_hir_to_vliw(unrolled)
+        mem = [0] * 20
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+
+        # Sum of 0+1+...+9 = 45
+        self.assertEqual(machine.mem[10], 45)
+        print("Skip unroll bad factor test passed!")
+
+    def test_pass_config_from_json(self):
+        """Test loading pass config from JSON."""
+        import tempfile
+        import os
+        from ir_compiler import PassManager, PassConfig, LoopUnrollPass
+
+        config_data = {
+            "passes": {
+                "loop-unroll": {
+                    "enabled": True,
+                    "options": {
+                        "unroll_factor": 2,
+                        "max_trip_count": 50
+                    }
+                }
+            }
+        }
+
+        # Write temp config file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(config_data, f)
+            config_path = f.name
+
+        try:
+            pm = PassManager()
+            pm.add_pass(LoopUnrollPass())
+            pm.load_config(config_path)
+
+            self.assertIn("loop-unroll", pm.config)
+            self.assertEqual(pm.config["loop-unroll"].options["unroll_factor"], 2)
+            self.assertEqual(pm.config["loop-unroll"].options["max_trip_count"], 50)
+            print("Pass config from JSON test passed!")
+        finally:
+            os.unlink(config_path)
 
 
 if __name__ == "__main__":
