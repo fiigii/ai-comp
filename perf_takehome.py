@@ -430,11 +430,16 @@ if __name__ == "__main__":
     import sys
     import argparse
 
-    # Check if running with unittest arguments or custom flags
+    # Check if running with custom flags (not unittest flags)
+    # Only route to argparse when a known custom flag is present
+    custom_flags = {'--print-vliw', '--print-after-all', '--no-ir', '--trace',
+                    '--forest-height', '--rounds', '--batch-size'}
+    has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
+
     if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):
         # Running a specific test
         unittest.main()
-    elif len(sys.argv) > 1 and sys.argv[1] in ("--print-vliw", "--print-after-all", "--no-ir", "-h", "--help"):
+    elif has_custom_flag:
         # Custom flags - run do_kernel_test directly
         parser = argparse.ArgumentParser(description="Performance engineering take-home")
         parser.add_argument("--print-vliw", action="store_true",
