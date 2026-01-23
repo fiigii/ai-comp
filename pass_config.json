@@ -1,5 +1,9 @@
 {
   "passes": {
+    "dce": {
+      "enabled": true,
+      "options": {}
+    },
     "loop-unroll": {
       "enabled": true,
       "options": {
