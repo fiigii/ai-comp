@@ -441,7 +441,7 @@ if __name__ == "__main__":
     # Check if running with custom flags (not unittest flags)
     # Only route to argparse when a known custom flag is present
     custom_flags = {'--print-vliw', '--print-after-all', '--no-ir', '--trace',
-                    '--forest-height', '--rounds', '--batch-size'}
+                    '--forest-height', '--rounds', '--batch-size', '--pass-config'}
     has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
 
     if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):

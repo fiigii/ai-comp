@@ -1162,6 +1162,102 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         finally:
             os.unlink(config_path)
 
+    def test_unroll_remaps_if_yields(self):
+        """Ensure unrolled loop results are remapped through If yields."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            Const, lower_to_lir, eliminate_phis, compile_to_vliw
+        )
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        cond_true = b.const_load(1, "cond_true")
+        init_sum = b.const_load(0, "init_sum")
+
+        def then_fn():
+            def body(i, params):
+                s = params[0]
+                return [b.add(s, i, "sum")]
+
+            results = b.for_loop(start=Const(0), end=Const(4), iter_args=[init_sum], body_fn=body)
+            return [results[0]]
+
+        def else_fn():
+            return [b.const_load(99, "else_val")]
+
+        out = b.if_stmt(cond_true, then_fn, else_fn)[0]
+        b.store(addr0, out)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.config["loop-unroll"] = PassConfig(name="loop-unroll", options={"max_trip_count": 100})
+        unrolled = pm.run(hir)
+
+        lir = lower_to_lir(unrolled)
+        eliminate_phis(lir)
+        instrs = compile_to_vliw(lir)
+
+        mem = [0] * 20
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+
+        # then branch taken: sum of 0+1+2+3 = 6
+        self.assertEqual(machine.mem[0], 6)
+        print("Unroll remaps If yields test passed!")
+
+    def test_unroll_remaps_forloop_yields(self):
+        """Ensure unrolled loop results are remapped through enclosing ForLoop yields."""
+        from ir_compiler import (
+            PassManager, PassConfig, LoopUnrollPass,
+            Const, lower_to_lir, eliminate_phis, compile_to_vliw
+        )
+
+        b = HIRBuilder()
+        addr0 = b.const_load(0, "addr0")
+        addr1 = b.const_load(1, "addr1")
+        bound = b.load(addr1, "bound")  # dynamic bound: outer loop should not be unrolled
+
+        init_sum = b.const_load(0, "init_sum")
+
+        def outer_body(i, params):
+            outer_s = params[0]
+
+            def inner_body(j, inner_params):
+                s = inner_params[0]
+                return [b.add(s, j, "inner_sum")]
+
+            inner_results = b.for_loop(start=Const(0), end=Const(4), iter_args=[outer_s], body_fn=inner_body)
+            return [inner_results[0]]
+
+        results = b.for_loop(start=Const(0), end=bound, iter_args=[init_sum], body_fn=outer_body)
+        b.store(addr0, results[0])
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        pm.config["loop-unroll"] = PassConfig(name="loop-unroll", options={"max_trip_count": 100})
+        unrolled = pm.run(hir)
+
+        lir = lower_to_lir(unrolled)
+        eliminate_phis(lir)
+        instrs = compile_to_vliw(lir)
+
+        mem = [0] * 20
+        mem[1] = 1  # one outer iteration
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+
+        # one outer iter, inner sum of 0+1+2+3 = 6
+        self.assertEqual(machine.mem[0], 6)
+        print("Unroll remaps ForLoop yields test passed!")
+
 
 if __name__ == "__main__":
     unittest.main()
