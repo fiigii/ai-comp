@@ -3,12 +3,29 @@ Tests for vector instruction support.
 """
 
 import pytest
-from compiler.hir import SSAValue, VectorSSAValue, Const, HIRFunction
+from compiler.hir import SSAValue, VectorSSAValue, Const, HIRFunction, Op
 from compiler.hir_builder import HIRBuilder
 from compiler.lowering import lower_to_lir, VLEN
 from compiler.codegen import compile_to_vliw
 from compiler.phi_elimination import eliminate_phis
 from compiler.lir import LIROpcode
+
+
+def _build_vgather_hir() -> HIRFunction:
+    b = HIRBuilder()
+    addr_base = b.const_load(0)
+    addr_indices = b.const_load(16)
+    vec_indices = b.vload(addr_indices)
+    vec_base = b.vbroadcast(addr_base)
+    vec_addr = b.vadd(vec_base, vec_indices)
+
+    vec_out = b._new_vec_ssa("gather")
+    b._emit(Op("vgather", vec_out, [vec_addr], "load"))
+    b.vstore(b.const_load(64), vec_out)
+    b.halt()
+    return b.build()
+
+
 
 
 class TestVectorTypes:
@@ -240,6 +257,27 @@ class TestVectorLowering:
 
         assert copy_count == VLEN
 
+    def test_vgather_lowering_to_load_offset(self):
+        """vgather should lower to VLEN load_offset instructions."""
+        hir = _build_vgather_hir()
+        lir = lower_to_lir(hir)
+
+        load_offset = []
+        load_dests = []
+        for block in lir.blocks.values():
+            for inst in block.instructions:
+                if inst.opcode == LIROpcode.LOAD_OFFSET:
+                    load_offset.append(inst)
+                if inst.opcode == LIROpcode.LOAD and isinstance(inst.dest, int):
+                    load_dests.append(inst.dest)
+
+        assert len(load_offset) == VLEN
+        dest_base = load_offset[0].dest
+        assert all(inst.dest == dest_base for inst in load_offset)
+        offsets = sorted(inst.operands[1] for inst in load_offset)
+        assert offsets == list(range(VLEN))
+        assert all(d not in range(dest_base, dest_base + VLEN) for d in load_dests)
+
 
 class TestVectorCodegen:
     """Tests for vector instruction codegen."""
@@ -402,6 +440,23 @@ class TestVectorCodegen:
                         assert len(slot) == 5
 
         assert vselect_found
+
+    def test_load_offset_codegen(self):
+        """load_offset should generate correct VLIW slot."""
+        hir = _build_vgather_hir()
+        lir = lower_to_lir(hir)
+        eliminate_phis(lir)
+        bundles = compile_to_vliw(lir)
+
+        load_offset_found = False
+        for bundle in bundles:
+            if "load" in bundle:
+                for slot in bundle["load"]:
+                    if slot[0] == "load_offset":
+                        load_offset_found = True
+                        assert len(slot) == 4
+
+        assert load_offset_found
 
 
 class TestVectorDCE:

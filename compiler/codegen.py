@@ -104,6 +104,8 @@ def _inst_to_slot(inst: LIRInst, zero_scratch: int) -> Optional[tuple]:
             return ("const", inst.dest, inst.operands[0])
         case LIROpcode.LOAD:
             return ("load", inst.dest, inst.operands[0])
+        case LIROpcode.LOAD_OFFSET:
+            return ("load_offset", inst.dest, inst.operands[0], inst.operands[1])
 
         # Store operations
         case LIROpcode.STORE:

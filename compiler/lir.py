@@ -28,6 +28,7 @@ class LIROpcode(Enum):
 
     # Load
     LOAD = "load"
+    LOAD_OFFSET = "load_offset"
     CONST = "const"
 
     # Store

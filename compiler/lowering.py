@@ -225,7 +225,8 @@ def _lower_op(op: Op, ctx: LoweringContext):
 # Vector opcodes
 VECTOR_OPCODES = {
     "v+", "v-", "v*", "v//", "v%", "v^", "v&", "v|", "v<<", "v>>", "v<", "v==",
-    "vbroadcast", "multiply_add", "vload", "vstore", "vselect", "vextract", "vinsert"
+    "vbroadcast", "multiply_add", "vload", "vstore", "vselect", "vextract", "vinsert",
+    "vpack", "vgather",
 }
 
 
@@ -248,12 +249,31 @@ def _lower_vector_op(op: Op, ctx: LoweringContext):
         "vselect": LIROpcode.VSELECT,
     }
 
-    # Handle vextract and vinsert specially (expand to scalar copies)
     if op.opcode == "vextract":
         _lower_vextract(op, ctx)
         return
     elif op.opcode == "vinsert":
         _lower_vinsert(op, ctx)
+        return
+    elif op.opcode == "vpack":
+        if op.result is None or not isinstance(op.result, VectorSSAValue):
+            raise ValueError("vpack requires a vector result")
+        if len(op.operands) != VLEN:
+            raise ValueError(f"vpack expects {VLEN} operands, got {len(op.operands)}")
+        dest_list = ctx.get_vector_scratch_list(op.result)
+        for i, lane_op in enumerate(op.operands):
+            src = ctx.get_operand(lane_op)
+            ctx.emit(LIRInst(LIROpcode.COPY, dest_list[i], [src], "alu"))
+        return
+    elif op.opcode == "vgather":
+        if op.result is None or not isinstance(op.result, VectorSSAValue):
+            raise ValueError("vgather requires a vector result")
+        if len(op.operands) != 1 or not isinstance(op.operands[0], VectorSSAValue):
+            raise ValueError("vgather expects a single vector address operand")
+        dest_base = ctx.get_vector_scratch(op.result)
+        addr_base = ctx.get_vector_scratch(op.operands[0])
+        for i in range(VLEN):
+            ctx.emit(LIRInst(LIROpcode.LOAD_OFFSET, dest_base, [addr_base, i], "load"))
         return
 
     lir_opcode = opcode_map.get(op.opcode)

@@ -57,8 +57,13 @@ class CopyPropagationPass(LIRPass):
         # Note: Skip instructions with immediate operands (not scratch references)
         for block in lir.blocks.values():
             for inst in block.instructions:
-                if inst.opcode != LIROpcode.CONST:
-                    inst.operands = self._rewrite_operands(inst.operands, copy_map)
+                if inst.opcode == LIROpcode.CONST:
+                    continue
+                if inst.opcode == LIROpcode.LOAD_OFFSET and len(inst.operands) == 2:
+                    rewritten = self._rewrite_operands([inst.operands[0]], copy_map)
+                    inst.operands = [rewritten[0], inst.operands[1]]
+                    continue
+                inst.operands = self._rewrite_operands(inst.operands, copy_map)
             if block.terminator:
                 block.terminator.operands = self._rewrite_operands(
                     block.terminator.operands, copy_map
