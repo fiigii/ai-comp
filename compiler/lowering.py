@@ -10,8 +10,11 @@ from typing import Optional
 from problem import SCRATCH_SIZE
 
 from .hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
+
+# Vector length (must match VM's VLEN)
+VLEN = 8
 from .lir import LIROpcode, LIRInst, Phi, BasicBlock, LIRFunction
 
 
@@ -24,6 +27,7 @@ class LoweringContext:
         self._block_counter = 0
         self._scratch_ptr = 0
         self._ssa_to_scratch: dict[int, int] = {}  # SSAValue.id -> scratch addr
+        self._vec_ssa_to_scratch: dict[int, int] = {}  # VectorSSAValue.id -> base scratch addr
         self._const_scratch: dict[int, int] = {}   # const value -> scratch addr
         self._pending_consts: list[tuple[int, int]] = []  # (scratch_addr, value) - deferred const loads
 
@@ -48,12 +52,35 @@ class LoweringContext:
             self._ssa_to_scratch[ssa.id] = addr
         return addr
 
+    def alloc_vector_scratch(self, vec_ssa: Optional[VectorSSAValue] = None) -> int:
+        """Allocate VLEN consecutive scratch addresses for a vector.
+
+        Returns the base address (first of VLEN consecutive addresses).
+        """
+        base = self._scratch_ptr
+        self._scratch_ptr += VLEN
+        if vec_ssa is not None:
+            self._vec_ssa_to_scratch[vec_ssa.id] = base
+        return base
+
     def get_scratch(self, ssa: SSAValue) -> int:
         """Get the scratch address for an SSA value."""
         if ssa.id not in self._ssa_to_scratch:
             # Allocate on demand
             self.alloc_scratch(ssa)
         return self._ssa_to_scratch[ssa.id]
+
+    def get_vector_scratch(self, vec_ssa: VectorSSAValue) -> int:
+        """Get the base scratch address for a vector SSA value."""
+        if vec_ssa.id not in self._vec_ssa_to_scratch:
+            # Allocate on demand
+            self.alloc_vector_scratch(vec_ssa)
+        return self._vec_ssa_to_scratch[vec_ssa.id]
+
+    def get_vector_scratch_list(self, vec_ssa: VectorSSAValue) -> list[int]:
+        """Get list of VLEN scratch addresses for a vector SSA value."""
+        base = self.get_vector_scratch(vec_ssa)
+        return list(range(base, base + VLEN))
 
     def get_operand(self, op: Operand) -> int:
         """Get scratch address for an operand (SSA value or const)."""
@@ -63,6 +90,13 @@ class LoweringContext:
             return self.get_const(op.value)
         else:
             raise ValueError(f"Unknown operand type: {op}")
+
+    def get_vector_operand(self, op: Operand) -> list[int]:
+        """Get scratch address list for a vector operand."""
+        if isinstance(op, VectorSSAValue):
+            return self.get_vector_scratch_list(op)
+        else:
+            raise ValueError(f"Expected VectorSSAValue, got: {op}")
 
     def get_const(self, value: int) -> int:
         """Get scratch address for a constant (with caching).
@@ -152,6 +186,11 @@ def _lower_statement(stmt: Statement, ctx: LoweringContext):
 
 def _lower_op(op: Op, ctx: LoweringContext):
     """Lower an Op to LIR instructions."""
+    # Check for vector operations first
+    if _is_vector_op(op.opcode):
+        _lower_vector_op(op, ctx)
+        return
+
     opcode_map = {
         "+": LIROpcode.ADD, "-": LIROpcode.SUB, "*": LIROpcode.MUL,
         "//": LIROpcode.DIV, "%": LIROpcode.MOD, "^": LIROpcode.XOR,
@@ -181,6 +220,134 @@ def _lower_op(op: Op, ctx: LoweringContext):
         operands = [ctx.get_operand(o) for o in op.operands]
 
     ctx.emit(LIRInst(lir_opcode, dest, operands, op.engine))
+
+
+# Vector opcodes
+VECTOR_OPCODES = {
+    "v+", "v-", "v*", "v//", "v%", "v^", "v&", "v|", "v<<", "v>>", "v<", "v==",
+    "vbroadcast", "multiply_add", "vload", "vstore", "vselect", "vextract", "vinsert"
+}
+
+
+def _is_vector_op(opcode: str) -> bool:
+    """Check if an opcode is a vector operation."""
+    return opcode in VECTOR_OPCODES
+
+
+def _lower_vector_op(op: Op, ctx: LoweringContext):
+    """Lower a vector operation to LIR instructions."""
+    opcode_map = {
+        "v+": LIROpcode.VADD, "v-": LIROpcode.VSUB, "v*": LIROpcode.VMUL,
+        "v//": LIROpcode.VDIV, "v%": LIROpcode.VMOD, "v^": LIROpcode.VXOR,
+        "v&": LIROpcode.VAND, "v|": LIROpcode.VOR, "v<<": LIROpcode.VSHL,
+        "v>>": LIROpcode.VSHR, "v<": LIROpcode.VLT, "v==": LIROpcode.VEQ,
+        "vbroadcast": LIROpcode.VBROADCAST,
+        "multiply_add": LIROpcode.MULTIPLY_ADD,
+        "vload": LIROpcode.VLOAD,
+        "vstore": LIROpcode.VSTORE,
+        "vselect": LIROpcode.VSELECT,
+    }
+
+    # Handle vextract and vinsert specially (expand to scalar copies)
+    if op.opcode == "vextract":
+        _lower_vextract(op, ctx)
+        return
+    elif op.opcode == "vinsert":
+        _lower_vinsert(op, ctx)
+        return
+
+    lir_opcode = opcode_map.get(op.opcode)
+    if lir_opcode is None:
+        raise ValueError(f"Unknown vector opcode: {op.opcode}")
+
+    # Determine destination
+    dest = None
+    if op.result is not None:
+        if isinstance(op.result, VectorSSAValue):
+            dest = ctx.get_vector_scratch_list(op.result)
+        else:
+            dest = ctx.get_scratch(op.result)
+
+    # Build operands based on operation type
+    if op.opcode == "vbroadcast":
+        # vbroadcast: scalar -> vector
+        # operand[0] is scalar SSAValue
+        operands = [ctx.get_operand(op.operands[0])]
+
+    elif op.opcode == "vload":
+        # vload: addr (scalar) -> vector
+        operands = [ctx.get_operand(op.operands[0])]
+
+    elif op.opcode == "vstore":
+        # vstore: addr (scalar), vec (vector) -> None
+        addr = ctx.get_operand(op.operands[0])
+        vec = ctx.get_vector_operand(op.operands[1])
+        operands = [addr, vec]
+
+    elif op.opcode == "multiply_add":
+        # multiply_add: vec, vec, vec -> vec
+        a = ctx.get_vector_operand(op.operands[0])
+        b = ctx.get_vector_operand(op.operands[1])
+        c = ctx.get_vector_operand(op.operands[2])
+        operands = [a, b, c]
+
+    elif op.opcode == "vselect":
+        # vselect: cond (vec), a (vec), b (vec) -> vec
+        cond = ctx.get_vector_operand(op.operands[0])
+        a = ctx.get_vector_operand(op.operands[1])
+        b = ctx.get_vector_operand(op.operands[2])
+        operands = [cond, a, b]
+
+    else:
+        # Binary vector ops: vec, vec -> vec
+        a = ctx.get_vector_operand(op.operands[0])
+        b = ctx.get_vector_operand(op.operands[1])
+        operands = [a, b]
+
+    ctx.emit(LIRInst(lir_opcode, dest, operands, op.engine))
+
+
+def _lower_vextract(op: Op, ctx: LoweringContext):
+    """Lower vextract to a COPY instruction."""
+    # vextract(vec, lane) -> scalar
+    vec = op.operands[0]
+    lane = op.operands[1].value  # Const
+
+    # Get source: vec[lane]
+    vec_base = ctx.get_vector_scratch(vec)
+    src = vec_base + lane
+
+    # Get destination
+    dest = ctx.get_scratch(op.result)
+
+    # Emit COPY
+    ctx.emit(LIRInst(LIROpcode.COPY, dest, [src], "alu"))
+
+
+def _lower_vinsert(op: Op, ctx: LoweringContext):
+    """Lower vinsert to COPY instructions (copy all lanes, replacing one)."""
+    # vinsert(vec, scalar, lane) -> new_vec
+    vec = op.operands[0]
+    scalar = op.operands[1]
+    lane = op.operands[2].value  # Const
+
+    # Get source vector base
+    src_base = ctx.get_vector_scratch(vec)
+
+    # Get scalar value
+    scalar_scratch = ctx.get_scratch(scalar)
+
+    # Get destination vector base
+    dest_base = ctx.get_vector_scratch(op.result)
+
+    # Copy all lanes, but replace lane `lane` with scalar
+    for i in range(VLEN):
+        if i == lane:
+            # Insert scalar at this lane
+            ctx.emit(LIRInst(LIROpcode.COPY, dest_base + i, [scalar_scratch], "alu"))
+        else:
+            # Copy from source vector
+            ctx.emit(LIRInst(LIROpcode.COPY, dest_base + i, [src_base + i], "alu"))
 
 
 def _lower_for_loop(loop: ForLoop, ctx: LoweringContext):

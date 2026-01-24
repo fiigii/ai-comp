@@ -43,18 +43,52 @@ class LIROpcode(Enum):
     # Pseudo-ops (eliminated before codegen)
     COPY = "copy"
 
+    # Vector ALU (engine: valu)
+    VADD = "v+"
+    VSUB = "v-"
+    VMUL = "v*"
+    VDIV = "v//"
+    VMOD = "v%"
+    VXOR = "v^"
+    VAND = "v&"
+    VOR = "v|"
+    VSHL = "v<<"
+    VSHR = "v>>"
+    VLT = "v<"
+    VEQ = "v=="
+    VBROADCAST = "vbroadcast"
+    MULTIPLY_ADD = "multiply_add"
+
+    # Vector load/store
+    VLOAD = "vload"
+    VSTORE = "vstore"
+
+    # Vector flow
+    VSELECT = "vselect"
+
 
 @dataclass
 class LIRInst:
-    """A single LIR instruction."""
+    """A single LIR instruction.
+
+    For scalar ops:
+      - dest: int (single scratch address)
+      - operands: list of int (scratch addresses) or immediates/labels
+
+    For vector ops:
+      - dest: list[int] (8 consecutive scratch addresses)
+      - operands: mix of list[int] (vector) and int (scalar)
+    """
     opcode: LIROpcode
-    dest: Optional[int]          # Scratch address for result
-    operands: list               # Scratch addresses, immediates, or labels
+    dest: Optional[int | list[int]]   # Scratch address(es) for result
+    operands: list                    # Scratch addresses, immediates, or labels
     engine: str
 
     def __repr__(self):
         ops_str = ", ".join(str(o) for o in self.operands)
         if self.dest is not None:
+            if isinstance(self.dest, list):
+                return f"s{self.dest[0]}..s{self.dest[-1]} = {self.opcode.value}({ops_str}) [{self.engine}]"
             return f"s{self.dest} = {self.opcode.value}({ops_str}) [{self.engine}]"
         return f"{self.opcode.value}({ops_str}) [{self.engine}]"
 

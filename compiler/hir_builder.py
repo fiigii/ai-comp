@@ -7,7 +7,7 @@ Provides a builder API for constructing HIR in SSA form.
 from typing import Optional, Callable
 
 from .hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 
 
@@ -16,12 +16,19 @@ class HIRBuilder:
 
     def __init__(self):
         self._ssa_counter = 0
+        self._vec_ssa_counter = 0
         self._statements: list[Statement] = []
 
     def _new_ssa(self, name: Optional[str] = None) -> SSAValue:
         """Create a new SSA value."""
         v = SSAValue(self._ssa_counter, name)
         self._ssa_counter += 1
+        return v
+
+    def _new_vec_ssa(self, name: Optional[str] = None) -> VectorSSAValue:
+        """Create a new vector SSA value."""
+        v = VectorSSAValue(self._vec_ssa_counter, name)
+        self._vec_ssa_counter += 1
         return v
 
     def _emit(self, stmt: Statement):
@@ -108,6 +115,90 @@ class HIRBuilder:
         """Conditional select: cond ? a : b"""
         result = self._new_ssa(name)
         self._emit(Op("select", result, [cond, a, b], "flow"))
+        return result
+
+    # === Vector operations (VLEN=8) ===
+
+    def valu(self, op: str, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Emit a binary vector ALU operation."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op(op, result, [a, b], "valu"))
+        return result
+
+    def vadd(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v+", a, b, name)
+
+    def vsub(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v-", a, b, name)
+
+    def vmul(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v*", a, b, name)
+
+    def vdiv(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v//", a, b, name)
+
+    def vmod(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v%", a, b, name)
+
+    def vxor(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v^", a, b, name)
+
+    def vand(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v&", a, b, name)
+
+    def vor(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v|", a, b, name)
+
+    def vshl(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v<<", a, b, name)
+
+    def vshr(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v>>", a, b, name)
+
+    def vlt(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v<", a, b, name)
+
+    def veq(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        return self.valu("v==", a, b, name)
+
+    def vbroadcast(self, scalar: SSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Broadcast a scalar to all VLEN lanes."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op("vbroadcast", result, [scalar], "valu"))
+        return result
+
+    def multiply_add(self, a: VectorSSAValue, b: VectorSSAValue, c: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Fused multiply-add: a * b + c."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op("multiply_add", result, [a, b, c], "valu"))
+        return result
+
+    def vload(self, addr: SSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Load VLEN consecutive words from memory."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op("vload", result, [addr], "load"))
+        return result
+
+    def vstore(self, addr: SSAValue, vec: VectorSSAValue):
+        """Store VLEN consecutive words to memory."""
+        self._emit(Op("vstore", None, [addr, vec], "store"))
+
+    def vselect(self, cond: VectorSSAValue, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Per-lane vector select: cond[i] ? a[i] : b[i]."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op("vselect", result, [cond, a, b], "flow"))
+        return result
+
+    def vextract(self, vec: VectorSSAValue, lane: int, name: Optional[str] = None) -> SSAValue:
+        """Extract a scalar from a vector lane (compile-time constant lane)."""
+        result = self._new_ssa(name)
+        self._emit(Op("vextract", result, [vec, Const(lane)], "alu"))
+        return result
+
+    def vinsert(self, vec: VectorSSAValue, scalar: SSAValue, lane: int, name: Optional[str] = None) -> VectorSSAValue:
+        """Insert a scalar into a vector lane (compile-time constant lane)."""
+        result = self._new_vec_ssa(name)
+        self._emit(Op("vinsert", result, [vec, scalar, Const(lane)], "alu"))
         return result
 
     # === Control flow ===
@@ -211,4 +302,5 @@ class HIRBuilder:
             name="kernel",
             body=self._statements,
             num_ssa_values=self._ssa_counter,
+            num_vec_ssa_values=self._vec_ssa_counter,
         )
