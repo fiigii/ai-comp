@@ -94,7 +94,7 @@ CSE_SAFE_OPS = {
 }
 
 # Load ops that can be CSE'd when memory isn't clobbered
-LOAD_OPS = {"load", "vload"}
+LOAD_OPS = {"load", "vload", "vgather"}
 
 # Commutative operations (a op b == b op a)
 COMMUTATIVE_OPS = {"+", "*", "^", "&", "|", "==", "v+", "v*", "v^", "v&", "v|", "v=="}

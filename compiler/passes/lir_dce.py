@@ -131,6 +131,11 @@ class LIRDCEPass(LIRPass):
         # CONST operands are immediate values, not scratch references
         if inst.opcode == LIROpcode.CONST:
             return
+        if inst.opcode == LIROpcode.LOAD_OFFSET and len(inst.operands) == 2:
+            addr = inst.operands[0]
+            if isinstance(addr, int):
+                used.add(addr)
+            return
 
         for op in inst.operands:
             if isinstance(op, int):
