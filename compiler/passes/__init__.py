@@ -18,11 +18,13 @@ from .copy_prop import CopyPropagationPass
 from .lir_dce import LIRDCEPass
 from .phi_elimination import PhiEliminationPass
 from .codegen import LIRToVLIWPass
+from .vectorize import VectorizePass
 
 __all__ = [
     'LoopUnrollPass',
     'DCEPass',
     'CSEPass',
+    'VectorizePass',
     'SimplifyPass',
     'HIRToLIRPass',
     'SimplifyCFGPass',

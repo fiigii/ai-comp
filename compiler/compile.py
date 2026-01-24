@@ -10,7 +10,7 @@ import os
 
 from .hir import HIRFunction
 from .pass_manager import CompilerPipeline
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, VectorizePass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass
 
 
 def compile_hir_to_vliw(
@@ -47,6 +47,7 @@ def compile_hir_to_vliw(
     pipeline.add_pass(SimplifyPass())        # HIR -> HIR (constant fold & identities)
     pipeline.add_pass(DCEPass())             # HIR -> HIR (post-peephole cleanup)
     pipeline.add_pass(CSEPass())             # HIR -> HIR
+    pipeline.add_pass(VectorizePass())       # HIR -> HIR (local vectorization)
     pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-lowering cleanup)
     pipeline.add_pass(HIRToLIRPass())        # HIR -> LIR
     pipeline.add_pass(CopyPropagationPass()) # LIR -> LIR (propagate COPY sources)

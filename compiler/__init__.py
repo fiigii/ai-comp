@@ -66,7 +66,7 @@ from .compile import compile_hir_to_vliw
 from .printing import print_hir, print_lir, print_vliw
 
 # Passes
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, VectorizePass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass
 
 __all__ = [
     # HIR
@@ -87,5 +87,5 @@ __all__ = [
     # Printing
     'print_hir', 'print_lir', 'print_vliw',
     # Passes
-    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass', 'LIRToVLIWPass',
+    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'VectorizePass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass', 'LIRToVLIWPass',
 ]
