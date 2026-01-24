@@ -14,6 +14,8 @@ from .cse import CSEPass
 from .simplify import SimplifyPass
 from .lowering import HIRToLIRPass
 from .simplify_cfg import SimplifyCFGPass
+from .copy_prop import CopyPropagationPass
+from .lir_dce import LIRDCEPass
 from .phi_elimination import PhiEliminationPass
 from .codegen import LIRToVLIWPass
 
@@ -24,6 +26,8 @@ __all__ = [
     'SimplifyPass',
     'HIRToLIRPass',
     'SimplifyCFGPass',
+    'CopyPropagationPass',
+    'LIRDCEPass',
     'PhiEliminationPass',
     'LIRToVLIWPass',
 ]
