@@ -6,13 +6,13 @@ Uses backward mark-and-sweep analysis on SSA values.
 """
 
 from ..hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
 
 
 # Operations that have side effects and should never be eliminated
-SIDE_EFFECT_OPS = {"store"}
+SIDE_EFFECT_OPS = {"store", "vstore"}
 
 
 class DCEPass(Pass):
@@ -47,11 +47,12 @@ class DCEPass(Pass):
         if not config.enabled:
             return hir
 
-        # Pass 1: Compute live set (backward analysis)
-        live = self._compute_live_set(hir.body)
+        # Pass 1: Compute live sets (backward analysis)
+        # Use separate sets for scalar and vector SSA values
+        live, live_vec = self._compute_live_set(hir.body)
 
         # Pass 2: Filter dead code (forward sweep)
-        new_body = self._filter_dead_code(hir.body, live)
+        new_body = self._filter_dead_code(hir.body, live, live_vec)
 
         # Record custom metrics
         if self._metrics:
@@ -64,15 +65,20 @@ class DCEPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=hir.num_ssa_values
+            num_ssa_values=hir.num_ssa_values,
+            num_vec_ssa_values=hir.num_vec_ssa_values
         )
 
-    def _compute_live_set(self, body: list[Statement]) -> set[int]:
+    def _compute_live_set(self, body: list[Statement]) -> tuple[set[int], set[int]]:
         """
-        Compute the set of live SSA value IDs using backward traversal.
+        Compute the sets of live SSA value IDs using backward traversal.
+
+        Returns (live, live_vec) where:
+        - live: set of live scalar SSAValue IDs
+        - live_vec: set of live VectorSSAValue IDs
 
         An SSA value is live if:
-        - It's used as operand to a side-effect op (store)
+        - It's used as operand to a side-effect op (store, vstore)
         - It's used as operand to Halt/Pause
         - It's used as operand to another live operation
         - It's a ForLoop/If result that's used downstream
@@ -80,14 +86,15 @@ class DCEPass(Pass):
         - It's an If condition when the If is needed
         """
         live: set[int] = set()
-        self._mark_live_backward(body, live)
-        return live
+        live_vec: set[int] = set()
+        self._mark_live_backward(body, live, live_vec)
+        return live, live_vec
 
-    def _mark_live_backward(self, body: list[Statement], live: set[int]) -> None:
+    def _mark_live_backward(self, body: list[Statement], live: set[int], live_vec: set[int]) -> None:
         """Traverse statements in reverse, marking live SSA values."""
         for stmt in reversed(body):
             if isinstance(stmt, Op):
-                self._mark_op_live(stmt, live)
+                self._mark_op_live(stmt, live, live_vec)
             elif isinstance(stmt, Halt):
                 # Halt is always live (terminates program)
                 pass
@@ -95,35 +102,41 @@ class DCEPass(Pass):
                 # Pause is always live (debug sync)
                 pass
             elif isinstance(stmt, ForLoop):
-                self._mark_forloop_live(stmt, live)
+                self._mark_forloop_live(stmt, live, live_vec)
             elif isinstance(stmt, If):
-                self._mark_if_live(stmt, live)
+                self._mark_if_live(stmt, live, live_vec)
 
-    def _mark_op_live(self, op: Op, live: set[int]) -> None:
+    def _mark_op_live(self, op: Op, live: set[int], live_vec: set[int]) -> None:
         """Mark an Op's operands as live if the op is live."""
         # Op is live if:
-        # 1. It has side effects (store, result=None)
-        # 2. Its result is in the live set
+        # 1. It has side effects (store, vstore, result=None)
+        # 2. Its result is in the appropriate live set
         is_live = False
 
         if self._is_side_effect_op(op):
             is_live = True
-        elif op.result is not None and op.result.id in live:
-            is_live = True
+        elif op.result is not None:
+            if isinstance(op.result, VectorSSAValue):
+                is_live = op.result.id in live_vec
+            else:
+                is_live = op.result.id in live
 
         if is_live:
             # Mark all operands as live
             for operand in op.operands:
                 if isinstance(operand, SSAValue):
                     live.add(operand.id)
+                elif isinstance(operand, VectorSSAValue):
+                    live_vec.add(operand.id)
 
-    def _mark_forloop_live(self, loop: ForLoop, live: set[int]) -> None:
+    def _mark_forloop_live(self, loop: ForLoop, live: set[int], live_vec: set[int]) -> None:
         """Mark a ForLoop's components as live if needed."""
         # Build map from body_param id to its index
         body_param_id_to_idx = {p.id: i for i, p in enumerate(loop.body_params)}
 
         # First, process the loop body to determine what's live inside
         body_live: set[int] = set()
+        body_live_vec: set[int] = set()
 
         # If any result is live, mark the corresponding yield as live
         for i, result in enumerate(loop.results):
@@ -135,7 +148,7 @@ class DCEPass(Pass):
         # This is needed because body_params[i] = yields[i] on subsequent iterations
         # So if body_params[i] is live, yields[i] must also be live
         while True:
-            prev_size = len(body_live)
+            prev_size = len(body_live) + len(body_live_vec)
 
             # Mark any body_param that's live -> also mark corresponding yield as live
             for ssa_id in list(body_live):
@@ -147,10 +160,10 @@ class DCEPass(Pass):
                             body_live.add(yield_val.id)
 
             # Run backward analysis on body
-            self._mark_live_backward(loop.body, body_live)
+            self._mark_live_backward(loop.body, body_live, body_live_vec)
 
             # Check for fixed point
-            if len(body_live) == prev_size:
+            if len(body_live) + len(body_live_vec) == prev_size:
                 break
 
         # Check if loop has side effects in body
@@ -190,11 +203,16 @@ class DCEPass(Pass):
                     # Value defined outside loop - propagate to outer scope
                     live.add(ssa_id)
 
-    def _mark_if_live(self, if_stmt: If, live: set[int]) -> None:
+            # Propagate body_live_vec to outer live_vec set
+            live_vec.update(body_live_vec)
+
+    def _mark_if_live(self, if_stmt: If, live: set[int], live_vec: set[int]) -> None:
         """Mark an If's components as live if needed."""
         # First, process both branches to determine what's live inside
         then_live: set[int] = set()
         else_live: set[int] = set()
+        then_live_vec: set[int] = set()
+        else_live_vec: set[int] = set()
 
         # If any result is live, mark the corresponding yields as live
         for i, result in enumerate(if_stmt.results):
@@ -205,8 +223,8 @@ class DCEPass(Pass):
                     else_live.add(if_stmt.else_yields[i].id)
 
         # Recursively mark live in branches
-        self._mark_live_backward(if_stmt.then_body, then_live)
-        self._mark_live_backward(if_stmt.else_body, else_live)
+        self._mark_live_backward(if_stmt.then_body, then_live, then_live_vec)
+        self._mark_live_backward(if_stmt.else_body, else_live, else_live_vec)
 
         # Check if branches have side effects
         then_has_side_effects = self._has_side_effects(if_stmt.then_body)
@@ -224,6 +242,8 @@ class DCEPass(Pass):
             # (No local definitions in if branches besides results)
             live.update(then_live)
             live.update(else_live)
+            live_vec.update(then_live_vec)
+            live_vec.update(else_live_vec)
 
     def _is_side_effect_op(self, op: Op) -> bool:
         """Check if an operation has side effects."""
@@ -248,13 +268,13 @@ class DCEPass(Pass):
                     return True
         return False
 
-    def _filter_dead_code(self, body: list[Statement], live: set[int]) -> list[Statement]:
+    def _filter_dead_code(self, body: list[Statement], live: set[int], live_vec: set[int]) -> list[Statement]:
         """Filter out dead statements, keeping only live ones."""
         result = []
 
         for stmt in body:
             if isinstance(stmt, Op):
-                filtered = self._filter_op(stmt, live)
+                filtered = self._filter_op(stmt, live, live_vec)
                 if filtered is not None:
                     result.append(filtered)
             elif isinstance(stmt, Halt):
@@ -262,28 +282,33 @@ class DCEPass(Pass):
             elif isinstance(stmt, Pause):
                 result.append(stmt)
             elif isinstance(stmt, ForLoop):
-                filtered = self._filter_forloop(stmt, live)
+                filtered = self._filter_forloop(stmt, live, live_vec)
                 if filtered is not None:
                     result.append(filtered)
             elif isinstance(stmt, If):
-                filtered = self._filter_if(stmt, live)
+                filtered = self._filter_if(stmt, live, live_vec)
                 if filtered is not None:
                     result.append(filtered)
 
         return result
 
-    def _filter_op(self, op: Op, live: set[int]) -> Op | None:
+    def _filter_op(self, op: Op, live: set[int], live_vec: set[int]) -> Op | None:
         """Filter an Op - keep if it has side effects or result is live."""
         if self._is_side_effect_op(op):
             return op
-        if op.result is not None and op.result.id in live:
-            return op
+        if op.result is not None:
+            if isinstance(op.result, VectorSSAValue):
+                if op.result.id in live_vec:
+                    return op
+            else:
+                if op.result.id in live:
+                    return op
 
         # Dead code - eliminate
         self._ops_eliminated += 1
         return None
 
-    def _filter_forloop(self, loop: ForLoop, live: set[int]) -> ForLoop | None:
+    def _filter_forloop(self, loop: ForLoop, live: set[int], live_vec: set[int]) -> ForLoop | None:
         """Filter a ForLoop - keep if any result is live or body has side effects."""
         has_side_effects = self._has_side_effects(loop.body)
         any_result_live = any(r.id in live for r in loop.results)
@@ -298,6 +323,7 @@ class DCEPass(Pass):
 
         # Compute what's live in the loop body
         body_live: set[int] = set()
+        body_live_vec: set[int] = set()
 
         # Results that are live make corresponding yields live
         for i, result in enumerate(loop.results):
@@ -312,7 +338,7 @@ class DCEPass(Pass):
 
         # Iteratively compute live set until fixed point
         while True:
-            prev_size = len(body_live)
+            prev_size = len(body_live) + len(body_live_vec)
 
             # Mark any body_param that's live -> also mark corresponding yield as live
             for ssa_id in list(body_live):
@@ -324,14 +350,14 @@ class DCEPass(Pass):
                             body_live.add(yield_val.id)
 
             # Propagate liveness backward through body
-            self._mark_live_backward(loop.body, body_live)
+            self._mark_live_backward(loop.body, body_live, body_live_vec)
 
             # Check for fixed point
-            if len(body_live) == prev_size:
+            if len(body_live) + len(body_live_vec) == prev_size:
                 break
 
         # Filter the body
-        new_body = self._filter_dead_code(loop.body, body_live)
+        new_body = self._filter_dead_code(loop.body, body_live, body_live_vec)
 
         return ForLoop(
             counter=loop.counter,
@@ -345,7 +371,7 @@ class DCEPass(Pass):
             pragma_unroll=loop.pragma_unroll
         )
 
-    def _filter_if(self, if_stmt: If, live: set[int]) -> If | None:
+    def _filter_if(self, if_stmt: If, live: set[int], live_vec: set[int]) -> If | None:
         """Filter an If - keep if any result is live or branches have side effects."""
         then_has_side_effects = self._has_side_effects(if_stmt.then_body)
         else_has_side_effects = self._has_side_effects(if_stmt.else_body)
@@ -359,6 +385,8 @@ class DCEPass(Pass):
         # Compute what's live in each branch
         then_live: set[int] = set()
         else_live: set[int] = set()
+        then_live_vec: set[int] = set()
+        else_live_vec: set[int] = set()
 
         # Results that are live make corresponding yields live
         for i, result in enumerate(if_stmt.results):
@@ -377,12 +405,12 @@ class DCEPass(Pass):
                 else_live.add(y.id)
 
         # Propagate liveness backward through branches
-        self._mark_live_backward(if_stmt.then_body, then_live)
-        self._mark_live_backward(if_stmt.else_body, else_live)
+        self._mark_live_backward(if_stmt.then_body, then_live, then_live_vec)
+        self._mark_live_backward(if_stmt.else_body, else_live, else_live_vec)
 
         # Filter each branch
-        new_then_body = self._filter_dead_code(if_stmt.then_body, then_live)
-        new_else_body = self._filter_dead_code(if_stmt.else_body, else_live)
+        new_then_body = self._filter_dead_code(if_stmt.then_body, then_live, then_live_vec)
+        new_else_body = self._filter_dead_code(if_stmt.else_body, else_live, else_live_vec)
 
         return If(
             cond=if_stmt.cond,

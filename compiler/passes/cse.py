@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
 from ..ssa_context import SSARenumberContext
@@ -18,11 +18,12 @@ from ..ssa_context import SSARenumberContext
 class CSEContext:
     """Context for CSE value numbering."""
 
-    # Maps value_number (tuple) -> first SSA computing it
-    expr_to_ssa: dict[tuple, SSAValue] = field(default_factory=dict)
+    # Maps value_number (tuple) -> first SSA computing it (SSAValue or VectorSSAValue)
+    expr_to_ssa: dict[tuple, SSAValue | VectorSSAValue] = field(default_factory=dict)
 
-    # Maps SSAValue.id -> its value number (tuple)
-    ssa_to_value_number: dict[int, tuple] = field(default_factory=dict)
+    # Maps SSA key -> its value number (tuple)
+    # Key is int for SSAValue.id, or ("vec", id) for VectorSSAValue.id
+    ssa_to_value_number: dict[int | tuple, tuple] = field(default_factory=dict)
 
     # Memory epoch counter (increments on store operations)
     # Enables finer-grained load CSE: loads with same address and epoch can be merged
@@ -31,7 +32,7 @@ class CSEContext:
     # Parent context for nested scopes
     parent: Optional['CSEContext'] = None
 
-    def lookup(self, value_number: tuple) -> Optional[SSAValue]:
+    def lookup(self, value_number: tuple) -> Optional[SSAValue | VectorSSAValue]:
         """Look up a value number in this context or parent contexts."""
         if value_number in self.expr_to_ssa:
             return self.expr_to_ssa[value_number]
@@ -39,12 +40,16 @@ class CSEContext:
             return self.parent.lookup(value_number)
         return None
 
-    def get_value_number(self, ssa_id: int) -> Optional[tuple]:
-        """Get the value number for an SSA value from this context or parents."""
-        if ssa_id in self.ssa_to_value_number:
-            return self.ssa_to_value_number[ssa_id]
+    def get_value_number(self, ssa_key: int | tuple) -> Optional[tuple]:
+        """Get the value number for an SSA value from this context or parents.
+
+        Args:
+            ssa_key: int for SSAValue.id, or ("vec", id) for VectorSSAValue.id
+        """
+        if ssa_key in self.ssa_to_value_number:
+            return self.ssa_to_value_number[ssa_key]
         if self.parent is not None:
-            return self.parent.get_value_number(ssa_id)
+            return self.parent.get_value_number(ssa_key)
         return None
 
     def get_mem_epoch(self) -> int:
@@ -57,10 +62,14 @@ class CSEContext:
         """Increment memory epoch (called on store)."""
         self.mem_epoch += 1
 
-    def record(self, value_number: tuple, ssa: SSAValue):
+    def record(self, value_number: tuple, ssa: SSAValue | VectorSSAValue):
         """Record a new expression -> SSA mapping."""
         self.expr_to_ssa[value_number] = ssa
-        self.ssa_to_value_number[ssa.id] = value_number
+        # Use tagged key for vector SSA to avoid ID collisions
+        if isinstance(ssa, VectorSSAValue):
+            self.ssa_to_value_number[("vec", ssa.id)] = value_number
+        else:
+            self.ssa_to_value_number[ssa.id] = value_number
 
     def child_context(self) -> 'CSEContext':
         """Create a child context for nested scopes."""
@@ -75,13 +84,20 @@ CSE_SAFE_OPS = {
     "const",
     # Flow engine ops
     "select",
+    # Vector ALU ops
+    "v+", "v-", "v*", "v//", "v%", "v^", "v&", "v|", "v<<", "v>>", "v<", "v==",
+    "vbroadcast", "multiply_add",
+    # Vector flow
+    "vselect",
+    # Vector insert/extract
+    "vextract", "vinsert",
 }
 
 # Load ops that can be CSE'd when memory isn't clobbered
-LOAD_OPS = {"load"}
+LOAD_OPS = {"load", "vload"}
 
 # Commutative operations (a op b == b op a)
-COMMUTATIVE_OPS = {"+", "*", "^", "&", "|", "=="}
+COMMUTATIVE_OPS = {"+", "*", "^", "&", "|", "==", "v+", "v*", "v^", "v&", "v|", "v=="}
 
 
 class CSEPass(Pass):
@@ -144,7 +160,8 @@ class CSEPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=ssa_ctx.next_id
+            num_ssa_values=ssa_ctx.next_id,
+            num_vec_ssa_values=hir.num_vec_ssa_values
         )
 
     def _transform_statements(
@@ -157,8 +174,8 @@ class CSEPass(Pass):
         result = []
 
         for stmt in stmts:
-            # Apply any SSA bindings from eliminated expressions
-            stmt = self._apply_bindings(stmt, ssa_ctx.result_bindings)
+            # Apply any SSA bindings from eliminated expressions (both scalar and vector)
+            stmt = self._apply_bindings(stmt, ssa_ctx.result_bindings, ssa_ctx.vector_bindings)
 
             if isinstance(stmt, Op):
                 transformed = self._transform_op(stmt, ctx, ssa_ctx)
@@ -188,7 +205,7 @@ class CSEPass(Pass):
         self._expressions_analyzed += 1
 
         # Store operations are never CSE'd and increment memory epoch
-        if op.opcode == "store":
+        if op.opcode in ("store", "vstore"):
             ctx.increment_epoch()
             return op
 
@@ -221,12 +238,15 @@ class CSEPass(Pass):
 
             if op.opcode == "const":
                 self._consts_eliminated += 1
-            elif op.opcode == "load":
+            elif op.opcode in LOAD_OPS:
                 self._loads_eliminated += 1
 
-            # Bind the result to the existing SSA
+            # Bind the result to the existing SSA (use appropriate binding map)
             if op.result is not None:
-                ssa_ctx.bind_result(op.result.id, existing_ssa)
+                if isinstance(op.result, VectorSSAValue):
+                    ssa_ctx.bind_vector_result(op.result.id, existing_ssa)
+                else:
+                    ssa_ctx.bind_result(op.result.id, existing_ssa)
 
             return None  # Eliminate the op
 
@@ -363,6 +383,14 @@ class CSEPass(Pass):
             # Unknown SSA - use its ID as value number
             return ("ssa", operand.id)
 
+        if isinstance(operand, VectorSSAValue):
+            # Look up in context using tagged key
+            vn = ctx.get_value_number(("vec", operand.id))
+            if vn is not None:
+                return vn
+            # Unknown vector SSA - use its ID as value number (tagged)
+            return ("vec_ssa", operand.id)
+
         return None
 
     def _resolve_binding(
@@ -370,26 +398,43 @@ class CSEPass(Pass):
         value: SSAValue,
         bindings: dict[int, SSAValue]
     ) -> SSAValue:
-        """Resolve SSA bindings transitively."""
+        """Resolve scalar SSA bindings transitively."""
         while value.id in bindings:
             value = bindings[value.id]
+        return value
+
+    def _resolve_vector_binding(
+        self,
+        value: VectorSSAValue,
+        vector_bindings: dict[int, VectorSSAValue]
+    ) -> VectorSSAValue:
+        """Resolve vector SSA bindings transitively."""
+        while value.id in vector_bindings:
+            value = vector_bindings[value.id]
         return value
 
     def _apply_bindings(
         self,
         stmt: Statement,
-        bindings: dict[int, SSAValue]
+        bindings: dict[int, SSAValue],
+        vector_bindings: dict[int, VectorSSAValue]
     ) -> Statement:
-        """Apply SSA value bindings to a statement's operands."""
-        if not bindings:
+        """Apply SSA value bindings to a statement's operands.
+
+        Handles both scalar SSAValue and VectorSSAValue bindings.
+        """
+        if not bindings and not vector_bindings:
             return stmt
 
         if isinstance(stmt, Op):
             new_operands = []
             for op in stmt.operands:
-                if isinstance(op, SSAValue) and op.id in bindings:
+                if isinstance(op, VectorSSAValue) and op.id in vector_bindings:
+                    new_operands.append(self._resolve_vector_binding(op, vector_bindings))
+                elif isinstance(op, SSAValue) and op.id in bindings:
                     new_operands.append(self._resolve_binding(op, bindings))
                 else:
+                    # Const or unbound SSA pass through unchanged
                     new_operands.append(op)
             return Op(stmt.opcode, stmt.result, new_operands, stmt.engine)
 

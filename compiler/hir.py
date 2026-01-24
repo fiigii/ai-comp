@@ -22,6 +22,18 @@ class SSAValue:
 
 
 @dataclass(frozen=True)
+class VectorSSAValue:
+    """A vector SSA value (VLEN=8 elements)."""
+    id: int
+    name: Optional[str] = None
+
+    def __repr__(self):
+        if self.name:
+            return f"vec{self.id}:{self.name}"
+        return f"vec{self.id}"
+
+
+@dataclass(frozen=True)
 class Const:
     """A compile-time constant."""
     value: int
@@ -30,8 +42,8 @@ class Const:
         return f"#{self.value}"
 
 
-# Type alias for operands
-Operand = Union[SSAValue, Const]
+# Type alias for operands (VectorSSAValue is also a valid operand for vector ops)
+Operand = Union[SSAValue, VectorSSAValue, Const]
 
 
 @dataclass
@@ -121,3 +133,4 @@ class HIRFunction:
     name: str
     body: list[Statement]
     num_ssa_values: int
+    num_vec_ssa_values: int = 0

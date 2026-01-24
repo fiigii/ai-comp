@@ -131,6 +131,52 @@ def _inst_to_slot(inst: LIRInst, zero_scratch: int) -> Optional[tuple]:
             # Implement copy as add with zero
             return ("+", inst.dest, inst.operands[0], zero_scratch)
 
+        # Vector ALU operations
+        # Machine uses base scratch address; VM knows to access VLEN consecutive locations
+        case LIROpcode.VADD | LIROpcode.VSUB | LIROpcode.VMUL | LIROpcode.VDIV | \
+             LIROpcode.VMOD | LIROpcode.VXOR | LIROpcode.VAND | LIROpcode.VOR | \
+             LIROpcode.VSHL | LIROpcode.VSHR | LIROpcode.VLT | LIROpcode.VEQ:
+            # Strip the "v" prefix to get the scalar op name
+            scalar_op = inst.opcode.value[1:]  # "v+" -> "+"
+            dest_base = inst.dest[0]
+            a_base = inst.operands[0][0]
+            b_base = inst.operands[1][0]
+            return (scalar_op, dest_base, a_base, b_base)
+
+        case LIROpcode.VBROADCAST:
+            # vbroadcast: scalar -> vector
+            dest_base = inst.dest[0]
+            scalar = inst.operands[0]
+            return ("vbroadcast", dest_base, scalar)
+
+        case LIROpcode.MULTIPLY_ADD:
+            # multiply_add: vec, vec, vec -> vec
+            dest_base = inst.dest[0]
+            a_base = inst.operands[0][0]
+            b_base = inst.operands[1][0]
+            c_base = inst.operands[2][0]
+            return ("multiply_add", dest_base, a_base, b_base, c_base)
+
+        case LIROpcode.VLOAD:
+            # vload: addr (scalar) -> vector
+            dest_base = inst.dest[0]
+            addr = inst.operands[0]
+            return ("vload", dest_base, addr)
+
+        case LIROpcode.VSTORE:
+            # vstore: addr (scalar), vec -> None
+            addr = inst.operands[0]
+            src_base = inst.operands[1][0]
+            return ("vstore", addr, src_base)
+
+        case LIROpcode.VSELECT:
+            # vselect: cond (vec), a (vec), b (vec) -> vec
+            dest_base = inst.dest[0]
+            cond_base = inst.operands[0][0]
+            a_base = inst.operands[1][0]
+            b_base = inst.operands[2][0]
+            return ("vselect", dest_base, cond_base, a_base, b_base)
+
         case _:
             raise NotImplementedError(f"Codegen for {inst.opcode}")
 
@@ -157,11 +203,18 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
         for block in lir.blocks.values():
             for inst in block.instructions:
                 if inst.dest is not None:
-                    max_scratch = max(max_scratch, inst.dest)
+                    if isinstance(inst.dest, list):
+                        # Vector dest - use the maximum address in the list
+                        max_scratch = max(max_scratch, max(inst.dest))
+                    else:
+                        max_scratch = max(max_scratch, inst.dest)
                 # Skip CONST operands - they are immediate values, not scratch indices
                 if inst.opcode != LIROpcode.CONST:
                     for op in inst.operands:
-                        if isinstance(op, int) and op >= 0:
+                        if isinstance(op, list):
+                            # Vector operand
+                            max_scratch = max(max_scratch, max(op))
+                        elif isinstance(op, int) and op >= 0:
                             max_scratch = max(max_scratch, op)
 
         zero_scratch = max_scratch + 1
