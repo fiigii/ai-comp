@@ -1,10 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) and any other AI agents when working with code in this repository.
 
 ## Overview
 
 This is Anthropic's original performance engineering take-home challenge. The task is to optimize a kernel running on a simulated VLIW SIMD virtual machine. The goal is to minimize cycle count for a tree traversal + hash computation workload.
+
+This project is to solve this challenge by developing a optimizing compiler.
 
 **Important:** Do not modify files in the `tests/` folder. The submission tests use a frozen copy of the simulator to prevent cheating.
 
@@ -38,6 +40,13 @@ python watch_trace.py
 ```
 
 ## Architecture
+
+### Project Structure & Module Organization
+- `compiler/`: IR definitions, passes, lowering, and codegen for the VLIW SIMD target.
+- `kernels/`: IR-based kernel builders (e.g., `kernels/tree_hash.py`).
+- `tests/` and `compiler/tests/`: correctness and regression tests (pytest-based).
+- `docs/`: architecture reference (`docs/VLIW_ISA.md` is essential).
+- `perf_takehome.py` / `problem.py`: simulator and benchmark entry points.
 
 ### Virtual Machine (problem.py)
 
