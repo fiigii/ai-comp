@@ -14,7 +14,7 @@ from compiler.tests.conftest import (
 )
 from compiler import (
     PassManager, PassConfig, LoopUnrollPass,
-    Const, ForLoop,
+    Const, ForLoop, If, Op, SSAValue,
 )
 
 
@@ -300,6 +300,79 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         # one outer iter, inner sum of 0+1+2+3 = 6
         self.assertEqual(machine.mem[0], 6)
         print("Unroll remaps ForLoop yields test passed!")
+
+    def test_unroll_materializes_const_iter_arg(self):
+        """Ensure const iter_args are materialized before cloned nested loops."""
+        b = HIRBuilder()
+
+        def inner_body(j, inner_params):
+            return [inner_params[0]]
+
+        def outer_body(i, params):
+            inner_results = b.for_loop(
+                start=Const(0),
+                end=Const(1),
+                iter_args=[params[0]],
+                body_fn=inner_body,
+                pragma_unroll=1  # keep inner loop
+            )
+            return [inner_results[0]]
+
+        # Pass Const directly to force remap -> Const during unroll
+        b.for_loop(start=Const(0), end=Const(2), iter_args=[Const(7)], body_fn=outer_body)
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        unrolled = pm.run(hir)
+
+        loops = [(idx, s) for idx, s in enumerate(unrolled.body) if isinstance(s, ForLoop)]
+        self.assertGreaterEqual(len(loops), 1)
+        has_materialized = False
+        for idx, loop in loops:
+            self.assertTrue(all(isinstance(arg, SSAValue) for arg in loop.iter_args))
+            self.assertGreater(idx, 0)
+            if any(
+                isinstance(stmt, Op) and stmt.opcode == "const" and stmt.result in loop.iter_args
+                for stmt in unrolled.body[:idx]
+            ):
+                has_materialized = True
+        self.assertTrue(has_materialized)
+
+    def test_unroll_materializes_const_if_cond(self):
+        """Ensure const If conditions are materialized before cloned Ifs."""
+        b = HIRBuilder()
+
+        def outer_body(i, params):
+            def then_fn():
+                return [params[0]]
+
+            def else_fn():
+                return [params[0]]
+
+            results = b.if_stmt(params[0], then_fn, else_fn)
+            return [results[0]]
+
+        # Pass Const directly to force remap -> Const during unroll
+        b.for_loop(start=Const(0), end=Const(2), iter_args=[Const(1)], body_fn=outer_body)
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(LoopUnrollPass())
+        unrolled = pm.run(hir)
+
+        ifs = [(idx, s) for idx, s in enumerate(unrolled.body) if isinstance(s, If)]
+        self.assertGreaterEqual(len(ifs), 1)
+        has_materialized = False
+        for idx, if_stmt in ifs:
+            self.assertIsInstance(if_stmt.cond, SSAValue)
+            self.assertGreater(idx, 0)
+            if any(
+                isinstance(stmt, Op) and stmt.opcode == "const" and stmt.result == if_stmt.cond
+                for stmt in unrolled.body[:idx]
+            ):
+                has_materialized = True
+        self.assertTrue(has_materialized)
 
 
 class TestPragmaUnroll(unittest.TestCase):

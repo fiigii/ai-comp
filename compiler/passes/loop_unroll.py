@@ -4,8 +4,6 @@ Loop Unroll Pass
 Unrolls ForLoops with static trip counts, either fully or partially.
 """
 
-from typing import Optional
-
 from ..hir import (
     SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
@@ -370,8 +368,8 @@ class LoopUnrollPass(Pass):
     ) -> tuple[list[Statement], list[SSAValue]]:
         """Clone a body of statements without recursing into nested structures.
 
-        Unlike _clone_body_with_remap, this does not call _unroll_loop on nested
-        ForLoops because the body is already transformed.
+        This does not call _unroll_loop on nested ForLoops because the body is
+        already transformed.
         """
         cloned = []
         for stmt in body:
@@ -416,6 +414,7 @@ class LoopUnrollPass(Pass):
 
             # Remap iter_args
             new_iter_args = []
+            prefix = []
             for arg in stmt.iter_args:
                 remapped = self._remap_operand(arg, remap)
                 if isinstance(remapped, SSAValue):
@@ -423,6 +422,7 @@ class LoopUnrollPass(Pass):
                 else:
                     # Create SSA for constant
                     ssa = ctx.new_ssa("iter_arg_const")
+                    prefix.append(Op("const", ssa, [remapped], "load"))
                     new_iter_args.append(ssa)
 
             # Build inner remap for the loop body
@@ -467,14 +467,16 @@ class LoopUnrollPass(Pass):
             for old_res, new_res in zip(stmt.results, new_results):
                 remap[old_res.id] = new_res
 
-            return [new_loop]
+            return prefix + [new_loop]
 
         elif isinstance(stmt, If):
             # Clone If statement
             new_cond = self._remap_operand(stmt.cond, remap)
+            cond_prefix = []
             if not isinstance(new_cond, SSAValue):
                 # Create SSA for constant condition (unusual but handle it)
                 cond_ssa = ctx.new_ssa("cond_const")
+                cond_prefix.append(Op("const", cond_ssa, [new_cond], "load"))
                 new_cond = cond_ssa
 
             # Clone branches
@@ -514,289 +516,7 @@ class LoopUnrollPass(Pass):
             for old_res, new_res in zip(stmt.results, new_results):
                 remap[old_res.id] = new_res
 
-            return [If(
-                cond=new_cond,
-                then_body=cloned_then,
-                then_yields=new_then_yields,
-                else_body=cloned_else,
-                else_yields=new_else_yields,
-                results=new_results
-            )]
-
-        elif isinstance(stmt, Halt):
-            return [Halt()]
-
-        elif isinstance(stmt, Pause):
-            return [Pause()]
-
-        else:
-            return [stmt]
-
-    def _fully_unroll(
-        self, loop: ForLoop, trip_count: int, ctx: SSARenumberContext,
-        nested_factor: Optional[int], max_trip: int
-    ) -> list[Statement]:
-        """Replace loop with trip_count copies of body."""
-        result = []
-
-        # Track current values for loop-carried variables
-        # Initially: current_params[i] = iter_args[i]
-        current_params = list(loop.iter_args)
-
-        for i in range(trip_count):
-            # Create remapping: counter -> const(start + i), body_params -> current_params
-            remap: dict[int, Operand] = {}
-
-            # Map counter to constant
-            counter_value = loop.start.value + i
-            counter_ssa = ctx.new_ssa(f"unroll_i{i}")
-            result.append(Op("const", counter_ssa, [Const(counter_value)], "load"))
-            remap[loop.counter.id] = counter_ssa
-
-            # Map body_params to current values
-            for param, current in zip(loop.body_params, current_params):
-                remap[param.id] = current
-
-            # Clone body with remapping
-            cloned_body, new_yields = self._clone_body_with_remap(
-                loop.body, loop.yields, remap, ctx, nested_factor, max_trip
-            )
-            result.extend(cloned_body)
-
-            # Update current_params for next iteration
-            current_params = new_yields
-
-        # Bind results to final yields
-        for result_ssa, final_val in zip(loop.results, current_params):
-            ctx.bind_result(result_ssa.id, final_val)
-
-        return result
-
-    def _partially_unroll(
-        self, loop: ForLoop, factor: int, ctx: SSARenumberContext,
-        nested_factor: Optional[int], max_trip: int
-    ) -> list[Statement]:
-        """
-        Create a new loop that iterates trip_count/factor times,
-        with factor copies of the body per iteration.
-        """
-        trip_count = loop.end.value - loop.start.value
-        new_trip_count = trip_count // factor
-
-        # New loop SSA values
-        new_counter = ctx.new_ssa("unroll_i")
-        new_body_params = [ctx.new_ssa(f"unroll_param_{j}") for j in range(len(loop.body_params))]
-        new_results = [ctx.new_ssa(f"unroll_result_{j}") for j in range(len(loop.results))]
-
-        # Build unrolled body
-        unrolled_body: list[Statement] = []
-        current_params = list(new_body_params)
-
-        for j in range(factor):
-            remap: dict[int, Operand] = {}
-
-            # Compute counter for this unrolled iteration:
-            # original_counter = new_counter * factor + j + start
-            counter_ssa = ctx.new_ssa(f"iter_{j}_counter")
-
-            # First compute: new_counter * factor
-            if factor > 1:
-                scaled = ctx.new_ssa(f"scaled_{j}")
-                unrolled_body.append(Op("*", scaled, [new_counter, Const(factor)], "alu"))
-                # Then add offset: scaled + (start + j)
-                unrolled_body.append(Op("+", counter_ssa, [scaled, Const(loop.start.value + j)], "alu"))
-            else:
-                # factor == 1, just add start
-                unrolled_body.append(Op("+", counter_ssa, [new_counter, Const(loop.start.value)], "alu"))
-
-            remap[loop.counter.id] = counter_ssa
-
-            # Map body_params to current values
-            for param, current in zip(loop.body_params, current_params):
-                remap[param.id] = current
-
-            # Clone body with remapping
-            cloned_body, new_yields = self._clone_body_with_remap(
-                loop.body, loop.yields, remap, ctx, nested_factor, max_trip
-            )
-            unrolled_body.extend(cloned_body)
-            current_params = new_yields
-
-        # Bind old results to new results so subsequent statements use the new ones
-        for old_result, new_result in zip(loop.results, new_results):
-            ctx.bind_result(old_result.id, new_result)
-
-        # Create new ForLoop with unrolled body
-        # Set pragma_unroll=1 to prevent re-unrolling
-        return [ForLoop(
-            counter=new_counter,
-            start=Const(0),
-            end=Const(new_trip_count),
-            iter_args=loop.iter_args,
-            body_params=new_body_params,
-            body=unrolled_body,
-            yields=current_params,
-            results=new_results,
-            pragma_unroll=1
-        )]
-
-    def _clone_body_with_remap(
-        self,
-        body: list[Statement],
-        yields: list[SSAValue],
-        remap: dict[int, Operand],
-        ctx: SSARenumberContext,
-        nested_factor: Optional[int],
-        max_trip: int
-    ) -> tuple[list[Statement], list[SSAValue]]:
-        """Clone a body of statements, remapping SSA values."""
-        cloned = []
-        for stmt in body:
-            cloned.extend(self._clone_stmt(stmt, remap, ctx, nested_factor, max_trip))
-
-        # Remap yields
-        new_yields = [self._remap_operand(y, remap) for y in yields]
-        # Ensure yields are SSAValue (not Const)
-        final_yields = []
-        for y in new_yields:
-            if isinstance(y, SSAValue):
-                final_yields.append(y)
-            else:
-                # Const yield - need to create SSA for it
-                ssa = ctx.new_ssa("yield_const")
-                cloned.append(Op("const", ssa, [y], "load"))
-                final_yields.append(ssa)
-
-        return cloned, final_yields
-
-    def _clone_stmt(
-        self,
-        stmt: Statement,
-        remap: dict[int, Operand],
-        ctx: SSARenumberContext,
-        nested_factor: Optional[int],
-        max_trip: int
-    ) -> list[Statement]:
-        """Clone a single statement with SSA remapping."""
-        if isinstance(stmt, Op):
-            new_operands = [self._remap_operand(op, remap) for op in stmt.operands]
-            if stmt.result:
-                new_result = ctx.new_ssa(stmt.result.name)
-                remap[stmt.result.id] = new_result
-            else:
-                new_result = None
-            return [Op(stmt.opcode, new_result, new_operands, stmt.engine)]
-
-        elif isinstance(stmt, ForLoop):
-            # Create new SSA values for the nested loop
-            new_counter = ctx.new_ssa(stmt.counter.name)
-            new_body_params = [ctx.new_ssa(p.name) for p in stmt.body_params]
-            new_results = [ctx.new_ssa(r.name) for r in stmt.results]
-
-            # Remap iter_args
-            new_iter_args = []
-            for arg in stmt.iter_args:
-                remapped = self._remap_operand(arg, remap)
-                if isinstance(remapped, SSAValue):
-                    new_iter_args.append(remapped)
-                else:
-                    # Create SSA for constant
-                    ssa = ctx.new_ssa("iter_arg_const")
-                    new_iter_args.append(ssa)
-                    # Note: we'd need to emit this const before the loop
-
-            # Build inner remap for the loop body
-            inner_remap = dict(remap)
-            inner_remap[stmt.counter.id] = new_counter
-            for old_param, new_param in zip(stmt.body_params, new_body_params):
-                inner_remap[old_param.id] = new_param
-
-            # Clone body
-            cloned_body = []
-            for s in stmt.body:
-                cloned_body.extend(self._clone_stmt(s, inner_remap, ctx, nested_factor, max_trip))
-
-            # Remap yields
-            new_yields = []
-            for y in stmt.yields:
-                remapped = self._remap_operand(y, inner_remap)
-                if isinstance(remapped, SSAValue):
-                    new_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("yield_const")
-                    cloned_body.append(Op("const", ssa, [remapped], "load"))
-                    new_yields.append(ssa)
-
-            # Remap start/end
-            new_start = self._remap_operand(stmt.start, remap) if isinstance(stmt.start, SSAValue) else stmt.start
-            new_end = self._remap_operand(stmt.end, remap) if isinstance(stmt.end, SSAValue) else stmt.end
-
-            new_loop = ForLoop(
-                counter=new_counter,
-                start=new_start,
-                end=new_end,
-                iter_args=new_iter_args,
-                body_params=new_body_params,
-                body=cloned_body,
-                yields=new_yields,
-                results=new_results,
-                pragma_unroll=stmt.pragma_unroll
-            )
-
-            # Recursively unroll nested loop if it has static bounds
-            replacement = self._unroll_loop(new_loop, max_trip, ctx)
-            # Ensure subsequent uses reference the post-unroll replacements.
-            for old_res, new_res in zip(stmt.results, new_results):
-                remap[old_res.id] = self._resolve_ssa_binding(new_res, ctx.result_bindings)
-            return replacement
-
-        elif isinstance(stmt, If):
-            # Clone If statement
-            new_cond = self._remap_operand(stmt.cond, remap)
-            if not isinstance(new_cond, SSAValue):
-                # Create SSA for constant condition (unusual but handle it)
-                cond_ssa = ctx.new_ssa("cond_const")
-                # We'd need to emit this before, handle specially
-                new_cond = cond_ssa
-
-            # Clone branches
-            then_remap = dict(remap)
-            cloned_then = []
-            for s in stmt.then_body:
-                cloned_then.extend(self._clone_stmt(s, then_remap, ctx, nested_factor, max_trip))
-
-            else_remap = dict(remap)
-            cloned_else = []
-            for s in stmt.else_body:
-                cloned_else.extend(self._clone_stmt(s, else_remap, ctx, nested_factor, max_trip))
-
-            # Remap yields
-            new_then_yields = []
-            for y in stmt.then_yields:
-                remapped = self._remap_operand(y, then_remap)
-                if isinstance(remapped, SSAValue):
-                    new_then_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("then_yield_const")
-                    cloned_then.append(Op("const", ssa, [remapped], "load"))
-                    new_then_yields.append(ssa)
-
-            new_else_yields = []
-            for y in stmt.else_yields:
-                remapped = self._remap_operand(y, else_remap)
-                if isinstance(remapped, SSAValue):
-                    new_else_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("else_yield_const")
-                    cloned_else.append(Op("const", ssa, [remapped], "load"))
-                    new_else_yields.append(ssa)
-
-            # New results
-            new_results = [ctx.new_ssa(r.name) for r in stmt.results]
-            for old_res, new_res in zip(stmt.results, new_results):
-                remap[old_res.id] = new_res
-
-            return [If(
+            return cond_prefix + [If(
                 cond=new_cond,
                 then_body=cloned_then,
                 then_yields=new_then_yields,
