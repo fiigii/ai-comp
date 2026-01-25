@@ -33,9 +33,9 @@ class TestSimplifyPass(unittest.TestCase):
     def test_constant_fold_add(self):
         """Test that Const(10) + Const(20) -> Const(30)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        val10 = b.const_load(10, "val10")
-        val20 = b.const_load(20, "val20")
+        addr0 = b.const(0)
+        val10 = b.const(10)
+        val20 = b.const(20)
 
         result = b.add(val10, val20, "result")
         b.store(addr0, result)
@@ -56,10 +56,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_constant_fold_all_ops(self):
         """Test constant folding for all supported operations."""
         b = HIRBuilder()
-        addr = [b.const_load(i, f"addr{i}") for i in range(12)]
+        addr = [b.const(i) for i in range(12)]
 
-        val10 = b.const_load(10, "val10")
-        val3 = b.const_load(3, "val3")
+        val10 = b.const(10)
+        val3 = b.const(3)
 
         # Test all foldable ops
         r_add = b.add(val10, val3, "r_add")       # 10 + 3 = 13
@@ -117,10 +117,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_add_zero(self):
         """Test that x + 0 -> x and 0 + x -> x."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         # x + 0 -> x
         result1 = b.add(x, zero, "result1")
@@ -146,10 +146,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_mul_one(self):
         """Test that x * 1 -> x and 1 * x -> x."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        one = b.const_load(1, "one")
+        one = b.const(1)
 
         # x * 1 -> x
         result1 = b.mul(x, one, "result1")
@@ -175,10 +175,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_mul_zero(self):
         """Test that x * 0 -> 0 and 0 * x -> 0."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         # x * 0 -> 0
         result1 = b.mul(x, zero, "result1")
@@ -204,10 +204,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_xor_zero(self):
         """Test that x ^ 0 -> x and 0 ^ x -> x."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         # x ^ 0 -> x
         result1 = b.xor(x, zero, "result1")
@@ -233,10 +233,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_and_zero(self):
         """Test that x & 0 -> 0 and 0 & x -> 0."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         # x & 0 -> 0
         result1 = b.and_(x, zero, "result1")
@@ -262,10 +262,10 @@ class TestSimplifyPass(unittest.TestCase):
     def test_identity_or_zero(self):
         """Test that x | 0 -> x and 0 | x -> x."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         # x | 0 -> x
         result1 = b.or_(x, zero, "result1")
@@ -293,21 +293,21 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_preserves_semantics(self):
         """Test that simplify pass preserves program semantics."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
         y = b.load(addr1, "y")
 
         # Expression with simplifiable subexpressions
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
+        zero = b.const(0)
+        one = b.const(1)
 
         # (x + 0) * (y * 1) + (10 + 20)
         t1 = b.add(x, zero, "t1")
         t2 = b.mul(y, one, "t2")
         t3 = b.mul(t1, t2, "t3")
-        val10 = b.const_load(10, "val10")
-        val20 = b.const_load(20, "val20")
+        val10 = b.const(10)
+        val20 = b.const(20)
         t4 = b.add(val10, val20, "t4")
         result = b.add(t3, t4, "result")
 
@@ -336,11 +336,11 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_metrics(self):
         """Test that simplify pass reports correct metrics."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         x = b.load(addr0, "x")
-        zero = b.const_load(0, "zero")
-        val10 = b.const_load(10, "val10")
-        val20 = b.const_load(20, "val20")
+        zero = b.const(0)
+        val10 = b.const(10)
+        val20 = b.const(20)
 
         # x + 0 -> identity simplification
         t1 = b.add(x, zero, "t1")
@@ -369,9 +369,9 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_config_disable(self):
         """Test that simplify pass can be disabled via config."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        val10 = b.const_load(10, "val10")
-        val20 = b.const_load(20, "val20")
+        addr0 = b.const(0)
+        val10 = b.const(10)
+        val20 = b.const(20)
 
         # This would normally be folded
         result = b.add(val10, val20, "result")
@@ -395,9 +395,9 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_mod2_to_and1(self):
         """Test %(x, 2) -> &(x, 1) strength reduction."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         x = b.load(addr0, "x")
-        two = b.const_load(2, "two")
+        two = b.const(2)
         result = b.mod(x, two, "result")  # x % 2
         b.store(addr0, result)
 
@@ -423,9 +423,9 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_mul2_to_shift(self):
         """Test *(x, 2) -> <<(x, 1) strength reduction."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         x = b.load(addr0, "x")
-        two = b.const_load(2, "two")
+        two = b.const(2)
         result = b.mul(x, two, "result")  # x * 2
         b.store(addr0, result)
 
@@ -451,9 +451,9 @@ class TestSimplifyPass(unittest.TestCase):
         """Test *(x, 16) -> <<(x, 4) and other powers of 2."""
         # Test multiply by 16 (2^4)
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         x = b.load(addr0, "x")
-        sixteen = b.const_load(16, "sixteen")
+        sixteen = b.const(16)
         result = b.mul(x, sixteen, "result")  # x * 16
         b.store(addr0, result)
 
@@ -476,17 +476,17 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_select_to_multiply(self):
         """Test select(cond, x, 0) -> *(x, cond) when cond is boolean."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         x = b.load(addr0, "x")
         y = b.load(addr1, "y")
 
         # cond = x < 5 (produces 0 or 1)
-        five = b.const_load(5, "five")
+        five = b.const(5)
         cond = b.lt(x, five, "cond")
 
         # select(cond, y, 0) should become y * cond
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
 
         def then_fn():
             return [y]
@@ -524,18 +524,18 @@ class TestSimplifyPass(unittest.TestCase):
     def test_simplify_parity_pattern(self):
         """Test full parity pattern: %(x,2) + ==(mod,0) + select(even,1,2) -> &(x,1) + 1."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         x = b.load(addr0, "x")
 
         # Parity pattern: offset = select(x % 2 == 0, 1, 2)
-        two = b.const_load(2, "two")
+        two = b.const(2)
         mod = b.mod(x, two, "mod")  # x % 2 -> & 1 (boolean)
 
-        zero = b.const_load(0, "zero")
+        zero = b.const(0)
         even = b.eq(mod, zero, "even")  # == 0, tracked as negated boolean
 
-        one = b.const_load(1, "one")
-        two_const = b.const_load(2, "two_const")
+        one = b.const(1)
+        two_const = b.const(2)
 
         # select(even, 1, 2) should become (x & 1) + 1
         def then_fn():

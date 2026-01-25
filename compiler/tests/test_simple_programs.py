@@ -27,11 +27,11 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         b = HIRBuilder()
 
         # Load constants
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
-        val10 = b.const_load(10, "val10")
-        val20 = b.const_load(20, "val20")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
+        val10 = b.const(10)
+        val20 = b.const(20)
 
         # Store 10 to mem[0], 20 to mem[1]
         b.store(addr0, val10)
@@ -60,12 +60,12 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test simple loop: sum = 0; for i in 0..5: sum += i; mem[0] = sum"""
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        five = b.const_load(5, "five")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        five = b.const(5)
+        addr0 = b.const(0)
 
         # Sum loop with carried value
-        init_sum = b.const_load(0, "init_sum")
+        init_sum = b.const(0)
 
         def loop_body(i, params):
             # params[0] is the running sum
@@ -97,9 +97,9 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test loop that initializes array: for i in 0..5: mem[i] = i * 2"""
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        five = b.const_load(5, "five")
-        two = b.const_load(2, "two")
+        zero = b.const(0)
+        five = b.const(5)
+        two = b.const(2)
 
         def loop_body(i, params):
             val = b.mul(i, two, "val")
@@ -127,8 +127,8 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test nested loops: for i in 0..3: for j in 0..3: mem[i*3+j] = i + j"""
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        three = b.const_load(3, "three")
+        zero = b.const(0)
+        three = b.const(3)
 
         def outer_body(i, outer_params):
             def inner_body(j, inner_params):
@@ -160,11 +160,11 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test if/else: if mem[0] > 5: mem[1] = 100 else mem[1] = 200"""
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        five = b.const_load(5, "five")
-        val100 = b.const_load(100, "val100")
-        val200 = b.const_load(200, "val200")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        five = b.const(5)
+        val100 = b.const(100)
+        val200 = b.const(200)
 
         # Load value from mem[0]
         val = b.load(addr0, "val")
@@ -201,11 +201,11 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test select operation: mem[1] = (mem[0] == 0) ? 42 : 99"""
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        zero = b.const_load(0, "zero")
-        val42 = b.const_load(42, "val42")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        zero = b.const(0)
+        val42 = b.const(42)
+        val99 = b.const(99)
 
         val = b.load(addr0, "val")
         cond = b.eq(val, zero, "cond")
@@ -231,15 +231,15 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test computing Fibonacci: fib(10) = 55"""
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        ten = b.const_load(10, "ten")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        one = b.const(1)
+        ten = b.const(10)
+        addr0 = b.const(0)
 
         # fib_prev = 0, fib_curr = 1
         # for i in 0..10: fib_prev, fib_curr = fib_curr, fib_prev + fib_curr
-        init_prev = b.const_load(0, "init_prev")
-        init_curr = b.const_load(1, "init_curr")
+        init_prev = b.const(0)
+        init_curr = b.const(1)
 
         def loop_body(i, params):
             fib_prev = params[0]
@@ -272,15 +272,15 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test bitwise operations: xor, and, or, shifts"""
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
-        addr3 = b.const_load(3, "addr3")
-        addr4 = b.const_load(4, "addr4")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
+        addr3 = b.const(3)
+        addr4 = b.const(4)
 
-        val_a = b.const_load(0b11110000, "val_a")  # 240
-        val_b = b.const_load(0b10101010, "val_b")  # 170
-        shift = b.const_load(2, "shift")
+        val_a = b.const(0b11110000)  # 240
+        val_b = b.const(0b10101010)  # 170
+        shift = b.const(2)
 
         # XOR
         xor_result = b.xor(val_a, val_b, "xor")
@@ -320,11 +320,11 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test modulo and division operations"""
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
-        val17 = b.const_load(17, "val17")
-        val5 = b.const_load(5, "val5")
+        val17 = b.const(17)
+        val5 = b.const(5)
 
         # 17 // 5 = 3
         div_result = b.div(val17, val5, "div")
@@ -349,9 +349,9 @@ class TestIRCompilerSimplePrograms(unittest.TestCase):
         """Test loop with bound computed from memory: for i in 0..mem[0]: mem[i+1] = i"""
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        one = b.const_load(1, "one")
-        zero = b.const_load(0, "zero")
+        addr0 = b.const(0)
+        one = b.const(1)
+        zero = b.const(0)
 
         # Load loop bound from memory
         bound = b.load(addr0, "bound")

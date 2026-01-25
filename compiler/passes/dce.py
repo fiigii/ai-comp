@@ -164,7 +164,9 @@ class DCEPass(Pass):
         for i, result in enumerate(loop.results):
             if result.id in live:
                 if i < len(loop.yields):
-                    body_live.add(loop.yields[i].id)
+                    yield_val = loop.yields[i]
+                    if isinstance(yield_val, SSAValue):
+                        body_live.add(yield_val.id)
 
         # Iteratively compute live set until fixed point
         # This is needed because body_params[i] = yields[i] on subsequent iterations
@@ -242,9 +244,13 @@ class DCEPass(Pass):
         for i, result in enumerate(if_stmt.results):
             if result.id in live:
                 if i < len(if_stmt.then_yields):
-                    then_live.add(if_stmt.then_yields[i].id)
+                    then_val = if_stmt.then_yields[i]
+                    if isinstance(then_val, SSAValue):
+                        then_live.add(then_val.id)
                 if i < len(if_stmt.else_yields):
-                    else_live.add(if_stmt.else_yields[i].id)
+                    else_val = if_stmt.else_yields[i]
+                    if isinstance(else_val, SSAValue):
+                        else_live.add(else_val.id)
 
         # Recursively mark live in branches
         self._mark_live_backward(if_stmt.then_body, then_live, then_live_vec, ctx)
@@ -260,7 +266,8 @@ class DCEPass(Pass):
 
         if if_is_live:
             # Mark condition as live
-            live.add(if_stmt.cond.id)
+            if isinstance(if_stmt.cond, SSAValue):
+                live.add(if_stmt.cond.id)
 
             # Propagate branch-live to outer live set
             # (No local definitions in if branches besides results)
@@ -361,12 +368,15 @@ class DCEPass(Pass):
         for i, result in enumerate(loop.results):
             if result.id in live:
                 if i < len(loop.yields):
-                    body_live.add(loop.yields[i].id)
+                    yield_val = loop.yields[i]
+                    if isinstance(yield_val, SSAValue):
+                        body_live.add(yield_val.id)
 
         # If body has side effects, all yields are potentially live
         if has_side_effects:
             for y in loop.yields:
-                body_live.add(y.id)
+                if isinstance(y, SSAValue):
+                    body_live.add(y.id)
 
         # Iteratively compute live set until fixed point
         while True:
@@ -426,17 +436,23 @@ class DCEPass(Pass):
         for i, result in enumerate(if_stmt.results):
             if result.id in live:
                 if i < len(if_stmt.then_yields):
-                    then_live.add(if_stmt.then_yields[i].id)
+                    then_val = if_stmt.then_yields[i]
+                    if isinstance(then_val, SSAValue):
+                        then_live.add(then_val.id)
                 if i < len(if_stmt.else_yields):
-                    else_live.add(if_stmt.else_yields[i].id)
+                    else_val = if_stmt.else_yields[i]
+                    if isinstance(else_val, SSAValue):
+                        else_live.add(else_val.id)
 
         # If branch has side effects, all its yields are potentially live
         if then_has_side_effects:
             for y in if_stmt.then_yields:
-                then_live.add(y.id)
+                if isinstance(y, SSAValue):
+                    then_live.add(y.id)
         if else_has_side_effects:
             for y in if_stmt.else_yields:
-                else_live.add(y.id)
+                if isinstance(y, SSAValue):
+                    else_live.add(y.id)
 
         # Propagate liveness backward through branches
         self._mark_live_backward(if_stmt.then_body, then_live, then_live_vec, ctx)

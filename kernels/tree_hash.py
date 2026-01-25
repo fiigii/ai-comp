@@ -46,7 +46,7 @@ def build_tree_hash_kernel(
 
     # Load header values from memory (addresses 0-6)
     def load_header(idx: int, name: str):
-        addr = b.const_load(idx, f"addr_{name}")
+        addr = b.const(idx)
         return b.load(addr, name)
 
     rounds_val = load_header(0, "rounds")
@@ -58,9 +58,9 @@ def build_tree_hash_kernel(
     inp_values_p = load_header(6, "inp_values_p")
 
     # Constants (as SSAValues for use in computations)
-    zero = b.const_load(0, "zero")
-    one = b.const_load(1, "one")
-    two = b.const_load(2, "two")
+    zero = b.const(0)
+    one = b.const(1)
+    two = b.const(2)
 
     # Compile-time constants for loop bounds (as Const for unrolling)
     rounds_const = Const(rounds)
@@ -70,8 +70,8 @@ def build_tree_hash_kernel(
     # Hash stage constants
     hash_consts = []
     for op1, val1, op2, op3, val3 in HASH_STAGES:
-        c1 = b.const_load(val1, f"hash_c1_{val1:x}")
-        c3 = b.const_load(val3, f"hash_c3_{val3}")
+        c1 = b.const(val1)
+        c3 = b.const(val3)
         hash_consts.append((c1, c3))
 
     # First pause (sync with reference_kernel2 first yield)

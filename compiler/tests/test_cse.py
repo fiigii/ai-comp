@@ -35,9 +35,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_redundant_add(self):
         """Test that two identical a + b expressions -> second eliminated."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         c = b.load(addr1, "c")
 
@@ -65,8 +65,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_redundant_mul(self):
         """Test that two identical a * b expressions -> second eliminated."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         a = b.load(addr0, "a")
         c = b.load(addr1, "c")
 
@@ -98,12 +98,12 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_const_dedup(self):
         """Test that two const(42) -> second eliminated."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Two identical constants
-        val42_1 = b.const_load(42, "val42_1")
-        val42_2 = b.const_load(42, "val42_2")
+        val42_1 = b.const(42)
+        val42_2 = b.const(42)
 
         b.store(addr0, val42_1)
         b.store(addr1, val42_2)
@@ -128,9 +128,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_different_operands_not_eliminated(self):
         """Test that a + b and a + c are both kept."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
         c = b.load(addr2, "c")
@@ -157,8 +157,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_different_opcodes_not_eliminated(self):
         """Test that a + b and a - b are both kept."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -184,9 +184,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_chain(self):
         """Test that a + b, then (a+b) + c reuses first result."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
         c = b.load(addr2, "c")
@@ -220,8 +220,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_load_same_address(self):
         """Test that two loads from same address (no store between) -> second eliminated."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # First load from addr0
         val1 = b.load(addr0, "val1")
@@ -254,9 +254,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_load_after_store_not_eliminated(self):
         """Test that load, store, load -> second load NOT eliminated."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        val99 = b.const(99)
 
         # First load from addr0
         val1 = b.load(addr0, "val1")
@@ -292,10 +292,10 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_load_different_address_after_store(self):
         """Test that store to X, load from Y -> load NOT eliminated (conservative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
+        val99 = b.const(99)
 
         # First load from addr1
         val1 = b.load(addr1, "val1")
@@ -325,9 +325,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_store_not_eliminated(self):
         """Test that store operations are always kept."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        val1 = b.const_load(100, "val1")
-        val2 = b.const_load(200, "val2")
+        addr0 = b.const(0)
+        val1 = b.const(100)
+        val2 = b.const(200)
 
         # Two stores to same address
         b.store(addr0, val1)
@@ -353,8 +353,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_in_loop_body(self):
         """Test that CSE works within a loop iteration."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        init_sum = b.const_load(0, "init_sum")
+        addr0 = b.const(0)
+        init_sum = b.const(0)
 
         def loop_body(i, params):
             s = params[0]
@@ -386,8 +386,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_across_loop_iterations_not_shared(self):
         """Test that loop body params have unique VNs per iteration."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        init_val = b.const_load(1, "init_val")
+        addr0 = b.const(0)
+        init_val = b.const(1)
 
         def loop_body(i, params):
             # params[0] changes each iteration
@@ -416,18 +416,18 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_in_if_then_branch(self):
         """Test that CSE works within then-branch."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        cond_true = b.const_load(1, "cond_true")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        cond_true = b.const(1)
 
         def then_fn():
             # Two identical additions
-            val1 = b.const_load(5, "val1")
-            val2 = b.const_load(5, "val2")  # Should be eliminated
+            val1 = b.const(5)
+            val2 = b.const(5)  # Should be eliminated
             return [b.add(val1, val2, "sum")]
 
         def else_fn():
-            return [b.const_load(0, "zero")]
+            return [b.const(0)]
 
         results = b.if_stmt(cond_true, then_fn, else_fn)
         b.store(addr1, results[0])
@@ -450,17 +450,17 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_in_if_else_branch(self):
         """Test that CSE works within else-branch."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        cond_false = b.const_load(0, "cond_false")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        cond_false = b.const(0)
 
         def then_fn():
-            return [b.const_load(0, "zero")]
+            return [b.const(0)]
 
         def else_fn():
             # Two identical additions
-            val1 = b.const_load(7, "val1")
-            val2 = b.const_load(7, "val2")  # Should be eliminated
+            val1 = b.const(7)
+            val2 = b.const(7)  # Should be eliminated
             return [b.add(val1, val2, "sum")]
 
         results = b.if_stmt(cond_false, then_fn, else_fn)
@@ -484,17 +484,17 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_across_if_branches_not_allowed(self):
         """Test that then-branch expr NOT reused in else-branch."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         cond = b.load(addr0, "cond")
 
         def then_fn():
-            val = b.const_load(42, "val42_then")
+            val = b.const(42)
             return [val]
 
         def else_fn():
             # Same constant as then branch, but should not be shared
-            val = b.const_load(42, "val42_else")
+            val = b.const(42)
             return [val]
 
         results = b.if_stmt(cond, then_fn, else_fn)
@@ -522,23 +522,23 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_before_if_reused_in_branches(self):
         """Test that expr before if CAN be reused in both branches."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Compute before if
-        pre_val = b.const_load(100, "pre_val")
+        pre_val = b.const(100)
 
         cond = b.load(addr0, "cond")
 
         def then_fn():
             # Use same constant as pre_val
-            val = b.const_load(100, "val100_then")  # Should be eliminated
-            return [b.add(val, b.const_load(1, "one_then"), "then_result")]
+            val = b.const(100)  # Should be eliminated
+            return [b.add(val, b.const(1), "then_result")]
 
         def else_fn():
             # Use same constant as pre_val
-            val = b.const_load(100, "val100_else")  # Should be eliminated
-            return [b.add(val, b.const_load(2, "two_else"), "else_result")]
+            val = b.const(100)  # Should be eliminated
+            return [b.add(val, b.const(2), "else_result")]
 
         results = b.if_stmt(cond, then_fn, else_fn)
         b.store(addr1, results[0])
@@ -566,9 +566,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_store_in_branch_clobbers_parent(self):
         """Test that store in branch invalidates loads after if."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        val99 = b.const(99)
 
         # Load before if
         val_before = b.load(addr0, "val_before")
@@ -581,7 +581,7 @@ class TestCSEPass(unittest.TestCase):
             return [val99]
 
         def else_fn():
-            return [b.const_load(0, "zero")]
+            return [b.const(0)]
 
         b.if_stmt(cond, then_fn, else_fn)
 
@@ -614,9 +614,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_preserves_semantics_simple(self):
         """Test that CSE preserves program semantics for simple programs."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -652,8 +652,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_preserves_semantics_with_loops(self):
         """Test that CSE preserves semantics for programs with loops."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        init_sum = b.const_load(0, "init_sum")
+        addr0 = b.const(0)
+        init_sum = b.const(0)
 
         def loop_body(i, params):
             s = params[0]
@@ -693,16 +693,16 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_preserves_semantics_with_memory(self):
         """Test that CSE preserves semantics with memory operations."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
 
         # Load, compute, store, load again
         val1 = b.load(addr0, "val1")
         doubled = b.add(val1, val1, "doubled")
         b.store(addr1, doubled)
         val2 = b.load(addr1, "val2")
-        result = b.add(val2, b.const_load(1, "one"), "result")
+        result = b.add(val2, b.const(1), "result")
         b.store(addr2, result)
 
         hir = b.build()
@@ -730,14 +730,16 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_after_unroll(self):
         """Test that CSE finds opportunities in unrolled code."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        init_sum = b.const_load(0, "init_sum")
+        addr0 = b.const(0)
+        init_sum = b.const(0)
 
         def loop_body(i, params):
             s = params[0]
-            # When unrolled, multiple iterations will have const(1) loads
-            one = b.const_load(1, "one")
-            new_s = b.add(s, one, "new_s")
+            # When unrolled, multiple iterations will have the same const expression
+            one = b.const(1)
+            two = b.const(2)
+            t = b.add(one, two, "t")
+            new_s = b.add(s, t, "new_s")
             return [new_s]
 
         results = b.for_loop(start=Const(0), end=Const(4), iter_args=[init_sum], body_fn=loop_body)
@@ -770,21 +772,21 @@ class TestCSEPass(unittest.TestCase):
         mem_cse = [0] * 100
         machine_cse = self._run_program(instrs_cse, mem_cse)
 
-        # Both should give 4 (0 + 1 + 1 + 1 + 1)
-        self.assertEqual(machine_unroll.mem[0], 4)
-        self.assertEqual(machine_cse.mem[0], 4)
+        # Both should give 12 (0 + 3 + 3 + 3 + 3)
+        self.assertEqual(machine_unroll.mem[0], 12)
+        self.assertEqual(machine_cse.mem[0], 12)
 
         print("CSE after unroll test passed!")
 
     def test_cse_metrics_reported(self):
         """Test that CSE pass reports correct metrics."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Create redundant expressions
-        val42_1 = b.const_load(42, "val42_1")
-        val42_2 = b.const_load(42, "val42_2")
+        val42_1 = b.const(42)
+        val42_2 = b.const(42)
         a = b.load(addr0, "a")
         c = b.load(addr1, "c")
         sum1 = b.add(a, c, "sum1")
@@ -804,7 +806,6 @@ class TestCSEPass(unittest.TestCase):
         self.assertIsNotNone(metrics)
         self.assertIn("expressions_eliminated", metrics.custom)
         self.assertGreater(metrics.custom["expressions_eliminated"], 0)
-        self.assertIn("consts_eliminated", metrics.custom)
 
         print(f"CSE metrics: {metrics.custom}")
         print("CSE metrics reported test passed!")
@@ -812,12 +813,14 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_config_enabled_disabled(self):
         """Test that CSE pass can be disabled via config."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        val1 = b.const_load(42, "val1")
-        val2 = b.const_load(42, "val2")  # Would be eliminated if CSE enabled
+        addr0 = b.const(0)
+        one = b.const(1)
+        a = b.load(addr0, "a")
+        sum1 = b.add(a, one, "sum1")
+        sum2 = b.add(a, one, "sum2")  # Would be eliminated if CSE enabled
 
-        b.store(addr0, val1)
-        b.store(addr0, val2)
+        b.store(addr0, sum1)
+        b.store(addr0, sum2)
 
         hir = b.build()
 
@@ -844,9 +847,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_commutative_add(self):
         """Test that a + b and b + a are merged (commutative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -872,8 +875,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_commutative_mul(self):
         """Test that a * b and b * a are merged (commutative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -906,8 +909,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_commutative_xor(self):
         """Test that a ^ b and b ^ a are merged (commutative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -933,9 +936,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_non_commutative_sub_not_merged(self):
         """Test that a - b and b - a are NOT merged (non-commutative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -965,8 +968,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_non_commutative_div_not_merged(self):
         """Test that a // b and b // a are NOT merged (non-commutative)."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         a = b.load(addr0, "a")
         val_b = b.load(addr1, "b")
 
@@ -998,8 +1001,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_multiple_loads_same_epoch(self):
         """Test that multiple loads with same address in same epoch are CSE'd."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Multiple loads from same address, no store between
         val1 = b.load(addr0, "val1")
@@ -1023,9 +1026,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_loads_different_epochs_not_merged(self):
         """Test that loads with different epochs are NOT merged."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        val99 = b.const(99)
 
         # Load, store, load - different epochs
         val1 = b.load(addr0, "val1")
@@ -1051,8 +1054,8 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_epoch_propagates_from_loop(self):
         """Test that store in loop increments parent epoch."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Load before loop
         val_before = b.load(addr0, "val_before")
@@ -1085,9 +1088,9 @@ class TestCSEPass(unittest.TestCase):
     def test_cse_epoch_propagates_from_if(self):
         """Test that store in branch increments parent epoch."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        val99 = b.const_load(99, "val99")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        val99 = b.const(99)
 
         # Load before if
         val_before = b.load(addr0, "val_before")

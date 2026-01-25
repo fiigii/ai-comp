@@ -35,25 +35,25 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         val = b.load(addr0, "val")
 
         # Compare with 5
-        five = b.const_load(5, "five")
+        five = b.const(5)
         cond = b.lt(five, val, "cond")
 
         # Both branches use a constant that's different from anything used before
         # Use 42 which is only used inside the if/else branches
         def then_fn():
             # Use 42 in then branch
-            result = b.const_load(42, "const42_then")
+            result = b.const(42)
             return [result]
 
         def else_fn():
             # Use 42 in else branch too (should reuse same scratch)
-            result = b.const_load(42, "const42_else")
+            result = b.const(42)
             return [result]
 
         results = b.if_stmt(cond, then_fn, else_fn)
@@ -84,14 +84,14 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Initial values: a=100, b=200
-        init_a = b.const_load(100, "init_a")
-        init_b = b.const_load(200, "init_b")
+        init_a = b.const(100)
+        init_b = b.const(200)
 
         def loop_body(i, params):
             a = params[0]
@@ -128,13 +128,13 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        three = b.const_load(3, "three")
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        zero = b.const(0)
+        three = b.const(3)
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
-        init_a = b.const_load(1, "init_a")
-        init_b = b.const_load(2, "init_b")
+        init_a = b.const(1)
+        init_b = b.const(2)
 
         def loop_body(i, params):
             a = params[0]
@@ -170,15 +170,15 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        addr2 = b.const_load(2, "addr2")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        addr2 = b.const(2)
 
-        init_a = b.const_load(1, "init_a")
-        init_b = b.const_load(2, "init_b")
-        init_c = b.const_load(3, "init_c")
+        init_a = b.const(1)
+        init_b = b.const(2)
+        init_c = b.const(3)
 
         def loop_body(i, params):
             a = params[0]
@@ -222,12 +222,12 @@ class TestCompilerRegressions(unittest.TestCase):
         b = HIRBuilder()
 
         # Use only non-zero constants
-        addr5 = b.const_load(5, "addr5")
-        addr6 = b.const_load(6, "addr6")
-        val100 = b.const_load(100, "val100")
-        val200 = b.const_load(200, "val200")
-        one = b.const_load(1, "one")
-        two = b.const_load(2, "two")
+        addr5 = b.const(5)
+        addr6 = b.const(6)
+        val100 = b.const(100)
+        val200 = b.const(200)
+        one = b.const(1)
+        two = b.const(2)
 
         # Use a loop to force phi elimination (COPY needs zero)
         def loop_body(i, params):
@@ -268,23 +268,23 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
-        zero = b.const_load(0, "zero")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        zero = b.const(0)
 
         # Load loop bound from memory (could be 0)
         bound = b.load(addr0, "bound")
 
         def loop_body(i, params):
             # Use const 99 inside loop
-            val99 = b.const_load(99, "val99")
+            val99 = b.const(99)
             b.store(addr1, val99)
             return []
 
         b.for_loop(start=zero, end=bound, iter_args=[], body_fn=loop_body)
 
         # Use const 77 after the loop (should work even if loop never ran)
-        val77 = b.const_load(77, "val77")
+        val77 = b.const(77)
         b.store(addr1, val77)
 
         hir = b.build()
@@ -309,12 +309,12 @@ class TestCompilerRegressions(unittest.TestCase):
         b = HIRBuilder()
 
         # Use only non-zero constants, including a large one
-        addr5 = b.const_load(5, "addr5")
-        addr6 = b.const_load(6, "addr6")
-        large_const = b.const_load(100000, "large_const")  # Large immediate value
-        val42 = b.const_load(42, "val42")
-        one = b.const_load(1, "one")
-        two = b.const_load(2, "two")
+        addr5 = b.const(5)
+        addr6 = b.const(6)
+        large_const = b.const(100000)  # Large immediate value
+        val42 = b.const(42)
+        one = b.const(1)
+        two = b.const(2)
 
         # Use a loop to trigger phi elimination (COPY needs zero)
         def loop_body(i, params):
@@ -356,13 +356,13 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
 
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
+        addr1 = b.const(1)
 
         # Create many intermediate values to use more scratch slots
-        vals = [b.const_load(i * 10, f"val{i}") for i in range(10)]
+        vals = [b.const(i * 10) for i in range(10)]
 
         # Use all the values to prevent dead code elimination
         acc = vals[0]
@@ -370,8 +370,8 @@ class TestCompilerRegressions(unittest.TestCase):
             acc = b.add(acc, v)
 
         # Swap operation (phi cycle) - this needs temp scratch
-        init_a = b.const_load(100, "init_a")
-        init_b = b.const_load(200, "init_b")
+        init_a = b.const(100)
+        init_b = b.const(200)
 
         def loop_body(i, params):
             a = params[0]
@@ -412,11 +412,11 @@ class TestCompilerRegressions(unittest.TestCase):
         """
         b = HIRBuilder()
         # 0xFFFFFFFF + 1 should wrap to 0, then >> 1 = 0
-        max_val = b.const_load(0xFFFFFFFF, "max")
-        one = b.const_load(1, "one")
+        max_val = b.const(0xFFFFFFFF)
+        one = b.const(1)
         added = b.add(max_val, one, "added")  # Should fold to 0
         shifted = b.shr(added, one, "shifted")  # 0 >> 1 = 0
-        addr = b.const_load(0, "addr")
+        addr = b.const(0)
         b.store(addr, shifted)
 
         hir = b.build()
@@ -440,10 +440,10 @@ class TestCompilerRegressions(unittest.TestCase):
         from compiler.hir import Const
 
         b = HIRBuilder()
-        addr = b.const_load(0, "addr")
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        two = b.const_load(2, "two")
+        addr = b.const(0)
+        zero = b.const(0)
+        one = b.const(1)
+        two = b.const(2)
 
         # store 0 to addr
         b.store(addr, zero)

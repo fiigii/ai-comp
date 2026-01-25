@@ -196,7 +196,7 @@ def _lower_op(op: Op, ctx: LoweringContext):
         "//": LIROpcode.DIV, "%": LIROpcode.MOD, "^": LIROpcode.XOR,
         "&": LIROpcode.AND, "|": LIROpcode.OR, "<<": LIROpcode.SHL,
         ">>": LIROpcode.SHR, "<": LIROpcode.LT, "==": LIROpcode.EQ,
-        "load": LIROpcode.LOAD, "const": LIROpcode.CONST,
+        "load": LIROpcode.LOAD,
         "store": LIROpcode.STORE, "select": LIROpcode.SELECT,
     }
 
@@ -210,10 +210,7 @@ def _lower_op(op: Op, ctx: LoweringContext):
         dest = ctx.get_scratch(op.result)
 
     # Get operand scratch addresses
-    if op.opcode == "const":
-        # Const has immediate value as operand
-        operands = [op.operands[0].value]
-    elif op.opcode == "store":
+    if op.opcode == "store":
         # Store: (addr, value)
         operands = [ctx.get_operand(op.operands[0]), ctx.get_operand(op.operands[1])]
     else:
@@ -345,7 +342,7 @@ def _lower_vinsert(op: Op, ctx: LoweringContext):
     src_base = ctx.get_vector_scratch(vec)
 
     # Get scalar value
-    scalar_scratch = ctx.get_scratch(scalar)
+    scalar_scratch = ctx.get_operand(scalar)
 
     # Get destination vector base
     dest_base = ctx.get_vector_scratch(op.result)
@@ -388,7 +385,7 @@ def _lower_for_loop(loop: ForLoop, ctx: LoweringContext):
     # Allocate iter_arg scratches (copy initial values)
     iter_arg_scratches = []
     for i, arg in enumerate(loop.iter_args):
-        src = ctx.get_scratch(arg)
+        src = ctx.get_operand(arg)
         dst = ctx.alloc_scratch()
         ctx.emit(LIRInst(LIROpcode.ADD, dst, [src, zero_scratch], "alu"))
         iter_arg_scratches.append(dst)
@@ -421,7 +418,7 @@ def _lower_for_loop(loop: ForLoop, ctx: LoweringContext):
         _lower_statement(stmt, ctx)
 
     # Get yield scratches
-    yield_scratches = [ctx.get_scratch(y) for y in loop.yields]
+    yield_scratches = [ctx.get_operand(y) for y in loop.yields]
 
     # Increment counter
     one_scratch = ctx.get_const(1)
@@ -453,14 +450,14 @@ def _lower_if(if_stmt: If, ctx: LoweringContext):
     merge_block = ctx.new_block("if_merge")
 
     # Branch
-    cond_scratch = ctx.get_scratch(if_stmt.cond)
+    cond_scratch = ctx.get_operand(if_stmt.cond)
     ctx.set_terminator(LIRInst(LIROpcode.COND_JUMP, None, [cond_scratch, then_block.name, else_block.name], "flow"))
 
     # === Then block ===
     ctx.set_block(then_block)
     for stmt in if_stmt.then_body:
         _lower_statement(stmt, ctx)
-    then_yield_scratches = [ctx.get_scratch(y) for y in if_stmt.then_yields]
+    then_yield_scratches = [ctx.get_operand(y) for y in if_stmt.then_yields]
     then_exit_block = ctx.current_block
     ctx.set_terminator(LIRInst(LIROpcode.JUMP, None, [merge_block.name], "flow"))
 
@@ -468,7 +465,7 @@ def _lower_if(if_stmt: If, ctx: LoweringContext):
     ctx.set_block(else_block)
     for stmt in if_stmt.else_body:
         _lower_statement(stmt, ctx)
-    else_yield_scratches = [ctx.get_scratch(y) for y in if_stmt.else_yields]
+    else_yield_scratches = [ctx.get_operand(y) for y in if_stmt.else_yields]
     else_exit_block = ctx.current_block
     ctx.set_terminator(LIRInst(LIROpcode.JUMP, None, [merge_block.name], "flow"))
 

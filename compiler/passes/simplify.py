@@ -50,8 +50,6 @@ class SimplifyPass(Pass):
         self._strength_reductions = 0
         self._select_optimizations = 0
         self._parity_patterns = 0
-        # Maps SSA id -> known constant value
-        self._known_constants: dict[int, int] = {}
         # SSA ids known to be boolean (0 or 1) - from comparisons or & 1
         self._boolean_values: set[int] = set()
         # Maps SSA id -> the SSA id it's negated from (for ==(x, 0) where x is boolean)
@@ -74,7 +72,6 @@ class SimplifyPass(Pass):
         self._strength_reductions = 0
         self._select_optimizations = 0
         self._parity_patterns = 0
-        self._known_constants = {}
         self._boolean_values = set()
         self._negated_boolean = {}
 
@@ -120,7 +117,8 @@ class SimplifyPass(Pass):
         for stmt in stmts:
             if isinstance(stmt, Op):
                 transformed = self._transform_op(stmt)
-                result.append(transformed)
+                if transformed is not None:
+                    result.append(transformed)
             elif isinstance(stmt, ForLoop):
                 result.append(self._transform_for_loop(stmt))
             elif isinstance(stmt, If):
@@ -133,16 +131,6 @@ class SimplifyPass(Pass):
 
     def _transform_op(self, op: Op) -> Op:
         """Apply simplifications to a single Op."""
-        # Track const ops for future constant folding
-        if op.opcode == "const" and op.result is not None and len(op.operands) == 1:
-            const_operand = op.operands[0]
-            if isinstance(const_operand, Const):
-                self._known_constants[op.result.id] = const_operand.value
-                # Constants 0 and 1 are boolean
-                if const_operand.value in (0, 1):
-                    self._boolean_values.add(op.result.id)
-            return op
-
         # Handle select (3 operands)
         if op.opcode == "select" and op.result is not None and len(op.operands) == 3:
             simplified = self._try_simplify_select(op)
@@ -162,19 +150,19 @@ class SimplifyPass(Pass):
             folded = self._try_constant_fold(op.opcode, left, right)
             if folded is not None:
                 self._constants_folded += 1
-                # Track the result as a known constant
-                self._known_constants[op.result.id] = folded
-                # Create a const op instead
-                return Op("const", op.result, [Const(folded)], "load")
+                self._use_def_ctx.replace_all_uses(op.result, Const(folded))
+                return None
 
         # Try algebraic identity simplifications (returns op, metric_type)
         simplified, metric_type = self._try_simplify_identity(op.opcode, left, right, op.result)
-        if simplified is not None:
+        if metric_type is not None:
             # Increment appropriate counter
             if metric_type == "identity":
                 self._identities_simplified += 1
             elif metric_type == "strength":
                 self._strength_reductions += 1
+            if simplified is None:
+                return None
             # Track boolean status if the simplified op produces a boolean
             if simplified.opcode in ("<", "=="):
                 self._boolean_values.add(op.result.id)
@@ -207,8 +195,6 @@ class SimplifyPass(Pass):
         """Get constant value if operand is a known constant."""
         if isinstance(operand, Const):
             return operand.value
-        if isinstance(operand, SSAValue) and operand.id in self._known_constants:
-            return self._known_constants[operand.id]
         return None
 
     def _is_boolean(self, operand: Operand) -> bool:
@@ -260,54 +246,56 @@ class SimplifyPass(Pass):
             if opcode == "+":
                 if right_is_const and right_val == 0:
                     self._use_def_ctx.replace_all_uses(result, left)
-                    # Return a no-op const that will get DCE'd, we replaced all uses
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
                 if left_is_const and left_val == 0:
                     self._use_def_ctx.replace_all_uses(result, right)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
 
             # x - 0 -> x
             if opcode == "-":
                 if right_is_const and right_val == 0:
                     self._use_def_ctx.replace_all_uses(result, left)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
 
             # x * 1 -> x, 1 * x -> x
             if opcode == "*":
                 if right_is_const and right_val == 1:
                     self._use_def_ctx.replace_all_uses(result, left)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
                 if left_is_const and left_val == 1:
                     self._use_def_ctx.replace_all_uses(result, right)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
                 # x * 0 -> 0, 0 * x -> 0
                 if right_is_const and right_val == 0:
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    return None, "identity"
                 if left_is_const and left_val == 0:
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    return None, "identity"
 
             # x ^ 0 -> x, 0 ^ x -> x
             if opcode == "^":
                 if right_is_const and right_val == 0:
                     self._use_def_ctx.replace_all_uses(result, left)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
                 if left_is_const and left_val == 0:
                     self._use_def_ctx.replace_all_uses(result, right)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
 
             # x & 0 -> 0, 0 & x -> 0
             if opcode == "&":
                 if (right_is_const and right_val == 0) or (left_is_const and left_val == 0):
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    return None, "identity"
 
             # x | 0 -> x, 0 | x -> x
             if opcode == "|":
                 if right_is_const and right_val == 0:
                     self._use_def_ctx.replace_all_uses(result, left)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
                 if left_is_const and left_val == 0:
                     self._use_def_ctx.replace_all_uses(result, right)
-                    return Op("const", result, [Const(0)], "load"), "identity"
+                    return None, "identity"
 
         # Strength reductions (only if enabled)
         if self._opts.get("strength_reduction", True):
