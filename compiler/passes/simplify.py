@@ -11,6 +11,7 @@ from ..hir import (
 )
 from ..pass_manager import Pass, PassConfig
 from ..ssa_context import SSARenumberContext
+from ..use_def import UseDefContext
 
 
 # Operations that can be constant-folded (all binary arithmetic)
@@ -59,6 +60,8 @@ class SimplifyPass(Pass):
         self._negated_boolean: dict[int, int] = {}
         # Feature options (set in run())
         self._opts: dict[str, bool] = {}
+        # Use-def context for efficient replacements
+        self._use_def_ctx: Optional[UseDefContext] = None
 
     @property
     def name(self) -> str:
@@ -92,6 +95,9 @@ class SimplifyPass(Pass):
         # Create SSA context for renumbering (in case we need new SSAs)
         ssa_ctx = SSARenumberContext(hir.num_ssa_values)
 
+        # Create use-def context for efficient value replacement
+        self._use_def_ctx = UseDefContext(hir)
+
         # Transform body
         new_body = self._transform_statements(hir.body, ssa_ctx)
 
@@ -120,9 +126,6 @@ class SimplifyPass(Pass):
         result = []
 
         for stmt in stmts:
-            # Apply any SSA bindings from simplified expressions
-            stmt = self._apply_bindings(stmt, ssa_ctx.result_bindings)
-
             if isinstance(stmt, Op):
                 transformed = self._transform_op(stmt, ssa_ctx)
                 result.append(transformed)
@@ -265,26 +268,26 @@ class SimplifyPass(Pass):
             # x + 0 -> x, 0 + x -> x
             if opcode == "+":
                 if right_is_const and right_val == 0:
-                    ssa_ctx.bind_result(result.id, left)
-                    # Return a no-op const that will get DCE'd, we bound the result
+                    self._use_def_ctx.replace_all_uses(result, left)
+                    # Return a no-op const that will get DCE'd, we replaced all uses
                     return Op("const", result, [Const(0)], "load"), "identity"
                 if left_is_const and left_val == 0:
-                    ssa_ctx.bind_result(result.id, right)
+                    self._use_def_ctx.replace_all_uses(result, right)
                     return Op("const", result, [Const(0)], "load"), "identity"
 
             # x - 0 -> x
             if opcode == "-":
                 if right_is_const and right_val == 0:
-                    ssa_ctx.bind_result(result.id, left)
+                    self._use_def_ctx.replace_all_uses(result, left)
                     return Op("const", result, [Const(0)], "load"), "identity"
 
             # x * 1 -> x, 1 * x -> x
             if opcode == "*":
                 if right_is_const and right_val == 1:
-                    ssa_ctx.bind_result(result.id, left)
+                    self._use_def_ctx.replace_all_uses(result, left)
                     return Op("const", result, [Const(0)], "load"), "identity"
                 if left_is_const and left_val == 1:
-                    ssa_ctx.bind_result(result.id, right)
+                    self._use_def_ctx.replace_all_uses(result, right)
                     return Op("const", result, [Const(0)], "load"), "identity"
                 # x * 0 -> 0, 0 * x -> 0
                 if right_is_const and right_val == 0:
@@ -295,10 +298,10 @@ class SimplifyPass(Pass):
             # x ^ 0 -> x, 0 ^ x -> x
             if opcode == "^":
                 if right_is_const and right_val == 0:
-                    ssa_ctx.bind_result(result.id, left)
+                    self._use_def_ctx.replace_all_uses(result, left)
                     return Op("const", result, [Const(0)], "load"), "identity"
                 if left_is_const and left_val == 0:
-                    ssa_ctx.bind_result(result.id, right)
+                    self._use_def_ctx.replace_all_uses(result, right)
                     return Op("const", result, [Const(0)], "load"), "identity"
 
             # x & 0 -> 0, 0 & x -> 0
@@ -309,10 +312,10 @@ class SimplifyPass(Pass):
             # x | 0 -> x, 0 | x -> x
             if opcode == "|":
                 if right_is_const and right_val == 0:
-                    ssa_ctx.bind_result(result.id, left)
+                    self._use_def_ctx.replace_all_uses(result, left)
                     return Op("const", result, [Const(0)], "load"), "identity"
                 if left_is_const and left_val == 0:
-                    ssa_ctx.bind_result(result.id, right)
+                    self._use_def_ctx.replace_all_uses(result, right)
                     return Op("const", result, [Const(0)], "load"), "identity"
 
         # Strength reductions (only if enabled)
@@ -368,12 +371,6 @@ class SimplifyPass(Pass):
         """Transform a ForLoop."""
         new_body = self._transform_statements(loop.body, ssa_ctx)
 
-        # Resolve yields through bindings
-        new_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in loop.yields
-        ]
-
         return ForLoop(
             counter=loop.counter,
             start=loop.start,
@@ -381,7 +378,7 @@ class SimplifyPass(Pass):
             iter_args=loop.iter_args,
             body_params=loop.body_params,
             body=new_body,
-            yields=new_yields,
+            yields=loop.yields,
             results=loop.results,
             pragma_unroll=loop.pragma_unroll
         )
@@ -391,107 +388,11 @@ class SimplifyPass(Pass):
         new_then_body = self._transform_statements(if_stmt.then_body, ssa_ctx)
         new_else_body = self._transform_statements(if_stmt.else_body, ssa_ctx)
 
-        # Resolve yields through bindings
-        new_then_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in if_stmt.then_yields
-        ]
-        new_else_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in if_stmt.else_yields
-        ]
-
         return If(
             cond=if_stmt.cond,
             then_body=new_then_body,
-            then_yields=new_then_yields,
+            then_yields=if_stmt.then_yields,
             else_body=new_else_body,
-            else_yields=new_else_yields,
+            else_yields=if_stmt.else_yields,
             results=if_stmt.results
         )
-
-    def _resolve_binding(
-        self,
-        value: SSAValue,
-        bindings: dict[int, SSAValue]
-    ) -> SSAValue:
-        """Resolve SSA bindings transitively."""
-        while value.id in bindings:
-            value = bindings[value.id]
-        return value
-
-    def _apply_bindings(
-        self,
-        stmt: Statement,
-        bindings: dict[int, SSAValue]
-    ) -> Statement:
-        """Apply SSA value bindings to a statement's operands."""
-        if not bindings:
-            return stmt
-
-        if isinstance(stmt, Op):
-            new_operands = []
-            for op in stmt.operands:
-                if isinstance(op, SSAValue) and op.id in bindings:
-                    new_operands.append(self._resolve_binding(op, bindings))
-                else:
-                    new_operands.append(op)
-            return Op(stmt.opcode, stmt.result, new_operands, stmt.engine)
-
-        elif isinstance(stmt, ForLoop):
-            new_iter_args = []
-            for arg in stmt.iter_args:
-                if arg.id in bindings:
-                    new_iter_args.append(self._resolve_binding(arg, bindings))
-                else:
-                    new_iter_args.append(arg)
-
-            new_start = stmt.start
-            if isinstance(stmt.start, SSAValue) and stmt.start.id in bindings:
-                new_start = self._resolve_binding(stmt.start, bindings)
-
-            new_end = stmt.end
-            if isinstance(stmt.end, SSAValue) and stmt.end.id in bindings:
-                new_end = self._resolve_binding(stmt.end, bindings)
-
-            new_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.yields
-            ]
-
-            return ForLoop(
-                counter=stmt.counter,
-                start=new_start,
-                end=new_end,
-                iter_args=new_iter_args,
-                body_params=stmt.body_params,
-                body=stmt.body,
-                yields=new_yields,
-                results=stmt.results,
-                pragma_unroll=stmt.pragma_unroll
-            )
-
-        elif isinstance(stmt, If):
-            new_cond = stmt.cond
-            if stmt.cond.id in bindings:
-                new_cond = self._resolve_binding(stmt.cond, bindings)
-
-            new_then_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.then_yields
-            ]
-            new_else_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.else_yields
-            ]
-
-            return If(
-                cond=new_cond,
-                then_body=stmt.then_body,
-                then_yields=new_then_yields,
-                else_body=stmt.else_body,
-                else_yields=new_else_yields,
-                results=stmt.results
-            )
-
-        return stmt

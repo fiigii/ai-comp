@@ -54,6 +54,9 @@ from .pass_manager import (
 # SSA utilities
 from .ssa_context import SSARenumberContext
 
+# Use-def chain infrastructure
+from .use_def import UseDefContext, DefLocation, UseLocation
+
 # Compilation stages
 from .lowering import lower_to_lir
 from .phi_elimination import eliminate_phis
@@ -82,6 +85,8 @@ __all__ = [
     'count_statements', 'count_lir_instructions', 'count_lir_phis',
     # SSA utilities
     'SSARenumberContext',
+    # Use-def chain infrastructure
+    'UseDefContext', 'DefLocation', 'UseLocation',
     # Compilation
     'lower_to_lir', 'eliminate_phis', 'compile_to_vliw', 'compile_hir_to_vliw',
     # Printing
