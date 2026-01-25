@@ -10,7 +10,6 @@ from ..hir import (
     SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
-from ..ssa_context import SSARenumberContext
 from ..use_def import UseDefContext
 
 
@@ -92,14 +91,11 @@ class SimplifyPass(Pass):
         if not config.enabled:
             return hir
 
-        # Create SSA context for renumbering (in case we need new SSAs)
-        ssa_ctx = SSARenumberContext(hir.num_ssa_values)
-
         # Create use-def context for efficient value replacement
         self._use_def_ctx = UseDefContext(hir)
 
         # Transform body
-        new_body = self._transform_statements(hir.body, ssa_ctx)
+        new_body = self._transform_statements(hir.body)
 
         # Record custom metrics
         if self._metrics:
@@ -114,32 +110,28 @@ class SimplifyPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=ssa_ctx.next_id
+            num_ssa_values=hir.num_ssa_values
         )
 
-    def _transform_statements(
-        self,
-        stmts: list[Statement],
-        ssa_ctx: SSARenumberContext
-    ) -> list[Statement]:
+    def _transform_statements(self, stmts: list[Statement]) -> list[Statement]:
         """Transform a list of statements."""
         result = []
 
         for stmt in stmts:
             if isinstance(stmt, Op):
-                transformed = self._transform_op(stmt, ssa_ctx)
+                transformed = self._transform_op(stmt)
                 result.append(transformed)
             elif isinstance(stmt, ForLoop):
-                result.append(self._transform_for_loop(stmt, ssa_ctx))
+                result.append(self._transform_for_loop(stmt))
             elif isinstance(stmt, If):
-                result.append(self._transform_if(stmt, ssa_ctx))
+                result.append(self._transform_if(stmt))
             else:
                 # Halt, Pause - keep as is
                 result.append(stmt)
 
         return result
 
-    def _transform_op(self, op: Op, ssa_ctx: SSARenumberContext) -> Op:
+    def _transform_op(self, op: Op) -> Op:
         """Apply simplifications to a single Op."""
         # Track const ops for future constant folding
         if op.opcode == "const" and op.result is not None and len(op.operands) == 1:
@@ -153,7 +145,7 @@ class SimplifyPass(Pass):
 
         # Handle select (3 operands)
         if op.opcode == "select" and op.result is not None and len(op.operands) == 3:
-            simplified = self._try_simplify_select(op, ssa_ctx)
+            simplified = self._try_simplify_select(op)
             if simplified is not None:
                 # Counter incremented inside _try_simplify_select
                 return simplified
@@ -176,7 +168,7 @@ class SimplifyPass(Pass):
                 return Op("const", op.result, [Const(folded)], "load")
 
         # Try algebraic identity simplifications (returns op, metric_type)
-        simplified, metric_type = self._try_simplify_identity(op.opcode, left, right, op.result, ssa_ctx)
+        simplified, metric_type = self._try_simplify_identity(op.opcode, left, right, op.result)
         if simplified is not None:
             # Increment appropriate counter
             if metric_type == "identity":
@@ -250,8 +242,7 @@ class SimplifyPass(Pass):
         opcode: str,
         left: Operand,
         right: Operand,
-        result: SSAValue,
-        ssa_ctx: SSARenumberContext
+        result: SSAValue
     ) -> tuple[Optional[Op], Optional[str]]:
         """Try to simplify using algebraic identities.
 
@@ -336,7 +327,7 @@ class SimplifyPass(Pass):
 
         return None, None
 
-    def _try_simplify_select(self, op: Op, ssa_ctx: SSARenumberContext) -> Optional[Op]:
+    def _try_simplify_select(self, op: Op) -> Optional[Op]:
         """Try to simplify select operations."""
         cond, true_val, false_val = op.operands
         result = op.result
@@ -367,9 +358,9 @@ class SimplifyPass(Pass):
 
         return None
 
-    def _transform_for_loop(self, loop: ForLoop, ssa_ctx: SSARenumberContext) -> ForLoop:
+    def _transform_for_loop(self, loop: ForLoop) -> ForLoop:
         """Transform a ForLoop."""
-        new_body = self._transform_statements(loop.body, ssa_ctx)
+        new_body = self._transform_statements(loop.body)
 
         return ForLoop(
             counter=loop.counter,
@@ -383,10 +374,10 @@ class SimplifyPass(Pass):
             pragma_unroll=loop.pragma_unroll
         )
 
-    def _transform_if(self, if_stmt: If, ssa_ctx: SSARenumberContext) -> If:
+    def _transform_if(self, if_stmt: If) -> If:
         """Transform an If statement."""
-        new_then_body = self._transform_statements(if_stmt.then_body, ssa_ctx)
-        new_else_body = self._transform_statements(if_stmt.else_body, ssa_ctx)
+        new_then_body = self._transform_statements(if_stmt.then_body)
+        new_else_body = self._transform_statements(if_stmt.else_body)
 
         return If(
             cond=if_stmt.cond,

@@ -11,7 +11,6 @@ from ..hir import (
     SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
-from ..ssa_context import SSARenumberContext
 from ..use_def import UseDefContext
 
 
@@ -142,9 +141,6 @@ class CSEPass(Pass):
         if not config.enabled:
             return hir
 
-        # Create SSA context for renumbering (in case we need new SSAs)
-        ssa_ctx = SSARenumberContext(hir.num_ssa_values)
-
         # Create use-def context for efficient value replacement
         self._use_def_ctx = UseDefContext(hir)
 
@@ -152,7 +148,7 @@ class CSEPass(Pass):
         cse_ctx = CSEContext()
 
         # Transform body
-        new_body = self._transform_statements(hir.body, cse_ctx, ssa_ctx)
+        new_body = self._transform_statements(hir.body, cse_ctx)
 
         # Record custom metrics
         if self._metrics:
@@ -166,28 +162,27 @@ class CSEPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=ssa_ctx.next_id,
+            num_ssa_values=hir.num_ssa_values,
             num_vec_ssa_values=hir.num_vec_ssa_values
         )
 
     def _transform_statements(
         self,
         stmts: list[Statement],
-        ctx: CSEContext,
-        ssa_ctx: SSARenumberContext
+        ctx: CSEContext
     ) -> list[Statement]:
         """Transform a list of statements, eliminating common subexpressions."""
         result = []
 
         for stmt in stmts:
             if isinstance(stmt, Op):
-                transformed = self._transform_op(stmt, ctx, ssa_ctx)
+                transformed = self._transform_op(stmt, ctx)
                 if transformed is not None:
                     result.append(transformed)
             elif isinstance(stmt, ForLoop):
-                result.append(self._transform_for_loop(stmt, ctx, ssa_ctx))
+                result.append(self._transform_for_loop(stmt, ctx))
             elif isinstance(stmt, If):
-                result.append(self._transform_if(stmt, ctx, ssa_ctx))
+                result.append(self._transform_if(stmt, ctx))
             else:
                 # Halt, Pause - keep as is
                 result.append(stmt)
@@ -197,8 +192,7 @@ class CSEPass(Pass):
     def _transform_op(
         self,
         op: Op,
-        ctx: CSEContext,
-        ssa_ctx: SSARenumberContext
+        ctx: CSEContext
     ) -> Optional[Op]:
         """
         Apply CSE to a single Op.
@@ -259,8 +253,7 @@ class CSEPass(Pass):
     def _transform_for_loop(
         self,
         loop: ForLoop,
-        ctx: CSEContext,
-        ssa_ctx: SSARenumberContext
+        ctx: CSEContext
     ) -> ForLoop:
         """Transform a ForLoop, handling nested scope for CSE."""
         # Create child context for loop body
@@ -276,7 +269,7 @@ class CSEPass(Pass):
             child_ctx.record(fresh_vn, param)
 
         # Transform loop body
-        new_body = self._transform_statements(loop.body, child_ctx, ssa_ctx)
+        new_body = self._transform_statements(loop.body, child_ctx)
 
         # Propagate memory epoch up to parent
         ctx.mem_epoch += child_ctx.mem_epoch
@@ -296,8 +289,7 @@ class CSEPass(Pass):
     def _transform_if(
         self,
         if_stmt: If,
-        ctx: CSEContext,
-        ssa_ctx: SSARenumberContext
+        ctx: CSEContext
     ) -> If:
         """Transform an If statement, handling separate scopes for each branch."""
         # Create separate child contexts for each branch
@@ -306,8 +298,8 @@ class CSEPass(Pass):
         else_ctx = ctx.child_context()
 
         # Transform each branch
-        new_then_body = self._transform_statements(if_stmt.then_body, then_ctx, ssa_ctx)
-        new_else_body = self._transform_statements(if_stmt.else_body, else_ctx, ssa_ctx)
+        new_then_body = self._transform_statements(if_stmt.then_body, then_ctx)
+        new_else_body = self._transform_statements(if_stmt.else_body, else_ctx)
 
         # Propagate memory epoch up (use max since either branch could execute)
         ctx.mem_epoch += max(then_ctx.mem_epoch, else_ctx.mem_epoch)

@@ -607,5 +607,183 @@ class TestUseDefConst(unittest.TestCase):
         self.assertEqual(add_op.operands[1], Const(42))
 
 
+class TestReplaceAllUsesIntegration(unittest.TestCase):
+    """Integration tests for replace_all_uses in control flow contexts."""
+
+    def test_replace_in_forloop_yields(self):
+        """Test replacing a value used in ForLoop yields."""
+        b = HIRBuilder()
+        init = b.const_load(0, "init")
+        new_val = b.const_load(42, "new_val")
+
+        def body(i, params):
+            # The yield will use params[0] (which we want to replace)
+            return [params[0]]
+
+        results = b.for_loop(start=Const(0), end=Const(3), iter_args=[init], body_fn=body)
+        hir = b.build()
+
+        # Find the loop and get the yield SSA
+        loop = hir.body[2]  # After two const_loads
+        self.assertIsInstance(loop, ForLoop)
+        old_yield = loop.yields[0]
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_yield, new_val)
+
+        # Should have replaced the yield
+        self.assertEqual(count, 1)
+        self.assertEqual(loop.yields[0], new_val)
+
+    def test_replace_in_forloop_start(self):
+        """Test replacing a value used as ForLoop start."""
+        b = HIRBuilder()
+        old_start = b.const_load(0, "old_start")
+        new_start = b.const_load(5, "new_start")
+
+        def body(i, params):
+            return []
+
+        b.for_loop(start=old_start, end=Const(10), iter_args=[], body_fn=body)
+        hir = b.build()
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_start, new_start)
+
+        self.assertEqual(count, 1)
+        loop = hir.body[2]  # After two const_loads
+        self.assertIsInstance(loop, ForLoop)
+        self.assertEqual(loop.start, new_start)
+
+    def test_replace_in_forloop_end(self):
+        """Test replacing a value used as ForLoop end."""
+        b = HIRBuilder()
+        old_end = b.const_load(10, "old_end")
+        new_end = b.const_load(20, "new_end")
+
+        def body(i, params):
+            return []
+
+        b.for_loop(start=Const(0), end=old_end, iter_args=[], body_fn=body)
+        hir = b.build()
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_end, new_end)
+
+        self.assertEqual(count, 1)
+        loop = hir.body[2]  # After two const_loads
+        self.assertIsInstance(loop, ForLoop)
+        self.assertEqual(loop.end, new_end)
+
+    def test_replace_in_if_cond(self):
+        """Test replacing a value used as If condition."""
+        b = HIRBuilder()
+        old_cond = b.const_load(1, "old_cond")
+        new_cond = b.const_load(0, "new_cond")
+
+        def then_fn():
+            return []
+
+        def else_fn():
+            return []
+
+        b.if_stmt(old_cond, then_fn, else_fn)
+        hir = b.build()
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_cond, new_cond)
+
+        self.assertEqual(count, 1)
+        if_stmt = hir.body[2]  # After two const_loads
+        self.assertIsInstance(if_stmt, If)
+        self.assertEqual(if_stmt.cond, new_cond)
+
+    def test_replace_in_if_then_yields(self):
+        """Test replacing a value used in If then_yields."""
+        b = HIRBuilder()
+        cond = b.const_load(1, "cond")
+        old_then_val = b.const_load(100, "old_then")
+        new_val = b.const_load(999, "new_val")
+
+        def then_fn():
+            return [old_then_val]
+
+        def else_fn():
+            return [b.const_load(200, "else_val")]
+
+        results = b.if_stmt(cond, then_fn, else_fn)
+        hir = b.build()
+
+        # Find the if statement
+        if_stmt = None
+        for stmt in hir.body:
+            if isinstance(stmt, If):
+                if_stmt = stmt
+                break
+        self.assertIsNotNone(if_stmt)
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_then_val, new_val)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(if_stmt.then_yields[0], new_val)
+
+    def test_replace_in_if_else_yields(self):
+        """Test replacing a value used in If else_yields."""
+        b = HIRBuilder()
+        cond = b.const_load(1, "cond")
+        old_else_val = b.const_load(200, "old_else")
+        new_val = b.const_load(999, "new_val")
+
+        def then_fn():
+            return [b.const_load(100, "then_val")]
+
+        def else_fn():
+            return [old_else_val]
+
+        results = b.if_stmt(cond, then_fn, else_fn)
+        hir = b.build()
+
+        # Find the if statement
+        if_stmt = None
+        for stmt in hir.body:
+            if isinstance(stmt, If):
+                if_stmt = stmt
+                break
+        self.assertIsNotNone(if_stmt)
+
+        ctx = UseDefContext(hir)
+        count = ctx.replace_all_uses(old_else_val, new_val)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(if_stmt.else_yields[0], new_val)
+
+    def test_replace_vector_ssa_in_operand(self):
+        """Test replacing VectorSSAValue used in vector op."""
+        b = HIRBuilder()
+        addr = b.const_load(0, "addr")
+        v1 = b.vload(addr, "v1")  # First vector load
+        v2 = b.vload(addr, "v2")  # Second vector load (to replace with)
+        v3 = b.vadd(v1, v1, "v3")  # Uses v1 twice
+        b.vstore(addr, v3)
+        hir = b.build()
+
+        ctx = UseDefContext(hir)
+
+        # Verify v1 has uses
+        self.assertEqual(ctx.use_count(v1), 2)
+
+        # Replace v1 with v2
+        count = ctx.replace_all_uses(v1, v2)
+        self.assertEqual(count, 2)
+
+        # Find the vadd op and verify operands were replaced
+        vadd_op = hir.body[3]  # After addr, v1, v2 loads
+        self.assertIsInstance(vadd_op, Op)
+        self.assertEqual(vadd_op.opcode, "v+")
+        self.assertEqual(vadd_op.operands[0], v2)
+        self.assertEqual(vadd_op.operands[1], v2)
+
+
 if __name__ == "__main__":
     unittest.main()
