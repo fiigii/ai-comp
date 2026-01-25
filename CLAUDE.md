@@ -8,6 +8,18 @@ This is Anthropic's original performance engineering take-home challenge. The ta
 
 **Important:** Do not modify files in the `tests/` folder. The submission tests use a frozen copy of the simulator to prevent cheating.
 
+## ⚠️ Essential Reading: VLIW ISA Documentation
+
+**Consult `docs/VLIW_ISA.md`** to understand the target architecture. This document is critical for:
+
+- Understanding the VLIW execution model and instruction bundling constraints
+- Knowing available instructions, their latencies, and engine slot assignments
+- Identifying optimization opportunities (e.g., instruction parallelism, vector operations)
+- Understanding memory access patterns and scratch register usage
+- Making informed decisions about performance trade-offs
+
+**Before implementing any optimization, always re-read the relevant sections of `docs/VLIW_ISA.md`** to ensure your approach aligns with the hardware capabilities and constraints.
+
 ## Commands
 
 ```bash
