@@ -12,6 +12,7 @@ from ..hir import (
 )
 from ..pass_manager import Pass, PassConfig
 from ..ssa_context import SSARenumberContext
+from ..use_def import UseDefContext
 
 
 @dataclass
@@ -122,6 +123,8 @@ class CSEPass(Pass):
         self._expressions_eliminated = 0
         self._consts_eliminated = 0
         self._loads_eliminated = 0
+        # Use-def context for efficient replacements
+        self._use_def_ctx: Optional[UseDefContext] = None
 
     @property
     def name(self) -> str:
@@ -141,6 +144,9 @@ class CSEPass(Pass):
 
         # Create SSA context for renumbering (in case we need new SSAs)
         ssa_ctx = SSARenumberContext(hir.num_ssa_values)
+
+        # Create use-def context for efficient value replacement
+        self._use_def_ctx = UseDefContext(hir)
 
         # Create CSE context
         cse_ctx = CSEContext()
@@ -174,9 +180,6 @@ class CSEPass(Pass):
         result = []
 
         for stmt in stmts:
-            # Apply any SSA bindings from eliminated expressions (both scalar and vector)
-            stmt = self._apply_bindings(stmt, ssa_ctx.result_bindings, ssa_ctx.vector_bindings)
-
             if isinstance(stmt, Op):
                 transformed = self._transform_op(stmt, ctx, ssa_ctx)
                 if transformed is not None:
@@ -241,12 +244,9 @@ class CSEPass(Pass):
             elif op.opcode in LOAD_OPS:
                 self._loads_eliminated += 1
 
-            # Bind the result to the existing SSA (use appropriate binding map)
+            # Replace all uses of this result with the existing SSA
             if op.result is not None:
-                if isinstance(op.result, VectorSSAValue):
-                    ssa_ctx.bind_vector_result(op.result.id, existing_ssa)
-                else:
-                    ssa_ctx.bind_result(op.result.id, existing_ssa)
+                self._use_def_ctx.replace_all_uses(op.result, existing_ssa)
 
             return None  # Eliminate the op
 
@@ -281,12 +281,6 @@ class CSEPass(Pass):
         # Propagate memory epoch up to parent
         ctx.mem_epoch += child_ctx.mem_epoch
 
-        # Resolve yields through bindings
-        new_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in loop.yields
-        ]
-
         return ForLoop(
             counter=loop.counter,
             start=loop.start,
@@ -294,7 +288,7 @@ class CSEPass(Pass):
             iter_args=loop.iter_args,
             body_params=loop.body_params,
             body=new_body,
-            yields=new_yields,
+            yields=loop.yields,
             results=loop.results,
             pragma_unroll=loop.pragma_unroll
         )
@@ -318,22 +312,12 @@ class CSEPass(Pass):
         # Propagate memory epoch up (use max since either branch could execute)
         ctx.mem_epoch += max(then_ctx.mem_epoch, else_ctx.mem_epoch)
 
-        # Resolve yields through bindings
-        new_then_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in if_stmt.then_yields
-        ]
-        new_else_yields = [
-            self._resolve_binding(y, ssa_ctx.result_bindings)
-            for y in if_stmt.else_yields
-        ]
-
         return If(
             cond=if_stmt.cond,
             then_body=new_then_body,
-            then_yields=new_then_yields,
+            then_yields=if_stmt.then_yields,
             else_body=new_else_body,
-            else_yields=new_else_yields,
+            else_yields=if_stmt.else_yields,
             results=if_stmt.results
         )
 
@@ -392,106 +376,3 @@ class CSEPass(Pass):
             return ("vec_ssa", operand.id)
 
         return None
-
-    def _resolve_binding(
-        self,
-        value: SSAValue,
-        bindings: dict[int, SSAValue]
-    ) -> SSAValue:
-        """Resolve scalar SSA bindings transitively."""
-        while value.id in bindings:
-            value = bindings[value.id]
-        return value
-
-    def _resolve_vector_binding(
-        self,
-        value: VectorSSAValue,
-        vector_bindings: dict[int, VectorSSAValue]
-    ) -> VectorSSAValue:
-        """Resolve vector SSA bindings transitively."""
-        while value.id in vector_bindings:
-            value = vector_bindings[value.id]
-        return value
-
-    def _apply_bindings(
-        self,
-        stmt: Statement,
-        bindings: dict[int, SSAValue],
-        vector_bindings: dict[int, VectorSSAValue]
-    ) -> Statement:
-        """Apply SSA value bindings to a statement's operands.
-
-        Handles both scalar SSAValue and VectorSSAValue bindings.
-        """
-        if not bindings and not vector_bindings:
-            return stmt
-
-        if isinstance(stmt, Op):
-            new_operands = []
-            for op in stmt.operands:
-                if isinstance(op, VectorSSAValue) and op.id in vector_bindings:
-                    new_operands.append(self._resolve_vector_binding(op, vector_bindings))
-                elif isinstance(op, SSAValue) and op.id in bindings:
-                    new_operands.append(self._resolve_binding(op, bindings))
-                else:
-                    # Const or unbound SSA pass through unchanged
-                    new_operands.append(op)
-            return Op(stmt.opcode, stmt.result, new_operands, stmt.engine)
-
-        elif isinstance(stmt, ForLoop):
-            new_iter_args = []
-            for arg in stmt.iter_args:
-                if arg.id in bindings:
-                    new_iter_args.append(self._resolve_binding(arg, bindings))
-                else:
-                    new_iter_args.append(arg)
-
-            new_start = stmt.start
-            if isinstance(stmt.start, SSAValue) and stmt.start.id in bindings:
-                new_start = self._resolve_binding(stmt.start, bindings)
-
-            new_end = stmt.end
-            if isinstance(stmt.end, SSAValue) and stmt.end.id in bindings:
-                new_end = self._resolve_binding(stmt.end, bindings)
-
-            new_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.yields
-            ]
-
-            return ForLoop(
-                counter=stmt.counter,
-                start=new_start,
-                end=new_end,
-                iter_args=new_iter_args,
-                body_params=stmt.body_params,
-                body=stmt.body,
-                yields=new_yields,
-                results=stmt.results,
-                pragma_unroll=stmt.pragma_unroll
-            )
-
-        elif isinstance(stmt, If):
-            new_cond = stmt.cond
-            if stmt.cond.id in bindings:
-                new_cond = self._resolve_binding(stmt.cond, bindings)
-
-            new_then_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.then_yields
-            ]
-            new_else_yields = [
-                self._resolve_binding(y, bindings) if y.id in bindings else y
-                for y in stmt.else_yields
-            ]
-
-            return If(
-                cond=new_cond,
-                then_body=stmt.then_body,
-                then_yields=new_then_yields,
-                else_body=stmt.else_body,
-                else_yields=new_else_yields,
-                results=stmt.results
-            )
-
-        return stmt
