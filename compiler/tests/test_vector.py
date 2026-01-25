@@ -13,15 +13,15 @@ from compiler.lir import LIROpcode
 
 def _build_vgather_hir() -> HIRFunction:
     b = HIRBuilder()
-    addr_base = b.const_load(0)
-    addr_indices = b.const_load(16)
+    addr_base = b.const(0)
+    addr_indices = b.const(16)
     vec_indices = b.vload(addr_indices)
     vec_base = b.vbroadcast(addr_base)
     vec_addr = b.vadd(vec_base, vec_indices)
 
     vec_out = b._new_vec_ssa("gather")
     b._emit(Op("vgather", vec_out, [vec_addr], "load"))
-    b.vstore(b.const_load(64), vec_out)
+    b.vstore(b.const(64), vec_out)
     b.halt()
     return b.build()
 
@@ -54,7 +54,7 @@ class TestVectorHIRBuilder:
     def test_vbroadcast(self):
         """vbroadcast should create a vector from a scalar."""
         b = HIRBuilder()
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec = b.vbroadcast(scalar)
 
         assert isinstance(vec, VectorSSAValue)
@@ -64,7 +64,7 @@ class TestVectorHIRBuilder:
     def test_vload_vstore(self):
         """vload and vstore should handle vector memory operations."""
         b = HIRBuilder()
-        addr = b.const_load(100)
+        addr = b.const(100)
         vec = b.vload(addr)
         b.vstore(addr, vec)
 
@@ -75,8 +75,8 @@ class TestVectorHIRBuilder:
     def test_vector_binary_ops(self):
         """Vector binary ops should produce vector results."""
         b = HIRBuilder()
-        addr1 = b.const_load(0)
-        addr2 = b.const_load(8)
+        addr1 = b.const(0)
+        addr2 = b.const(8)
         a = b.vload(addr1)
         c = b.vload(addr2)
 
@@ -93,7 +93,7 @@ class TestVectorHIRBuilder:
     def test_multiply_add(self):
         """multiply_add should perform fused multiply-add."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         a = b.vload(addr)
         c = b.vload(addr)
         d = b.vload(addr)
@@ -104,7 +104,7 @@ class TestVectorHIRBuilder:
     def test_vselect(self):
         """vselect should select per-lane."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         cond = b.vload(addr)
         a = b.vload(addr)
         c = b.vload(addr)
@@ -115,7 +115,7 @@ class TestVectorHIRBuilder:
     def test_vextract(self):
         """vextract should extract a scalar from a vector."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
         scalar = b.vextract(vec, 3)
 
@@ -125,9 +125,9 @@ class TestVectorHIRBuilder:
     def test_vinsert(self):
         """vinsert should insert a scalar into a vector."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
-        scalar = b.const_load(99)
+        scalar = b.const(99)
         new_vec = b.vinsert(vec, scalar, 5)
 
         assert isinstance(new_vec, VectorSSAValue)
@@ -139,9 +139,9 @@ class TestVectorLowering:
     def test_vbroadcast_lowering(self):
         """vbroadcast should lower to LIR with vector dest."""
         b = HIRBuilder()
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec = b.vbroadcast(scalar)
-        b.vstore(b.const_load(100), vec)
+        b.vstore(b.const(100), vec)
         b.halt()
 
         hir = b.build()
@@ -164,9 +164,9 @@ class TestVectorLowering:
     def test_vload_lowering(self):
         """vload should lower to LIR with vector dest."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
-        b.vstore(b.const_load(100), vec)
+        b.vstore(b.const(100), vec)
         b.halt()
 
         hir = b.build()
@@ -186,12 +186,12 @@ class TestVectorLowering:
     def test_vadd_lowering(self):
         """vadd should lower with vector operands."""
         b = HIRBuilder()
-        addr1 = b.const_load(0)
-        addr2 = b.const_load(8)
+        addr1 = b.const(0)
+        addr2 = b.const(8)
         a = b.vload(addr1)
         c = b.vload(addr2)
         result = b.vadd(a, c)
-        b.vstore(b.const_load(16), result)
+        b.vstore(b.const(16), result)
         b.halt()
 
         hir = b.build()
@@ -214,10 +214,10 @@ class TestVectorLowering:
     def test_vextract_lowering(self):
         """vextract should lower to COPY instruction."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
         scalar = b.vextract(vec, 3)
-        b.store(b.const_load(100), scalar)
+        b.store(b.const(100), scalar)
         b.halt()
 
         hir = b.build()
@@ -238,11 +238,11 @@ class TestVectorLowering:
     def test_vinsert_lowering(self):
         """vinsert should lower to multiple COPY instructions."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
-        scalar = b.const_load(99)
+        scalar = b.const(99)
         new_vec = b.vinsert(vec, scalar, 5)
-        b.vstore(b.const_load(100), new_vec)
+        b.vstore(b.const(100), new_vec)
         b.halt()
 
         hir = b.build()
@@ -285,9 +285,9 @@ class TestVectorCodegen:
     def test_vload_codegen(self):
         """vload should generate correct VLIW slot."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
-        b.vstore(b.const_load(8), vec)
+        b.vstore(b.const(8), vec)
         b.halt()
 
         hir = b.build()
@@ -310,9 +310,9 @@ class TestVectorCodegen:
     def test_vstore_codegen(self):
         """vstore should generate correct VLIW slot."""
         b = HIRBuilder()
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec = b.vbroadcast(scalar)
-        addr = b.const_load(100)
+        addr = b.const(100)
         b.vstore(addr, vec)
         b.halt()
 
@@ -336,11 +336,11 @@ class TestVectorCodegen:
     def test_vadd_codegen(self):
         """vadd should generate scalar op with base addresses."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         a = b.vload(addr)
         c = b.vload(addr)
         result = b.vadd(a, c)
-        b.vstore(b.const_load(24), result)
+        b.vstore(b.const(24), result)
         b.halt()
 
         hir = b.build()
@@ -363,9 +363,9 @@ class TestVectorCodegen:
     def test_vbroadcast_codegen(self):
         """vbroadcast should generate correct VLIW slot."""
         b = HIRBuilder()
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec = b.vbroadcast(scalar)
-        b.vstore(b.const_load(100), vec)
+        b.vstore(b.const(100), vec)
         b.halt()
 
         hir = b.build()
@@ -388,12 +388,12 @@ class TestVectorCodegen:
     def test_multiply_add_codegen(self):
         """multiply_add should generate correct VLIW slot."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         a = b.vload(addr)
         c = b.vload(addr)
         d = b.vload(addr)
         result = b.multiply_add(a, c, d)
-        b.vstore(b.const_load(100), result)
+        b.vstore(b.const(100), result)
         b.halt()
 
         hir = b.build()
@@ -416,12 +416,12 @@ class TestVectorCodegen:
     def test_vselect_codegen(self):
         """vselect should generate correct VLIW slot."""
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         cond = b.vload(addr)
         a = b.vload(addr)
         c = b.vload(addr)
         result = b.vselect(cond, a, c)
-        b.vstore(b.const_load(100), result)
+        b.vstore(b.const(100), result)
         b.halt()
 
         hir = b.build()
@@ -468,7 +468,7 @@ class TestVectorDCE:
         from compiler.pass_manager import PassConfig
 
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         _dead_vec = b.vload(addr)  # Not used
         b.halt()
 
@@ -487,9 +487,9 @@ class TestVectorDCE:
         from compiler.pass_manager import PassConfig
 
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec = b.vload(addr)
-        b.vstore(b.const_load(100), vec)
+        b.vstore(b.const(100), vec)
         b.halt()
 
         hir = b.build()
@@ -515,11 +515,11 @@ class TestVectorCSE:
         from compiler.pass_manager import PassConfig
 
         b = HIRBuilder()
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec1 = b.vbroadcast(scalar)
         vec2 = b.vbroadcast(scalar)  # Duplicate
         result = b.vadd(vec1, vec2)
-        b.vstore(b.const_load(100), result)
+        b.vstore(b.const(100), result)
         b.halt()
 
         hir = b.build()
@@ -543,11 +543,11 @@ class TestVectorCSE:
         from compiler.pass_manager import PassConfig
 
         b = HIRBuilder()
-        addr = b.const_load(0)
+        addr = b.const(0)
         vec1 = b.vload(addr)
         b.vstore(addr, vec1)  # Clobbers memory
         vec2 = b.vload(addr)  # Should NOT be CSE'd with vec1
-        b.vstore(b.const_load(100), vec2)
+        b.vstore(b.const(100), vec2)
         b.halt()
 
         hir = b.build()
@@ -577,14 +577,14 @@ class TestVectorCSE:
         b = HIRBuilder()
 
         # Create two identical vbroadcast ops
-        scalar = b.const_load(42)
+        scalar = b.const(42)
         vec1 = b.vbroadcast(scalar)  # First vbroadcast
         vec2 = b.vbroadcast(scalar)  # Duplicate - should be eliminated
 
         # Use both vectors in an add - after CSE, should use vec1 twice
         result = b.vadd(vec1, vec2)
 
-        addr_out = b.const_load(0)
+        addr_out = b.const(0)
         b.vstore(addr_out, result)
         b.halt()
 
@@ -624,9 +624,9 @@ class TestVectorCSE:
 
         b = HIRBuilder()
 
-        addr_a = b.const_load(0)
-        addr_b = b.const_load(8)
-        addr_out = b.const_load(16)
+        addr_a = b.const(0)
+        addr_b = b.const(8)
+        addr_out = b.const(16)
 
         vec_a = b.vload(addr_a)
         vec_b = b.vload(addr_b)
@@ -691,22 +691,22 @@ class TestVectorCSE:
         b = HIRBuilder()
 
         # First scalar and first vector both have id=0
-        # (const_load creates scalar v0, vload creates vec0)
-        addr = b.const_load(0)  # SSAValue(id=0)
+        # (add creates scalar v0, vload creates vec0)
+        addr = b.add(Const(0), Const(0), "addr")  # SSAValue(id=0)
         vec = b.vload(addr)     # VectorSSAValue(id=0)
 
         # Create duplicate operations for both
-        addr_dup = b.const_load(0)  # SSAValue(id=1) - same value, should CSE to v0
+        addr_dup = b.add(Const(0), Const(0), "addr_dup")  # SSAValue(id=1) - same expr, should CSE to v0
         vec_dup = b.vload(addr)     # VectorSSAValue(id=1) - same, should CSE to vec0
 
         # Use the duplicates to verify bindings work correctly
-        addr_out = b.const_load(8)
+        addr_out = Const(8)
         result = b.vadd(vec, vec_dup)  # Should use vec0 twice after CSE
         b.vstore(addr_out, result)
 
         # Also verify scalar binding works
         scalar_sum = b.add(addr, addr_dup)  # Should use v0 twice after CSE
-        b.store(b.const_load(100), scalar_sum)
+        b.store(Const(100), scalar_sum)
 
         b.halt()
 
@@ -767,9 +767,9 @@ class TestVectorKernel:
         # [8..15]  = b (input)
         # [16..23] = c (output)
 
-        addr_a = b.const_load(0, "addr_a")
-        addr_b = b.const_load(8, "addr_b")
-        addr_c = b.const_load(16, "addr_c")
+        addr_a = b.const(0)
+        addr_b = b.const(8)
+        addr_c = b.const(16)
 
         # Load vectors
         vec_a = b.vload(addr_a)
@@ -809,9 +809,9 @@ class TestVectorKernel:
         # [8]      = scalar
         # [16..23] = output
 
-        addr_input = b.const_load(0, "addr_input")
-        addr_scalar = b.const_load(8, "addr_scalar")
-        addr_output = b.const_load(16, "addr_output")
+        addr_input = b.const(0)
+        addr_scalar = b.const(8)
+        addr_output = b.const(16)
 
         # Load input vector
         vec_input = b.vload(addr_input)
@@ -854,10 +854,10 @@ class TestVectorKernel:
         # [16..23] = c
         # [24..31] = d (output)
 
-        addr_a = b.const_load(0)
-        addr_b = b.const_load(8)
-        addr_c = b.const_load(16)
-        addr_d = b.const_load(24)
+        addr_a = b.const(0)
+        addr_b = b.const(8)
+        addr_c = b.const(16)
+        addr_d = b.const(24)
 
         # Load vectors
         vec_a = b.vload(addr_a)
@@ -902,10 +902,10 @@ class TestVectorKernel:
         # [16..23] = b
         # [24..31] = result
 
-        addr_cond = b.const_load(0)
-        addr_a = b.const_load(8)
-        addr_b = b.const_load(16)
-        addr_result = b.const_load(24)
+        addr_cond = b.const(0)
+        addr_a = b.const(8)
+        addr_b = b.const(16)
+        addr_result = b.const(24)
 
         # Load vectors
         vec_cond = b.vload(addr_cond)
@@ -951,8 +951,8 @@ class TestVectorKernel:
         # [0..7]   = input
         # [8..15]  = output (same as input but lane 3 doubled)
 
-        addr_input = b.const_load(0)
-        addr_output = b.const_load(8)
+        addr_input = b.const(0)
+        addr_output = b.const(8)
 
         # Load vector
         vec = b.vload(addr_input)
@@ -961,7 +961,7 @@ class TestVectorKernel:
         val = b.vextract(vec, 3)
 
         # Double it
-        two = b.const_load(2)
+        two = b.const(2)
         doubled = b.mul(val, two)
 
         # Insert back at lane 3
@@ -997,8 +997,8 @@ class TestVectorKernel:
         # [0..7] = input vector
         # [8]    = sum output
 
-        addr_input = b.const_load(0)
-        addr_output = b.const_load(8)
+        addr_input = b.const(0)
+        addr_output = b.const(8)
 
         # Load vector
         vec = b.vload(addr_input)
@@ -1039,11 +1039,11 @@ class TestVectorKernel:
         # [24..31] = d
         # [32..39] = result
 
-        addr_a = b.const_load(0)
-        addr_b = b.const_load(8)
-        addr_c = b.const_load(16)
-        addr_d = b.const_load(24)
-        addr_result = b.const_load(32)
+        addr_a = b.const(0)
+        addr_b = b.const(8)
+        addr_c = b.const(16)
+        addr_d = b.const(24)
+        addr_result = b.const(32)
 
         # Load all vectors
         vec_a = b.vload(addr_a)
@@ -1087,12 +1087,12 @@ class TestVectorKernel:
         # [8..15]  = increment vector
         # [16..23] = final result
 
-        addr_acc = b.const_load(0)
-        addr_inc = b.const_load(8)
-        addr_result = b.const_load(16)
+        addr_acc = b.const(0)
+        addr_inc = b.const(8)
+        addr_result = b.const(16)
 
-        zero = b.const_load(0)
-        four = b.const_load(4)
+        zero = b.const(0)
+        four = b.const(4)
 
         # Load increment vector (constant across loop)
         vec_inc = b.vload(addr_inc)

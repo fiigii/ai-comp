@@ -24,11 +24,11 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
     def test_full_unroll_simple_loop(self):
         """Test that a simple loop with static bounds gets fully unrolled."""
         b = HIRBuilder()
-        zero = b.const_load(0, "zero")
-        addr = b.const_load(10, "addr")
+        zero = b.const(0)
+        addr = b.const(10)
 
         # Simple loop: for i in 0..4: (no body, just count iterations)
-        init_sum = b.const_load(0, "init_sum")
+        init_sum = b.const(0)
 
         def body(i, params):
             s = params[0]
@@ -70,8 +70,8 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
     def test_partial_unroll(self):
         """Test partial unrolling with pragma_unroll."""
         b = HIRBuilder()
-        addr = b.const_load(10, "addr")
-        init_sum = b.const_load(0, "init_sum")
+        addr = b.const(10)
+        init_sum = b.const(0)
 
         def body(i, params):
             s = params[0]
@@ -120,17 +120,17 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         """Test that loops with dynamic bounds are not unrolled."""
         b = HIRBuilder()
         # Load bound from memory (dynamic)
-        addr0 = b.const_load(0, "addr0")
+        addr0 = b.const(0)
         bound = b.load(addr0, "bound")
-        addr10 = b.const_load(10, "addr10")
-        init_sum = b.const_load(0, "init_sum")
+        addr10 = b.const(10)
+        init_sum = b.const(0)
 
         def body(i, params):
             s = params[0]
             new_s = b.add(s, i, "sum")
             return [new_s]
 
-        results = b.for_loop(start=b.const_load(0), end=bound, iter_args=[init_sum], body_fn=body)
+        results = b.for_loop(start=b.const(0), end=bound, iter_args=[init_sum], body_fn=body)
         b.store(addr10, results[0])
 
         hir = b.build()
@@ -149,8 +149,8 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
     def test_skip_unroll_bad_factor(self):
         """Test that unrolling is skipped when pragma factor doesn't divide trip count."""
         b = HIRBuilder()
-        addr = b.const_load(10, "addr")
-        init_sum = b.const_load(0, "init_sum")
+        addr = b.const(10)
+        init_sum = b.const(0)
 
         def body(i, params):
             s = params[0]
@@ -218,9 +218,9 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
     def test_unroll_remaps_if_yields(self):
         """Ensure unrolled loop results are remapped through If yields."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        cond_true = b.const_load(1, "cond_true")
-        init_sum = b.const_load(0, "init_sum")
+        addr0 = b.const(0)
+        cond_true = b.const(1)
+        init_sum = b.const(0)
 
         def then_fn():
             def body(i, params):
@@ -231,7 +231,7 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
             return [results[0]]
 
         def else_fn():
-            return [b.const_load(99, "else_val")]
+            return [b.const(99)]
 
         out = b.if_stmt(cond_true, then_fn, else_fn)[0]
         b.store(addr0, out)
@@ -260,11 +260,11 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
     def test_unroll_remaps_forloop_yields(self):
         """Ensure unrolled loop results are remapped through enclosing ForLoop yields."""
         b = HIRBuilder()
-        addr0 = b.const_load(0, "addr0")
-        addr1 = b.const_load(1, "addr1")
+        addr0 = b.const(0)
+        addr1 = b.const(1)
         bound = b.load(addr1, "bound")  # dynamic bound: outer loop should not be unrolled
 
-        init_sum = b.const_load(0, "init_sum")
+        init_sum = b.const(0)
 
         def outer_body(i, params):
             outer_s = params[0]
@@ -301,8 +301,8 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
         self.assertEqual(machine.mem[0], 6)
         print("Unroll remaps ForLoop yields test passed!")
 
-    def test_unroll_materializes_const_iter_arg(self):
-        """Ensure const iter_args are materialized before cloned nested loops."""
+    def test_unroll_propagates_const_iter_arg(self):
+        """Ensure const iter_args are propagated into cloned nested loops."""
         b = HIRBuilder()
 
         def inner_body(j, inner_params):
@@ -328,19 +328,14 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
         loops = [(idx, s) for idx, s in enumerate(unrolled.body) if isinstance(s, ForLoop)]
         self.assertGreaterEqual(len(loops), 1)
-        has_materialized = False
-        for idx, loop in loops:
-            self.assertTrue(all(isinstance(arg, SSAValue) for arg in loop.iter_args))
-            self.assertGreater(idx, 0)
-            if any(
-                isinstance(stmt, Op) and stmt.opcode == "const" and stmt.result in loop.iter_args
-                for stmt in unrolled.body[:idx]
-            ):
-                has_materialized = True
-        self.assertTrue(has_materialized)
+        has_const_iter_arg = False
+        for _, loop in loops:
+            if any(isinstance(arg, Const) for arg in loop.iter_args):
+                has_const_iter_arg = True
+        self.assertTrue(has_const_iter_arg)
 
-    def test_unroll_materializes_const_if_cond(self):
-        """Ensure const If conditions are materialized before cloned Ifs."""
+    def test_unroll_propagates_const_if_cond(self):
+        """Ensure const If conditions are propagated into cloned Ifs."""
         b = HIRBuilder()
 
         def outer_body(i, params):
@@ -363,16 +358,11 @@ class TestPassManagerAndLoopUnroll(unittest.TestCase):
 
         ifs = [(idx, s) for idx, s in enumerate(unrolled.body) if isinstance(s, If)]
         self.assertGreaterEqual(len(ifs), 1)
-        has_materialized = False
-        for idx, if_stmt in ifs:
-            self.assertIsInstance(if_stmt.cond, SSAValue)
-            self.assertGreater(idx, 0)
-            if any(
-                isinstance(stmt, Op) and stmt.opcode == "const" and stmt.result == if_stmt.cond
-                for stmt in unrolled.body[:idx]
-            ):
-                has_materialized = True
-        self.assertTrue(has_materialized)
+        has_const_cond = False
+        for _, if_stmt in ifs:
+            if isinstance(if_stmt.cond, Const):
+                has_const_cond = True
+        self.assertTrue(has_const_cond)
 
 
 class TestPragmaUnroll(unittest.TestCase):
@@ -401,11 +391,11 @@ class TestPragmaUnroll(unittest.TestCase):
     def test_pragma_unroll_disabled(self):
         """Test that pragma_unroll=1 prevents unrolling."""
         b = HIRBuilder()
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
 
-        init_val = b.const_load(0, "init_val")
+        init_val = b.const(0)
 
         def loop_body(i, params):
             # Sum: val += 1
@@ -444,11 +434,11 @@ class TestPragmaUnroll(unittest.TestCase):
     def test_pragma_unroll_full(self):
         """Test that pragma_unroll=0 causes full unroll."""
         b = HIRBuilder()
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
 
-        init_val = b.const_load(0, "init_val")
+        init_val = b.const(0)
 
         def loop_body(i, params):
             new_val = b.add(params[0], one, "new_val")
@@ -486,11 +476,11 @@ class TestPragmaUnroll(unittest.TestCase):
     def test_pragma_unroll_partial(self):
         """Test that pragma_unroll=4 with 8 iters creates 2-iteration loop."""
         b = HIRBuilder()
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
 
-        init_val = b.const_load(0, "init_val")
+        init_val = b.const(0)
 
         def loop_body(i, params):
             new_val = b.add(params[0], one, "new_val")
@@ -539,11 +529,11 @@ class TestPragmaUnroll(unittest.TestCase):
     def test_pragma_unroll_nested_mixed(self):
         """Test outer=1 (disabled), inner=0 (full unroll) works correctly."""
         b = HIRBuilder()
-        zero = b.const_load(0, "zero")
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
+        zero = b.const(0)
+        one = b.const(1)
+        addr0 = b.const(0)
 
-        init_val = b.const_load(0, "init_val")
+        init_val = b.const(0)
 
         def inner_body(j, inner_params):
             new_val = b.add(inner_params[0], one, "inner_val")
@@ -592,10 +582,10 @@ class TestPragmaUnroll(unittest.TestCase):
     def test_pragma_unroll_non_divisible_skipped(self):
         """Test that partial unroll is skipped when factor doesn't divide trip count."""
         b = HIRBuilder()
-        one = b.const_load(1, "one")
-        addr0 = b.const_load(0, "addr0")
+        one = b.const(1)
+        addr0 = b.const(0)
 
-        init_val = b.const_load(0, "init_val")
+        init_val = b.const(0)
 
         def loop_body(i, params):
             new_val = b.add(params[0], one, "new_val")

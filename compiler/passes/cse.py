@@ -80,8 +80,6 @@ class CSEContext:
 CSE_SAFE_OPS = {
     # ALU ops
     "+", "-", "*", "//", "%", "^", "&", "|", "<<", ">>", "<", "==",
-    # Load engine ops that are CSE-safe
-    "const",
     # Flow engine ops
     "select",
     # Vector ALU ops
@@ -105,7 +103,7 @@ class CSEPass(Pass):
     Common Subexpression Elimination using value numbering.
 
     Eliminates redundant computations by tracking expressions and their values:
-    - Safe for CSE: ALU ops, const, select
+    - Safe for CSE: ALU ops, select
     - Conditional CSE: load (only within the same memory epoch)
     - Never CSE'd: store (has side effects)
 
@@ -120,7 +118,6 @@ class CSEPass(Pass):
         super().__init__()
         self._expressions_analyzed = 0
         self._expressions_eliminated = 0
-        self._consts_eliminated = 0
         self._loads_eliminated = 0
         # Use-def context for efficient replacements
         self._use_def_ctx: Optional[UseDefContext] = None
@@ -134,7 +131,6 @@ class CSEPass(Pass):
         self._init_metrics()
         self._expressions_analyzed = 0
         self._expressions_eliminated = 0
-        self._consts_eliminated = 0
         self._loads_eliminated = 0
 
         # Check if pass is enabled
@@ -155,7 +151,6 @@ class CSEPass(Pass):
             self._metrics.custom = {
                 "expressions_analyzed": self._expressions_analyzed,
                 "expressions_eliminated": self._expressions_eliminated,
-                "consts_eliminated": self._consts_eliminated,
                 "loads_eliminated": self._loads_eliminated,
             }
 
@@ -233,9 +228,7 @@ class CSEPass(Pass):
             # Found a match - eliminate this expression
             self._expressions_eliminated += 1
 
-            if op.opcode == "const":
-                self._consts_eliminated += 1
-            elif op.opcode in LOAD_OPS:
+            if op.opcode in LOAD_OPS:
                 self._loads_eliminated += 1
 
             # Replace all uses of this result with the existing SSA
@@ -319,10 +312,6 @@ class CSEPass(Pass):
 
         Returns None if we can't compute a value number (e.g., unknown operand).
         """
-        if op.opcode == "const":
-            # Constants are identified by their value
-            return ("const", op.operands[0].value)
-
         # For other ops, use opcode + operand value numbers
         operand_vns = []
         for operand in op.operands:

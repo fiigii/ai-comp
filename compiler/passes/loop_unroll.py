@@ -5,7 +5,7 @@ Unrolls ForLoops with static trip counts, either fully or partially.
 """
 
 from ..hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
 from ..ssa_context import SSARenumberContext
@@ -51,7 +51,8 @@ class LoopUnrollPass(Pass):
         max_trip_count = config.options.get("max_trip_count", 10000000)
 
         # Create SSA renumber context starting from current max
-        ctx = SSARenumberContext(hir.num_ssa_values)
+        max_vec_id = self._max_vector_id(hir.body)
+        ctx = SSARenumberContext(hir.num_ssa_values, max_vec_id + 1)
 
         # Transform body recursively
         new_body = self._transform_statements(hir.body, max_trip_count, ctx)
@@ -68,8 +69,22 @@ class LoopUnrollPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=ctx.next_id
+            num_ssa_values=ctx.next_id,
+            num_vec_ssa_values=ctx.next_vec_id
         )
+
+    def _max_vector_id(self, body: list[Statement]) -> int:
+        """Find the maximum VectorSSAValue id defined in the body."""
+        max_id = -1
+        for stmt in body:
+            if isinstance(stmt, Op) and isinstance(stmt.result, VectorSSAValue):
+                max_id = max(max_id, stmt.result.id)
+            elif isinstance(stmt, ForLoop):
+                max_id = max(max_id, self._max_vector_id(stmt.body))
+            elif isinstance(stmt, If):
+                max_id = max(max_id, self._max_vector_id(stmt.then_body))
+                max_id = max(max_id, self._max_vector_id(stmt.else_body))
+        return max_id
 
     def _transform_statements(
         self, stmts: list[Statement], max_trip: int, ctx: SSARenumberContext
@@ -88,13 +103,13 @@ class LoopUnrollPass(Pass):
                 result.append(stmt)
         return result
 
-    def _resolve_ssa_binding(self, value: SSAValue, bindings: dict[int, SSAValue]) -> SSAValue:
+    def _resolve_ssa_binding(self, value: Operand, bindings: dict[int, Operand]) -> Operand:
         """Resolve SSA bindings transitively (old -> new -> ...)."""
-        while value.id in bindings:
+        while isinstance(value, SSAValue) and value.id in bindings:
             value = bindings[value.id]
         return value
 
-    def _apply_bindings(self, stmt: Statement, bindings: dict[int, SSAValue]) -> Statement:
+    def _apply_bindings(self, stmt: Statement, bindings: dict[int, Operand]) -> Statement:
         """Apply SSA value bindings to a statement's operands."""
         if not bindings:
             return stmt
@@ -112,11 +127,14 @@ class LoopUnrollPass(Pass):
             # Remap iter_args
             new_iter_args = []
             for arg in stmt.iter_args:
-                if arg.id in bindings:
+                if isinstance(arg, SSAValue) and arg.id in bindings:
                     new_iter_args.append(self._resolve_ssa_binding(arg, bindings))
                 else:
                     new_iter_args.append(arg)
-            new_yields = [self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.yields]
+            new_yields = [
+                self._resolve_ssa_binding(y, bindings) if isinstance(y, SSAValue) and y.id in bindings else y
+                for y in stmt.yields
+            ]
             return ForLoop(
                 counter=stmt.counter,
                 start=stmt.start if not isinstance(stmt.start, SSAValue) or stmt.start.id not in bindings
@@ -132,12 +150,17 @@ class LoopUnrollPass(Pass):
             )
 
         elif isinstance(stmt, If):
-            new_cond = self._resolve_ssa_binding(stmt.cond, bindings) if stmt.cond.id in bindings else stmt.cond
+            if isinstance(stmt.cond, SSAValue) and stmt.cond.id in bindings:
+                new_cond = self._resolve_ssa_binding(stmt.cond, bindings)
+            else:
+                new_cond = stmt.cond
             new_then_yields = [
-                self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.then_yields
+                self._resolve_ssa_binding(y, bindings) if isinstance(y, SSAValue) and y.id in bindings else y
+                for y in stmt.then_yields
             ]
             new_else_yields = [
-                self._resolve_ssa_binding(y, bindings) if y.id in bindings else y for y in stmt.else_yields
+                self._resolve_ssa_binding(y, bindings) if isinstance(y, SSAValue) and y.id in bindings else y
+                for y in stmt.else_yields
             ]
             return If(
                 cond=new_cond,
@@ -269,13 +292,11 @@ class LoopUnrollPass(Pass):
 
             # Map counter to constant
             counter_value = loop.start.value + i
-            counter_ssa = ctx.new_ssa(f"unroll_i{i}")
-            result.append(Op("const", counter_ssa, [Const(counter_value)], "load"))
-            remap[loop.counter.id] = counter_ssa
+            remap[self._remap_key(loop.counter)] = Const(counter_value)
 
             # Map body_params to current values
             for param, current in zip(loop.body_params, current_params):
-                remap[param.id] = current
+                remap[self._remap_key(param)] = current
 
             # Clone body with remapping (no recursion since body is already transformed)
             cloned_body, new_yields = self._clone_body_no_recurse(
@@ -328,11 +349,11 @@ class LoopUnrollPass(Pass):
                 # factor == 1, just add start
                 unrolled_body.append(Op("+", counter_ssa, [new_counter, Const(loop.start.value)], "alu"))
 
-            remap[loop.counter.id] = counter_ssa
+            remap[self._remap_key(loop.counter)] = counter_ssa
 
             # Map body_params to current values
             for param, current in zip(loop.body_params, current_params):
-                remap[param.id] = current
+                remap[self._remap_key(param)] = current
 
             # Clone body with remapping (no recursion since body is already transformed)
             cloned_body, new_yields = self._clone_body_no_recurse(
@@ -362,10 +383,10 @@ class LoopUnrollPass(Pass):
     def _clone_body_no_recurse(
         self,
         body: list[Statement],
-        yields: list[SSAValue],
-        remap: dict[int, Operand],
+        yields: list[Operand],
+        remap: dict,
         ctx: SSARenumberContext
-    ) -> tuple[list[Statement], list[SSAValue]]:
+    ) -> tuple[list[Statement], list[Operand]]:
         """Clone a body of statements without recursing into nested structures.
 
         This does not call _unroll_loop on nested ForLoops because the body is
@@ -375,33 +396,25 @@ class LoopUnrollPass(Pass):
         for stmt in body:
             cloned.extend(self._clone_stmt_no_recurse(stmt, remap, ctx))
 
-        # Remap yields
         new_yields = [self._remap_operand(y, remap) for y in yields]
-        # Ensure yields are SSAValue (not Const)
-        final_yields = []
-        for y in new_yields:
-            if isinstance(y, SSAValue):
-                final_yields.append(y)
-            else:
-                # Const yield - need to create SSA for it
-                ssa = ctx.new_ssa("yield_const")
-                cloned.append(Op("const", ssa, [y], "load"))
-                final_yields.append(ssa)
-
-        return cloned, final_yields
+        return cloned, new_yields
 
     def _clone_stmt_no_recurse(
         self,
         stmt: Statement,
-        remap: dict[int, Operand],
+        remap: dict,
         ctx: SSARenumberContext
     ) -> list[Statement]:
         """Clone a single statement without recursing into nested loop unrolling."""
         if isinstance(stmt, Op):
             new_operands = [self._remap_operand(op, remap) for op in stmt.operands]
             if stmt.result:
-                new_result = ctx.new_ssa(stmt.result.name)
-                remap[stmt.result.id] = new_result
+                if isinstance(stmt.result, VectorSSAValue):
+                    new_result = ctx.new_vec_ssa(stmt.result.name)
+                    remap[self._remap_key(stmt.result)] = new_result
+                else:
+                    new_result = ctx.new_ssa(stmt.result.name)
+                    remap[self._remap_key(stmt.result)] = new_result
             else:
                 new_result = None
             return [Op(stmt.opcode, new_result, new_operands, stmt.engine)]
@@ -413,23 +426,13 @@ class LoopUnrollPass(Pass):
             new_results = [ctx.new_ssa(r.name) for r in stmt.results]
 
             # Remap iter_args
-            new_iter_args = []
-            prefix = []
-            for arg in stmt.iter_args:
-                remapped = self._remap_operand(arg, remap)
-                if isinstance(remapped, SSAValue):
-                    new_iter_args.append(remapped)
-                else:
-                    # Create SSA for constant
-                    ssa = ctx.new_ssa("iter_arg_const")
-                    prefix.append(Op("const", ssa, [remapped], "load"))
-                    new_iter_args.append(ssa)
+            new_iter_args = [self._remap_operand(arg, remap) for arg in stmt.iter_args]
 
             # Build inner remap for the loop body
             inner_remap = dict(remap)
-            inner_remap[stmt.counter.id] = new_counter
+            inner_remap[self._remap_key(stmt.counter)] = new_counter
             for old_param, new_param in zip(stmt.body_params, new_body_params):
-                inner_remap[old_param.id] = new_param
+                inner_remap[self._remap_key(old_param)] = new_param
 
             # Clone body (no recurse into unroll)
             cloned_body = []
@@ -437,15 +440,7 @@ class LoopUnrollPass(Pass):
                 cloned_body.extend(self._clone_stmt_no_recurse(s, inner_remap, ctx))
 
             # Remap yields
-            new_yields = []
-            for y in stmt.yields:
-                remapped = self._remap_operand(y, inner_remap)
-                if isinstance(remapped, SSAValue):
-                    new_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("yield_const")
-                    cloned_body.append(Op("const", ssa, [remapped], "load"))
-                    new_yields.append(ssa)
+            new_yields = [self._remap_operand(y, inner_remap) for y in stmt.yields]
 
             # Remap start/end
             new_start = self._remap_operand(stmt.start, remap) if isinstance(stmt.start, SSAValue) else stmt.start
@@ -465,19 +460,13 @@ class LoopUnrollPass(Pass):
 
             # Map old results to new results
             for old_res, new_res in zip(stmt.results, new_results):
-                remap[old_res.id] = new_res
+                remap[self._remap_key(old_res)] = new_res
 
-            return prefix + [new_loop]
+            return [new_loop]
 
         elif isinstance(stmt, If):
             # Clone If statement
             new_cond = self._remap_operand(stmt.cond, remap)
-            cond_prefix = []
-            if not isinstance(new_cond, SSAValue):
-                # Create SSA for constant condition (unusual but handle it)
-                cond_ssa = ctx.new_ssa("cond_const")
-                cond_prefix.append(Op("const", cond_ssa, [new_cond], "load"))
-                new_cond = cond_ssa
 
             # Clone branches
             then_remap = dict(remap)
@@ -491,32 +480,16 @@ class LoopUnrollPass(Pass):
                 cloned_else.extend(self._clone_stmt_no_recurse(s, else_remap, ctx))
 
             # Remap yields
-            new_then_yields = []
-            for y in stmt.then_yields:
-                remapped = self._remap_operand(y, then_remap)
-                if isinstance(remapped, SSAValue):
-                    new_then_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("then_yield_const")
-                    cloned_then.append(Op("const", ssa, [remapped], "load"))
-                    new_then_yields.append(ssa)
+            new_then_yields = [self._remap_operand(y, then_remap) for y in stmt.then_yields]
 
-            new_else_yields = []
-            for y in stmt.else_yields:
-                remapped = self._remap_operand(y, else_remap)
-                if isinstance(remapped, SSAValue):
-                    new_else_yields.append(remapped)
-                else:
-                    ssa = ctx.new_ssa("else_yield_const")
-                    cloned_else.append(Op("const", ssa, [remapped], "load"))
-                    new_else_yields.append(ssa)
+            new_else_yields = [self._remap_operand(y, else_remap) for y in stmt.else_yields]
 
             # New results
             new_results = [ctx.new_ssa(r.name) for r in stmt.results]
             for old_res, new_res in zip(stmt.results, new_results):
-                remap[old_res.id] = new_res
+                remap[self._remap_key(old_res)] = new_res
 
-            return cond_prefix + [If(
+            return [If(
                 cond=new_cond,
                 then_body=cloned_then,
                 then_yields=new_then_yields,
@@ -534,10 +507,19 @@ class LoopUnrollPass(Pass):
         else:
             return [stmt]
 
-    def _remap_operand(self, op: Operand, remap: dict[int, Operand]) -> Operand:
-        """Remap an operand using the SSA remapping."""
+    def _remap_key(self, op: Operand) -> object:
+        """Build a remap key for scalar or vector SSA values."""
+        if isinstance(op, VectorSSAValue):
+            return ("vec", op.id)
         if isinstance(op, SSAValue):
-            if op.id in remap:
-                return remap[op.id]
+            return op.id
+        return None
+
+    def _remap_operand(self, op: Operand, remap: dict) -> Operand:
+        """Remap an operand using the SSA remapping."""
+        if isinstance(op, (SSAValue, VectorSSAValue)):
+            key = self._remap_key(op)
+            if key in remap:
+                return remap[key]
             return op
         return op  # Const stays as-is

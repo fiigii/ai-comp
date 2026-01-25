@@ -90,10 +90,10 @@ class ForLoop:
     counter: SSAValue
     start: Operand
     end: Operand
-    iter_args: list[SSAValue]
+    iter_args: list[Operand]
     body_params: list[SSAValue]
     body: list  # list[Statement]
-    yields: list[SSAValue]
+    yields: list[Operand]
     results: list[SSAValue]
     pragma_unroll: int = 1  # 0=full, 1=disabled (default), N>1=partial
 
@@ -112,11 +112,11 @@ class If:
         else_body (yields else_vals)
     results = phi(then_vals, else_vals)
     """
-    cond: SSAValue
+    cond: Operand
     then_body: list  # list[Statement]
-    then_yields: list[SSAValue]
+    then_yields: list[Operand]
     else_body: list  # list[Statement]
-    else_yields: list[SSAValue]
+    else_yields: list[Operand]
     results: list[SSAValue]
 
     def __repr__(self):

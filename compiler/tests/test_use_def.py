@@ -13,13 +13,18 @@ from compiler import (
 from compiler.hir import ForLoop, If, Op, VectorSSAValue
 
 
+def const_ssa(builder: HIRBuilder, value: int, name=None) -> SSAValue:
+    """Materialize a constant as an SSA value using a simple add."""
+    return builder.add(Const(value), Const(0), name)
+
+
 class TestUseDefBasicOps(unittest.TestCase):
     """Test use-def chains for basic Op statements."""
 
-    def test_const_load_def(self):
-        """Test that const_load creates a definition."""
+    def test_const_ssa_def(self):
+        """Test that const_ssa creates a definition."""
         b = HIRBuilder()
-        val = b.const_load(42, "val")
+        val = const_ssa(b, 42, "val")
         b.halt()
         hir = b.build()
 
@@ -34,8 +39,8 @@ class TestUseDefBasicOps(unittest.TestCase):
     def test_op_uses_operands(self):
         """Test that operations record uses of their operands."""
         b = HIRBuilder()
-        a = b.const_load(10, "a")
-        b_val = b.const_load(20, "b")
+        a = const_ssa(b, 10, "a")
+        b_val = const_ssa(b, 20, "b")
         c = b.add(a, b_val, "c")
         b.halt()
         hir = b.build()
@@ -57,9 +62,9 @@ class TestUseDefBasicOps(unittest.TestCase):
     def test_unused_value_no_uses(self):
         """Test that unused values have no uses."""
         b = HIRBuilder()
-        used = b.const_load(10, "used")
-        unused = b.const_load(20, "unused")
-        addr = b.const_load(0, "addr")
+        used = const_ssa(b, 10, "used")
+        unused = const_ssa(b, 20, "unused")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, used)
         hir = b.build()
 
@@ -73,8 +78,8 @@ class TestUseDefBasicOps(unittest.TestCase):
     def test_store_uses(self):
         """Test that store records uses of address and value."""
         b = HIRBuilder()
-        addr = b.const_load(0, "addr")
-        val = b.const_load(42, "val")
+        addr = const_ssa(b, 0, "addr")
+        val = const_ssa(b, 42, "val")
         b.store(addr, val)
         hir = b.build()
 
@@ -92,9 +97,9 @@ class TestUseDefBasicOps(unittest.TestCase):
     def test_multiple_uses(self):
         """Test value used multiple times."""
         b = HIRBuilder()
-        x = b.const_load(5, "x")
+        x = const_ssa(b, 5, "x")
         y = b.add(x, x, "y")  # x used twice
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, y)
         hir = b.build()
 
@@ -132,7 +137,7 @@ class TestUseDefForLoop(unittest.TestCase):
     def test_loop_body_params_def(self):
         """Test that body_params are defined by the loop."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def body(i, params):
             s = params[0]
@@ -142,7 +147,7 @@ class TestUseDefForLoop(unittest.TestCase):
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        loop = hir.body[1]  # After const_load
+        loop = hir.body[1]  # After const
         self.assertIsInstance(loop, ForLoop)
 
         for param in loop.body_params:
@@ -153,7 +158,7 @@ class TestUseDefForLoop(unittest.TestCase):
     def test_loop_results_def(self):
         """Test that loop results are defined by the loop."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def body(i, params):
             s = params[0]
@@ -174,7 +179,7 @@ class TestUseDefForLoop(unittest.TestCase):
     def test_loop_iter_args_uses(self):
         """Test that iter_args are uses."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def body(i, params):
             return [params[0]]
@@ -192,7 +197,7 @@ class TestUseDefForLoop(unittest.TestCase):
     def test_loop_yields_uses(self):
         """Test that yields are uses."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def body(i, params):
             s = params[0]
@@ -215,8 +220,8 @@ class TestUseDefForLoop(unittest.TestCase):
     def test_loop_start_end_ssa_uses(self):
         """Test that SSA values in start/end are uses."""
         b = HIRBuilder()
-        start_val = b.const_load(0, "start")
-        end_val = b.const_load(10, "end")
+        start_val = const_ssa(b, 0, "start")
+        end_val = const_ssa(b, 10, "end")
 
         def body(i, params):
             return []
@@ -242,19 +247,19 @@ class TestUseDefIf(unittest.TestCase):
     def test_if_results_def(self):
         """Test that if results are defined by the if."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
+        cond = const_ssa(b, 1, "cond")
 
         def then_fn():
-            return [b.const_load(100, "then_val")]
+            return [const_ssa(b, 100, "then_val")]
 
         def else_fn():
-            return [b.const_load(200, "else_val")]
+            return [const_ssa(b, 200, "else_val")]
 
         results = b.if_stmt(cond, then_fn, else_fn)
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        if_stmt = hir.body[1]  # After const_load for cond
+        if_stmt = hir.body[1]  # After const for cond
         self.assertIsInstance(if_stmt, If)
 
         for result in if_stmt.results:
@@ -265,7 +270,7 @@ class TestUseDefIf(unittest.TestCase):
     def test_if_cond_use(self):
         """Test that condition is a use."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
+        cond = const_ssa(b, 1, "cond")
 
         def then_fn():
             return []
@@ -285,14 +290,14 @@ class TestUseDefIf(unittest.TestCase):
     def test_if_yields_uses(self):
         """Test that then_yields and else_yields are uses."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
+        cond = const_ssa(b, 1, "cond")
 
         def then_fn():
-            then_val = b.const_load(100, "then_val")
+            then_val = const_ssa(b, 100, "then_val")
             return [then_val]
 
         def else_fn():
-            else_val = b.const_load(200, "else_val")
+            else_val = const_ssa(b, 200, "else_val")
             return [else_val]
 
         results = b.if_stmt(cond, then_fn, else_fn)
@@ -321,7 +326,7 @@ class TestUseDefNested(unittest.TestCase):
     def test_nested_loop_in_loop(self):
         """Test nested loops."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def outer_body(i, outer_params):
             outer_s = outer_params[0]
@@ -337,7 +342,7 @@ class TestUseDefNested(unittest.TestCase):
             return [inner_results[0]]
 
         results = b.for_loop(start=Const(0), end=Const(2), iter_args=[init], body_fn=outer_body)
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, results[0])
         hir = b.build()
 
@@ -349,10 +354,10 @@ class TestUseDefNested(unittest.TestCase):
     def test_loop_in_if(self):
         """Test loop inside if branch."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
+        cond = const_ssa(b, 1, "cond")
 
         def then_fn():
-            init = b.const_load(0, "init")
+            init = const_ssa(b, 0, "init")
 
             def body(i, params):
                 return [b.add(params[0], i, "sum")]
@@ -361,10 +366,10 @@ class TestUseDefNested(unittest.TestCase):
             return [results[0]]
 
         def else_fn():
-            return [b.const_load(999, "else_val")]
+            return [const_ssa(b, 999, "else_val")]
 
         results = b.if_stmt(cond, then_fn, else_fn)
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, results[0])
         hir = b.build()
 
@@ -376,7 +381,7 @@ class TestUseDefNested(unittest.TestCase):
     def test_if_in_loop(self):
         """Test if inside loop body."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
+        init = const_ssa(b, 0, "init")
 
         def body(i, params):
             s = params[0]
@@ -393,7 +398,7 @@ class TestUseDefNested(unittest.TestCase):
             return [if_results[0]]
 
         results = b.for_loop(start=Const(0), end=Const(5), iter_args=[init], body_fn=body)
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, results[0])
         hir = b.build()
 
@@ -408,7 +413,7 @@ class TestUseDefParent(unittest.TestCase):
     def test_parent_tracking_basic(self):
         """Test that parent list and index are tracked correctly."""
         b = HIRBuilder()
-        a = b.const_load(10, "a")
+        a = const_ssa(b, 10, "a")
         c = b.add(a, a, "c")
         b.halt()
         hir = b.build()
@@ -434,7 +439,7 @@ class TestUseDefParent(unittest.TestCase):
         b = HIRBuilder()
 
         def body(i, params):
-            val = b.const_load(42, "val")  # Inside loop
+            val = const_ssa(b, 42, "val")  # Inside loop
             return []
 
         b.for_loop(start=Const(0), end=Const(5), iter_args=[], body_fn=body)
@@ -444,7 +449,7 @@ class TestUseDefParent(unittest.TestCase):
         loop = hir.body[0]
         self.assertIsInstance(loop, ForLoop)
 
-        # Check that the const_load inside has the loop body as parent
+        # Check that the const inside has the loop body as parent
         inner_op = loop.body[0]
         parent_info = ctx.get_parent(inner_op)
         self.assertIsNotNone(parent_info)
@@ -459,7 +464,7 @@ class TestUseDefUpdate(unittest.TestCase):
     def test_invalidate_rebuilds(self):
         """Test that invalidate causes rebuild on next query."""
         b = HIRBuilder()
-        a = b.const_load(10, "a")
+        a = const_ssa(b, 10, "a")
         b.halt()
         hir = b.build()
 
@@ -476,12 +481,12 @@ class TestUseDefUpdate(unittest.TestCase):
     def test_rebuild_with_new_hir(self):
         """Test rebuild with new HIR."""
         b1 = HIRBuilder()
-        a1 = b1.const_load(10, "a")
+        a1 = const_ssa(b1, 10, "a")
         b1.halt()
         hir1 = b1.build()
 
         b2 = HIRBuilder()
-        a2 = b2.const_load(20, "a")
+        a2 = const_ssa(b2, 20, "a")
         b2.halt()
         hir2 = b2.build()
 
@@ -500,10 +505,10 @@ class TestUseDefUpdate(unittest.TestCase):
     def test_replace_all_uses_op_operands(self):
         """Test replacing uses in op operands."""
         b = HIRBuilder()
-        old_val = b.const_load(10, "old")
-        new_val = b.const_load(20, "new")
+        old_val = const_ssa(b, 10, "old")
+        new_val = const_ssa(b, 20, "new")
         result = b.add(old_val, old_val, "result")  # Uses old_val twice
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, result)
         hir = b.build()
 
@@ -525,8 +530,8 @@ class TestUseDefUpdate(unittest.TestCase):
     def test_replace_all_uses_loop_iter_args(self):
         """Test replacing uses in loop iter_args."""
         b = HIRBuilder()
-        old_init = b.const_load(0, "old_init")
-        new_init = b.const_load(100, "new_init")
+        old_init = const_ssa(b, 0, "old_init")
+        new_init = const_ssa(b, 100, "new_init")
 
         def body(i, params):
             return [params[0]]
@@ -538,7 +543,7 @@ class TestUseDefUpdate(unittest.TestCase):
         count = ctx.replace_all_uses(old_init, new_init)
 
         self.assertEqual(count, 1)
-        loop = hir.body[2]  # After two const_loads
+        loop = hir.body[2]  # After two consts
         self.assertIsInstance(loop, ForLoop)
         self.assertEqual(loop.iter_args[0], new_init)
 
@@ -549,7 +554,7 @@ class TestUseDefGetAllDefs(unittest.TestCase):
     def test_get_all_defs(self):
         """Test iterating over all definitions."""
         b = HIRBuilder()
-        a = b.const_load(10, "a")
+        a = const_ssa(b, 10, "a")
         c = b.add(a, a, "c")
         b.halt()
         hir = b.build()
@@ -570,7 +575,7 @@ class TestUseDefConst(unittest.TestCase):
     def test_const_not_tracked_as_use(self):
         """Test that Const operands don't appear in uses."""
         b = HIRBuilder()
-        val = b.const_load(10, "val")
+        val = const_ssa(b, 10, "val")
         result = b.add(val, Const(5), "result")  # Const(5) is an operand
         b.halt()
         hir = b.build()
@@ -588,9 +593,9 @@ class TestUseDefConst(unittest.TestCase):
     def test_replace_all_uses_with_const(self):
         """Test replacing SSA uses with a Const value."""
         b = HIRBuilder()
-        val = b.const_load(10, "val")
+        val = const_ssa(b, 10, "val")
         result = b.add(val, val, "result")  # val used twice
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         b.store(addr, result)
         hir = b.build()
 
@@ -613,8 +618,8 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
     def test_replace_in_forloop_yields(self):
         """Test replacing a value used in ForLoop yields."""
         b = HIRBuilder()
-        init = b.const_load(0, "init")
-        new_val = b.const_load(42, "new_val")
+        init = const_ssa(b, 0, "init")
+        new_val = const_ssa(b, 42, "new_val")
 
         def body(i, params):
             # The yield will use params[0] (which we want to replace)
@@ -624,7 +629,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         hir = b.build()
 
         # Find the loop and get the yield SSA
-        loop = hir.body[2]  # After two const_loads
+        loop = hir.body[2]  # After two consts
         self.assertIsInstance(loop, ForLoop)
         old_yield = loop.yields[0]
 
@@ -638,8 +643,8 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
     def test_replace_in_forloop_start(self):
         """Test replacing a value used as ForLoop start."""
         b = HIRBuilder()
-        old_start = b.const_load(0, "old_start")
-        new_start = b.const_load(5, "new_start")
+        old_start = const_ssa(b, 0, "old_start")
+        new_start = const_ssa(b, 5, "new_start")
 
         def body(i, params):
             return []
@@ -651,15 +656,15 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         count = ctx.replace_all_uses(old_start, new_start)
 
         self.assertEqual(count, 1)
-        loop = hir.body[2]  # After two const_loads
+        loop = hir.body[2]  # After two consts
         self.assertIsInstance(loop, ForLoop)
         self.assertEqual(loop.start, new_start)
 
     def test_replace_in_forloop_end(self):
         """Test replacing a value used as ForLoop end."""
         b = HIRBuilder()
-        old_end = b.const_load(10, "old_end")
-        new_end = b.const_load(20, "new_end")
+        old_end = const_ssa(b, 10, "old_end")
+        new_end = const_ssa(b, 20, "new_end")
 
         def body(i, params):
             return []
@@ -671,15 +676,15 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         count = ctx.replace_all_uses(old_end, new_end)
 
         self.assertEqual(count, 1)
-        loop = hir.body[2]  # After two const_loads
+        loop = hir.body[2]  # After two consts
         self.assertIsInstance(loop, ForLoop)
         self.assertEqual(loop.end, new_end)
 
     def test_replace_in_if_cond(self):
         """Test replacing a value used as If condition."""
         b = HIRBuilder()
-        old_cond = b.const_load(1, "old_cond")
-        new_cond = b.const_load(0, "new_cond")
+        old_cond = const_ssa(b, 1, "old_cond")
+        new_cond = const_ssa(b, 0, "new_cond")
 
         def then_fn():
             return []
@@ -694,22 +699,22 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         count = ctx.replace_all_uses(old_cond, new_cond)
 
         self.assertEqual(count, 1)
-        if_stmt = hir.body[2]  # After two const_loads
+        if_stmt = hir.body[2]  # After two consts
         self.assertIsInstance(if_stmt, If)
         self.assertEqual(if_stmt.cond, new_cond)
 
     def test_replace_in_if_then_yields(self):
         """Test replacing a value used in If then_yields."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
-        old_then_val = b.const_load(100, "old_then")
-        new_val = b.const_load(999, "new_val")
+        cond = const_ssa(b, 1, "cond")
+        old_then_val = const_ssa(b, 100, "old_then")
+        new_val = const_ssa(b, 999, "new_val")
 
         def then_fn():
             return [old_then_val]
 
         def else_fn():
-            return [b.const_load(200, "else_val")]
+            return [const_ssa(b, 200, "else_val")]
 
         results = b.if_stmt(cond, then_fn, else_fn)
         hir = b.build()
@@ -731,12 +736,12 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
     def test_replace_in_if_else_yields(self):
         """Test replacing a value used in If else_yields."""
         b = HIRBuilder()
-        cond = b.const_load(1, "cond")
-        old_else_val = b.const_load(200, "old_else")
-        new_val = b.const_load(999, "new_val")
+        cond = const_ssa(b, 1, "cond")
+        old_else_val = const_ssa(b, 200, "old_else")
+        new_val = const_ssa(b, 999, "new_val")
 
         def then_fn():
-            return [b.const_load(100, "then_val")]
+            return [const_ssa(b, 100, "then_val")]
 
         def else_fn():
             return [old_else_val]
@@ -761,7 +766,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
     def test_replace_vector_ssa_in_operand(self):
         """Test replacing VectorSSAValue used in vector op."""
         b = HIRBuilder()
-        addr = b.const_load(0, "addr")
+        addr = const_ssa(b, 0, "addr")
         v1 = b.vload(addr, "v1")  # First vector load
         v2 = b.vload(addr, "v2")  # Second vector load (to replace with)
         v3 = b.vadd(v1, v1, "v3")  # Uses v1 twice
