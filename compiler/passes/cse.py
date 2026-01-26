@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..hir import (
-    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
 from ..use_def import UseDefContext
@@ -19,11 +19,11 @@ class CSEContext:
     """Context for CSE value numbering."""
 
     # Maps value_number (tuple) -> first SSA computing it (SSAValue or VectorSSAValue)
-    expr_to_ssa: dict[tuple, SSAValue | VectorSSAValue] = field(default_factory=dict)
+    expr_to_ssa: dict[tuple, Variable] = field(default_factory=dict)
 
-    # Maps SSA key -> its value number (tuple)
-    # Key is int for SSAValue.id, or ("vec", id) for VectorSSAValue.id
-    ssa_to_value_number: dict[int | tuple, tuple] = field(default_factory=dict)
+    # Maps SSA value -> its value number (tuple)
+    # Uses SSAValue/VectorSSAValue objects directly as keys
+    ssa_to_value_number: dict[Variable, tuple] = field(default_factory=dict)
 
     # Memory epoch counter (increments on store operations)
     # Enables finer-grained load CSE: loads with same address and epoch can be merged
@@ -32,7 +32,7 @@ class CSEContext:
     # Parent context for nested scopes
     parent: Optional['CSEContext'] = None
 
-    def lookup(self, value_number: tuple) -> Optional[SSAValue | VectorSSAValue]:
+    def lookup(self, value_number: tuple) -> Optional[Variable]:
         """Look up a value number in this context or parent contexts."""
         if value_number in self.expr_to_ssa:
             return self.expr_to_ssa[value_number]
@@ -40,16 +40,12 @@ class CSEContext:
             return self.parent.lookup(value_number)
         return None
 
-    def get_value_number(self, ssa_key: int | tuple) -> Optional[tuple]:
-        """Get the value number for an SSA value from this context or parents.
-
-        Args:
-            ssa_key: int for SSAValue.id, or ("vec", id) for VectorSSAValue.id
-        """
-        if ssa_key in self.ssa_to_value_number:
-            return self.ssa_to_value_number[ssa_key]
+    def get_value_number(self, ssa: Variable) -> Optional[tuple]:
+        """Get the value number for an SSA value from this context or parents."""
+        if ssa in self.ssa_to_value_number:
+            return self.ssa_to_value_number[ssa]
         if self.parent is not None:
-            return self.parent.get_value_number(ssa_key)
+            return self.parent.get_value_number(ssa)
         return None
 
     def get_mem_epoch(self) -> int:
@@ -62,14 +58,10 @@ class CSEContext:
         """Increment memory epoch (called on store)."""
         self.mem_epoch += 1
 
-    def record(self, value_number: tuple, ssa: SSAValue | VectorSSAValue):
+    def record(self, value_number: tuple, ssa: Variable):
         """Record a new expression -> SSA mapping."""
         self.expr_to_ssa[value_number] = ssa
-        # Use tagged key for vector SSA to avoid ID collisions
-        if isinstance(ssa, VectorSSAValue):
-            self.ssa_to_value_number[("vec", ssa.id)] = value_number
-        else:
-            self.ssa_to_value_number[ssa.id] = value_number
+        self.ssa_to_value_number[ssa] = value_number
 
     def child_context(self) -> 'CSEContext':
         """Create a child context for nested scopes."""
@@ -217,7 +209,7 @@ class CSEPass(Pass):
             # Still keep the op and record its value number if possible
             if op.result is not None:
                 # Create a fresh value number based on the result SSA
-                fresh_vn = ("ssa", op.result.id)
+                fresh_vn = ("ssa", id(op.result))
                 ctx.record(fresh_vn, op.result)
             return op
 
@@ -258,7 +250,7 @@ class CSEPass(Pass):
 
         # Give body_params fresh value numbers (they're unique per iteration)
         for param in loop.body_params:
-            fresh_vn = ("loop_param", param.id)
+            fresh_vn = ("loop_param", id(param))
             child_ctx.record(fresh_vn, param)
 
         # Transform loop body
@@ -333,27 +325,19 @@ class CSEPass(Pass):
 
     def _get_operand_value_number(
         self,
-        operand: Operand,
+        operand: Value,
         ctx: CSEContext
     ) -> Optional[tuple]:
         """Get the value number for an operand."""
         if isinstance(operand, Const):
             return ("const", operand.value)
 
-        if isinstance(operand, SSAValue):
-            # Look up in context
-            vn = ctx.get_value_number(operand.id)
+        if isinstance(operand, (SSAValue, VectorSSAValue)):
+            # Look up in context using SSA object directly
+            vn = ctx.get_value_number(operand)
             if vn is not None:
                 return vn
-            # Unknown SSA - use its ID as value number
-            return ("ssa", operand.id)
-
-        if isinstance(operand, VectorSSAValue):
-            # Look up in context using tagged key
-            vn = ctx.get_value_number(("vec", operand.id))
-            if vn is not None:
-                return vn
-            # Unknown vector SSA - use its ID as value number (tagged)
-            return ("vec_ssa", operand.id)
+            # Unknown SSA - use Python object id as value number
+            return ("ssa", id(operand))
 
         return None

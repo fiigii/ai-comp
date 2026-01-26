@@ -12,7 +12,7 @@ Compilation pipeline: HIR -> LIR -> VLIW assembly
 from .hir import (
     SSAValue,
     Const,
-    Operand,
+    Value,
     Op,
     Halt,
     Pause,
@@ -57,6 +57,23 @@ from .ssa_context import SSARenumberContext
 # Use-def chain infrastructure
 from .use_def import UseDefContext, DefLocation, UseLocation
 
+# Data Dependency Graph
+from .ddg import (
+    DDGNode,
+    DataDependencyDAG,
+    BlockDDGs,
+    DDGBuilder,
+    HIRDDGBuilder,
+    LIRDDGBuilder,
+    get_dag_depth,
+    get_dag_width,
+    find_independent_nodes,
+    print_dag,
+    print_dag_tree,
+    print_block_ddgs,
+    print_dag_dot,
+)
+
 # Compilation stages
 from .lowering import lower_to_lir
 from .phi_elimination import eliminate_phis
@@ -73,7 +90,7 @@ from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass
 
 __all__ = [
     # HIR
-    'SSAValue', 'Const', 'Operand', 'Op', 'Halt', 'Pause', 'ForLoop', 'If',
+    'SSAValue', 'Const', 'Value', 'Op', 'Halt', 'Pause', 'ForLoop', 'If',
     'Statement', 'HIRFunction',
     # Builder
     'HIRBuilder',
@@ -87,6 +104,11 @@ __all__ = [
     'SSARenumberContext',
     # Use-def chain infrastructure
     'UseDefContext', 'DefLocation', 'UseLocation',
+    # Data Dependency Graph
+    'DDGNode', 'DataDependencyDAG', 'BlockDDGs', 'DDGBuilder',
+    'HIRDDGBuilder', 'LIRDDGBuilder',
+    'get_dag_depth', 'get_dag_width', 'find_independent_nodes',
+    'print_dag', 'print_dag_tree', 'print_block_ddgs', 'print_dag_dot',
     # Compilation
     'lower_to_lir', 'eliminate_phis', 'compile_to_vliw', 'compile_hir_to_vliw',
     # Printing

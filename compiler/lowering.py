@@ -10,7 +10,7 @@ from typing import Optional
 from problem import SCRATCH_SIZE
 
 from .hir import (
-    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 
 # Vector length (must match VM's VLEN)
@@ -26,8 +26,8 @@ class LoweringContext:
         self.current_block: Optional[BasicBlock] = None
         self._block_counter = 0
         self._scratch_ptr = 0
-        self._ssa_to_scratch: dict[int, int] = {}  # SSAValue.id -> scratch addr
-        self._vec_ssa_to_scratch: dict[int, int] = {}  # VectorSSAValue.id -> base scratch addr
+        # Maps SSAValue/VectorSSAValue objects directly to scratch addresses
+        self._ssa_to_scratch: dict[Variable, int] = {}
         self._const_scratch: dict[int, int] = {}   # const value -> scratch addr
         self._pending_consts: list[tuple[int, int]] = []  # (scratch_addr, value) - deferred const loads
 
@@ -49,7 +49,7 @@ class LoweringContext:
         self._scratch_ptr += 1
         # Note: Scratch overflow is checked in codegen, not here
         if ssa is not None:
-            self._ssa_to_scratch[ssa.id] = addr
+            self._ssa_to_scratch[ssa] = addr
         return addr
 
     def alloc_vector_scratch(self, vec_ssa: Optional[VectorSSAValue] = None) -> int:
@@ -60,29 +60,29 @@ class LoweringContext:
         base = self._scratch_ptr
         self._scratch_ptr += VLEN
         if vec_ssa is not None:
-            self._vec_ssa_to_scratch[vec_ssa.id] = base
+            self._ssa_to_scratch[vec_ssa] = base
         return base
 
     def get_scratch(self, ssa: SSAValue) -> int:
         """Get the scratch address for an SSA value."""
-        if ssa.id not in self._ssa_to_scratch:
+        if ssa not in self._ssa_to_scratch:
             # Allocate on demand
             self.alloc_scratch(ssa)
-        return self._ssa_to_scratch[ssa.id]
+        return self._ssa_to_scratch[ssa]
 
     def get_vector_scratch(self, vec_ssa: VectorSSAValue) -> int:
         """Get the base scratch address for a vector SSA value."""
-        if vec_ssa.id not in self._vec_ssa_to_scratch:
+        if vec_ssa not in self._ssa_to_scratch:
             # Allocate on demand
             self.alloc_vector_scratch(vec_ssa)
-        return self._vec_ssa_to_scratch[vec_ssa.id]
+        return self._ssa_to_scratch[vec_ssa]
 
     def get_vector_scratch_list(self, vec_ssa: VectorSSAValue) -> list[int]:
         """Get list of VLEN scratch addresses for a vector SSA value."""
         base = self.get_vector_scratch(vec_ssa)
         return list(range(base, base + VLEN))
 
-    def get_operand(self, op: Operand) -> int:
+    def get_operand(self, op: Value) -> int:
         """Get scratch address for an operand (SSA value or const)."""
         if isinstance(op, SSAValue):
             return self.get_scratch(op)
@@ -91,7 +91,7 @@ class LoweringContext:
         else:
             raise ValueError(f"Unknown operand type: {op}")
 
-    def get_vector_operand(self, op: Operand) -> list[int]:
+    def get_vector_operand(self, op: Value) -> list[int]:
         """Get scratch address list for a vector operand."""
         if isinstance(op, VectorSSAValue):
             return self.get_vector_scratch_list(op)
@@ -439,7 +439,7 @@ def _lower_for_loop(loop: ForLoop, ctx: LoweringContext):
 
     # Map results to param scratches (final values)
     for i, result in enumerate(loop.results):
-        ctx._ssa_to_scratch[result.id] = param_scratches[i]
+        ctx._ssa_to_scratch[result] = param_scratches[i]
 
 
 def _lower_if(if_stmt: If, ctx: LoweringContext):

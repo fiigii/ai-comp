@@ -6,7 +6,7 @@ loop unrolling.
 """
 
 from dataclasses import dataclass, field
-from .hir import SSAValue, VectorSSAValue, Operand
+from .hir import SSAValue, VectorSSAValue, Variable, Value
 
 
 @dataclass
@@ -14,8 +14,8 @@ class SSARenumberContext:
     """Track SSA value renumbering during transformations."""
     next_id: int
     next_vec_id: int
-    result_bindings: dict[int, Operand] = field(default_factory=dict)
-    vector_bindings: dict[int, VectorSSAValue] = field(default_factory=dict)
+    # Maps SSAValue/VectorSSAValue objects directly to their replacement values
+    result_bindings: dict[Variable, Value] = field(default_factory=dict)
 
     def new_ssa(self, name: str = None) -> SSAValue:
         """Create a new unique SSA value."""
@@ -29,10 +29,6 @@ class SSARenumberContext:
         self.next_vec_id += 1
         return vec
 
-    def bind_result(self, old_id: int, new_value: Operand):
+    def bind_result(self, old_ssa: Variable, new_value: Value):
         """Map old result SSA to new value (for eliminating loop after unroll)."""
-        self.result_bindings[old_id] = new_value
-
-    def bind_vector_result(self, old_id: int, new_vec: VectorSSAValue):
-        """Map old vector result to new vector value."""
-        self.vector_bindings[old_id] = new_vec
+        self.result_bindings[old_ssa] = new_value

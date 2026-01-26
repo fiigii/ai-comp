@@ -9,9 +9,9 @@ Provides efficient queries for:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, Union
+from typing import Optional, Iterator
 
-from .hir import SSAValue, VectorSSAValue, Const, Operand, Op, ForLoop, If, Halt, Pause, Statement, HIRFunction
+from .hir import SSAValue, VectorSSAValue, Variable, Const, Value, Op, ForLoop, If, Halt, Pause, Statement, HIRFunction
 
 
 @dataclass
@@ -52,11 +52,9 @@ class UseDefContext:
     hir: HIRFunction
     _built: bool = field(default=False, repr=False)
 
-    # Mappings (built lazily)
-    _defs: dict[int, DefLocation] = field(default_factory=dict, repr=False)
-    _vec_defs: dict[int, DefLocation] = field(default_factory=dict, repr=False)
-    _uses: dict[int, list[UseLocation]] = field(default_factory=dict, repr=False)
-    _vec_uses: dict[int, list[UseLocation]] = field(default_factory=dict, repr=False)
+    # Mappings (built lazily) - use SSAValue/VectorSSAValue objects directly as keys
+    _defs: dict[Variable, DefLocation] = field(default_factory=dict, repr=False)
+    _uses: dict[Variable, list[UseLocation]] = field(default_factory=dict, repr=False)
     _parents: dict[int, tuple[list[Statement], int]] = field(default_factory=dict, repr=False)
 
     def _ensure_built(self) -> None:
@@ -67,9 +65,7 @@ class UseDefContext:
     def _build(self) -> None:
         """Build all use-def chain mappings."""
         self._defs.clear()
-        self._vec_defs.clear()
         self._uses.clear()
-        self._vec_uses.clear()
         self._parents.clear()
         self._traverse(self.hir.body)
         self._built = True
@@ -86,32 +82,21 @@ class UseDefContext:
                 self._process_if(stmt, body)
             # Halt and Pause don't define or use SSA values
 
-    def _add_def(self, ssa: Union[SSAValue, VectorSSAValue], def_loc: DefLocation) -> None:
+    def _add_def(self, ssa: Variable, def_loc: DefLocation) -> None:
         """Record a definition."""
-        if isinstance(ssa, VectorSSAValue):
-            self._vec_defs[ssa.id] = def_loc
-        else:
-            self._defs[ssa.id] = def_loc
+        self._defs[ssa] = def_loc
 
-    def _add_use(self, ssa: Union[SSAValue, VectorSSAValue], use_loc: UseLocation) -> None:
+    def _add_use(self, ssa: Variable, use_loc: UseLocation) -> None:
         """Record a use."""
-        if isinstance(ssa, VectorSSAValue):
-            if ssa.id not in self._vec_uses:
-                self._vec_uses[ssa.id] = []
-            self._vec_uses[ssa.id].append(use_loc)
-        else:
-            if ssa.id not in self._uses:
-                self._uses[ssa.id] = []
-            self._uses[ssa.id].append(use_loc)
+        if ssa not in self._uses:
+            self._uses[ssa] = []
+        self._uses[ssa].append(use_loc)
 
     def _process_op(self, op: Op, parent_list: list[Statement]) -> None:
         """Process an Op statement for definitions and uses."""
         # Definition: op.result (if not None)
         if op.result is not None:
-            if isinstance(op.result, VectorSSAValue):
-                self._add_def(op.result, DefLocation(op, "result", parent_list))
-            else:
-                self._add_def(op.result, DefLocation(op, "result", parent_list))
+            self._add_def(op.result, DefLocation(op, "result", parent_list))
 
         # Uses: each operand (skip Const values)
         for idx, operand in enumerate(op.operands):
@@ -180,74 +165,37 @@ class UseDefContext:
 
     # ==================== Query API ====================
 
-    def get_def(self, ssa: Union[SSAValue, VectorSSAValue]) -> Optional[DefLocation]:
+    def get_def(self, ssa: Variable) -> Optional[DefLocation]:
         """Get the DefLocation for an SSA value."""
         self._ensure_built()
-        if isinstance(ssa, VectorSSAValue):
-            return self._vec_defs.get(ssa.id)
-        return self._defs.get(ssa.id)
+        return self._defs.get(ssa)
 
-    def get_uses(self, ssa: Union[SSAValue, VectorSSAValue]) -> list[UseLocation]:
+    def get_uses(self, ssa: Variable) -> list[UseLocation]:
         """Get list of UseLocation for an SSA value."""
         self._ensure_built()
-        if isinstance(ssa, VectorSSAValue):
-            return self._vec_uses.get(ssa.id, [])
-        return self._uses.get(ssa.id, [])
+        return self._uses.get(ssa, [])
 
-    def has_uses(self, ssa: Union[SSAValue, VectorSSAValue]) -> bool:
+    def has_uses(self, ssa: Variable) -> bool:
         """Check if SSA value has any uses."""
         self._ensure_built()
-        if isinstance(ssa, VectorSSAValue):
-            return ssa.id in self._vec_uses and len(self._vec_uses[ssa.id]) > 0
-        return ssa.id in self._uses and len(self._uses[ssa.id]) > 0
+        return ssa in self._uses and len(self._uses[ssa]) > 0
 
-    def use_count(self, ssa: Union[SSAValue, VectorSSAValue]) -> int:
+    def use_count(self, ssa: Variable) -> int:
         """Get number of uses of an SSA value."""
         self._ensure_built()
-        if isinstance(ssa, VectorSSAValue):
-            return len(self._vec_uses.get(ssa.id, []))
-        return len(self._uses.get(ssa.id, []))
+        return len(self._uses.get(ssa, []))
 
     def get_parent(self, stmt: Statement) -> Optional[tuple[list[Statement], int]]:
         """Get (parent_list, index) for a statement."""
         self._ensure_built()
         return self._parents.get(id(stmt))
 
-    def get_all_defs(self) -> Iterator[tuple[Union[SSAValue, VectorSSAValue], DefLocation]]:
+    def get_all_defs(self) -> Iterator[tuple[Variable, DefLocation]]:
         """Iterate over all definitions."""
         self._ensure_built()
-        for ssa_id, def_loc in self._defs.items():
-            # Reconstruct the SSAValue from the definition
-            if def_loc.def_kind == "result":
-                assert isinstance(def_loc.statement, Op)
-                yield def_loc.statement.result, def_loc
-            elif def_loc.def_kind == "counter":
-                assert isinstance(def_loc.statement, ForLoop)
-                yield def_loc.statement.counter, def_loc
-            elif def_loc.def_kind == "body_param":
-                assert isinstance(def_loc.statement, ForLoop)
-                for param in def_loc.statement.body_params:
-                    if param.id == ssa_id:
-                        yield param, def_loc
-                        break
-            elif def_loc.def_kind == "loop_result":
-                assert isinstance(def_loc.statement, ForLoop)
-                for result in def_loc.statement.results:
-                    if result.id == ssa_id:
-                        yield result, def_loc
-                        break
-            elif def_loc.def_kind == "if_result":
-                assert isinstance(def_loc.statement, If)
-                for result in def_loc.statement.results:
-                    if result.id == ssa_id:
-                        yield result, def_loc
-                        break
-
-        # Also yield vector definitions
-        for ssa_id, def_loc in self._vec_defs.items():
-            if def_loc.def_kind == "result":
-                assert isinstance(def_loc.statement, Op)
-                yield def_loc.statement.result, def_loc
+        # SSAValue/VectorSSAValue objects are used directly as keys
+        for ssa, def_loc in self._defs.items():
+            yield ssa, def_loc
 
     # ==================== Update API ====================
 
@@ -262,18 +210,15 @@ class UseDefContext:
         self._built = False
         self._ensure_built()
 
-    def add_use(self, ssa: Union[SSAValue, VectorSSAValue], use_loc: UseLocation) -> None:
+    def add_use(self, ssa: Variable, use_loc: UseLocation) -> None:
         """Incrementally add a use."""
         self._ensure_built()
         self._add_use(ssa, use_loc)
 
-    def remove_use(self, ssa: Union[SSAValue, VectorSSAValue], use_loc: UseLocation) -> None:
+    def remove_use(self, ssa: Variable, use_loc: UseLocation) -> None:
         """Incrementally remove a use."""
         self._ensure_built()
-        if isinstance(ssa, VectorSSAValue):
-            uses = self._vec_uses.get(ssa.id, [])
-        else:
-            uses = self._uses.get(ssa.id, [])
+        uses = self._uses.get(ssa, [])
 
         # Find and remove the matching use
         for i, u in enumerate(uses):
@@ -281,8 +226,8 @@ class UseDefContext:
                 uses.pop(i)
                 return
 
-    def replace_all_uses(self, old_ssa: Union[SSAValue, VectorSSAValue],
-                         new_value: Operand) -> int:
+    def replace_all_uses(self, old_ssa: Variable,
+                         new_value: Value) -> int:
         """
         Replace all uses of old_ssa with new_value.
 
