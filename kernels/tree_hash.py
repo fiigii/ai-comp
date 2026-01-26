@@ -16,6 +16,7 @@ def build_tree_hash_kernel(
     rounds: int,
     print_after_all: bool = False,
     print_metrics: bool = False,
+    print_ddg_after_all: bool = False,
 ) -> tuple[list[dict], dict]:
     """
     Build IR-based tree hash kernel.
@@ -36,6 +37,7 @@ def build_tree_hash_kernel(
         rounds: Number of rounds to process
         print_after_all: If True, print IR after each compilation pass
         print_metrics: If True, print pass metrics and diagnostics
+        print_ddg_after_all: If True, print DDGs after each compilation pass
 
     Returns:
         Tuple of (instructions, debug_info) where:
@@ -150,7 +152,8 @@ def build_tree_hash_kernel(
     instrs = compile_hir_to_vliw(
         hir,
         print_after_all=print_after_all,
-        print_metrics=print_metrics
+        print_metrics=print_metrics,
+        print_ddg_after_all=print_ddg_after_all
     )
 
     # Debug info is empty for IR-compiled kernel

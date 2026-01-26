@@ -272,6 +272,7 @@ class CompilerPipeline:
     config: dict[str, PassConfig] = field(default_factory=dict)
     print_after_all: bool = False
     print_metrics: bool = False
+    print_ddg_after_all: bool = False
 
     def add_pass(self, p: CompilerPass) -> None:
         """Register a pass in the pipeline."""
@@ -362,6 +363,68 @@ class CompilerPipeline:
                 for msg in metrics.messages:
                     print(f"  - {msg}")
 
+    def _print_ddg(self, state: dict, pass_name: str):
+        """Print DDGs after a pass."""
+        if state["type"] == "hir":
+            self._print_hir_ddg(state["ir"], pass_name)
+        elif state["type"] == "lir":
+            self._print_lir_ddg(state["ir"], pass_name)
+        # VLIW doesn't have DDG
+
+    def _print_hir_ddg(self, hir: HIRFunction, pass_name: str):
+        """Print DDG for HIR (flat ops from body)."""
+        from .hir import Op
+        from .ddg import HIRDDGBuilder, print_dag_tree
+
+        def extract_ops(stmts):
+            ops = []
+            for stmt in stmts:
+                if isinstance(stmt, Op):
+                    ops.append(stmt)
+                elif isinstance(stmt, ForLoop):
+                    ops.extend(extract_ops(stmt.body))
+                elif isinstance(stmt, If):
+                    ops.extend(extract_ops(stmt.then_body))
+                    ops.extend(extract_ops(stmt.else_body))
+            return ops
+
+        ops = extract_ops(hir.body)
+        if not ops:
+            return
+
+        builder = HIRDDGBuilder()
+        ddgs = builder.build(ops)
+
+        print("-" * 60)
+        print(f"After DDG-{pass_name}:")
+        print("-" * 60)
+        print(f"HIR body: {len(ops)} ops, {len(ddgs.dags)} DAGs")
+        for i, dag in enumerate(ddgs.dags):
+            print(f"\n--- DAG {i} (root: {dag.root.instruction.opcode}) ---")
+            print(print_dag_tree(dag))
+
+    def _print_lir_ddg(self, lir: LIRFunction, pass_name: str):
+        """Print DDG for each LIR basic block."""
+        from .ddg import LIRDDGBuilder, print_dag_tree
+
+        builder = LIRDDGBuilder()
+
+        print("-" * 60)
+        print(f"After DDG-{pass_name}:")
+        print("-" * 60)
+
+        for block_name, block in lir.blocks.items():
+            if not block.instructions:
+                continue
+            ddgs = builder.build(block.instructions)
+            print(f"\nBlock {block_name}: {len(block.instructions)} insts, {len(ddgs.dags)} DAGs")
+            for i, dag in enumerate(ddgs.dags):
+                print(f"\n  --- DAG {i} (root: {dag.root.instruction.opcode}) ---")
+                # Indent tree output
+                tree = print_dag_tree(dag)
+                for line in tree.split('\n'):
+                    print(f"    {line}")
+
     def run(self, hir: HIRFunction) -> list[dict]:
         """
         Run the full compilation pipeline.
@@ -438,6 +501,10 @@ class CompilerPipeline:
 
             # Update state
             state = {"type": p.output_type, "ir": result}
+
+            # Print DDG after pass if requested
+            if self.print_ddg_after_all:
+                self._print_ddg(state, p.name)
 
         if self.print_after_all:
             print("=" * 60)

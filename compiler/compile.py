@@ -16,7 +16,8 @@ from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass
 def compile_hir_to_vliw(
     hir: HIRFunction,
     print_after_all: bool = False,
-    print_metrics: bool = False
+    print_metrics: bool = False,
+    print_ddg_after_all: bool = False
 ) -> list[dict]:
     """
     Full compilation from HIR to VLIW with optional debug printing.
@@ -25,6 +26,7 @@ def compile_hir_to_vliw(
         hir: The HIR function to compile
         print_after_all: If True, print IR after each compilation phase
         print_metrics: If True, print pass metrics and diagnostics
+        print_ddg_after_all: If True, print DDGs after each compilation pass
 
     Returns:
         List of VLIW instruction bundles
@@ -37,7 +39,8 @@ def compile_hir_to_vliw(
     # Create pipeline with all passes in order
     pipeline = CompilerPipeline(
         print_after_all=print_after_all,
-        print_metrics=print_metrics
+        print_metrics=print_metrics,
+        print_ddg_after_all=print_ddg_after_all
     )
     pipeline.set_config(config_data)
 
