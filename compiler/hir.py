@@ -33,6 +33,10 @@ class VectorSSAValue:
         return f"vec{self.id}"
 
 
+# Type alias for any SSA value (scalar or vector)
+Variable = Union[SSAValue, VectorSSAValue]
+
+
 @dataclass(frozen=True)
 class Const:
     """A compile-time constant."""
@@ -42,8 +46,8 @@ class Const:
         return f"#{self.value}"
 
 
-# Type alias for operands (VectorSSAValue is also a valid operand for vector ops)
-Operand = Union[SSAValue, VectorSSAValue, Const]
+# Type alias for any value (SSA value or constant)
+Value = Union[SSAValue, VectorSSAValue, Const]
 
 
 @dataclass
@@ -51,7 +55,7 @@ class Op:
     """Single SSA operation: result = opcode(operands)"""
     opcode: str                      # "+", "load", "store", "select", etc.
     result: Optional[SSAValue]       # None for store/side-effects
-    operands: list[Operand]
+    operands: list[Value]
     engine: str                      # alu/valu/load/store/flow
 
     def __repr__(self):
@@ -88,12 +92,12 @@ class ForLoop:
     pragma_unroll: Unroll pragma (0=full, 1=disabled, N>1=partial by factor N)
     """
     counter: SSAValue
-    start: Operand
-    end: Operand
-    iter_args: list[Operand]
+    start: Value
+    end: Value
+    iter_args: list[Value]
     body_params: list[SSAValue]
     body: list  # list[Statement]
-    yields: list[Operand]
+    yields: list[Value]
     results: list[SSAValue]
     pragma_unroll: int = 1  # 0=full, 1=disabled (default), N>1=partial
 
@@ -112,11 +116,11 @@ class If:
         else_body (yields else_vals)
     results = phi(then_vals, else_vals)
     """
-    cond: Operand
+    cond: Value
     then_body: list  # list[Statement]
-    then_yields: list[Operand]
+    then_yields: list[Value]
     else_body: list  # list[Statement]
-    else_yields: list[Operand]
+    else_yields: list[Value]
     results: list[SSAValue]
 
     def __repr__(self):

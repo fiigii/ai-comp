@@ -7,7 +7,7 @@ Performs constant folding and algebraic identity simplifications on HIR.
 from typing import Optional
 
 from ..hir import (
-    SSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
 from ..use_def import UseDefContext
@@ -50,11 +50,11 @@ class SimplifyPass(Pass):
         self._strength_reductions = 0
         self._select_optimizations = 0
         self._parity_patterns = 0
-        # SSA ids known to be boolean (0 or 1) - from comparisons or & 1
-        self._boolean_values: set[int] = set()
-        # Maps SSA id -> the SSA id it's negated from (for ==(x, 0) where x is boolean)
+        # SSA values known to be boolean (0 or 1) - from comparisons or & 1
+        self._boolean_values: set[SSAValue] = set()
+        # Maps SSA value -> the SSA value it's negated from (for ==(x, 0) where x is boolean)
         # If _negated_boolean[a] = b, then a = (1 - b) = !b
-        self._negated_boolean: dict[int, int] = {}
+        self._negated_boolean: dict[SSAValue, SSAValue] = {}
         # Feature options (set in run())
         self._opts: dict[str, bool] = {}
         # Use-def context for efficient replacements
@@ -165,47 +165,47 @@ class SimplifyPass(Pass):
                 return None
             # Track boolean status if the simplified op produces a boolean
             if simplified.opcode in ("<", "=="):
-                self._boolean_values.add(op.result.id)
+                self._boolean_values.add(op.result)
             elif simplified.opcode == "&" and len(simplified.operands) == 2:
                 # Check if this is & 1
                 r_val = self._get_const_value(simplified.operands[1])
                 if r_val == 1:
-                    self._boolean_values.add(op.result.id)
+                    self._boolean_values.add(op.result)
             return simplified
 
         # Track boolean values from comparisons
         if op.opcode in ("<", "=="):
-            self._boolean_values.add(op.result.id)
+            self._boolean_values.add(op.result)
             # Track negated booleans: ==(x, 0) where x is boolean -> result is !x
             if op.opcode == "==":
                 right_val = self._get_const_value(right)
                 if right_val == 0 and self._is_boolean(left):
                     if isinstance(left, SSAValue):
-                        self._negated_boolean[op.result.id] = left.id
+                        self._negated_boolean[op.result] = left
 
         # Track & 1 as producing boolean
         if op.opcode == "&":
             right_val = self._get_const_value(right)
             if right_val == 1:
-                self._boolean_values.add(op.result.id)
+                self._boolean_values.add(op.result)
 
         return op
 
-    def _get_const_value(self, operand: Operand) -> Optional[int]:
+    def _get_const_value(self, operand: Value) -> Optional[int]:
         """Get constant value if operand is a known constant."""
         if isinstance(operand, Const):
             return operand.value
         return None
 
-    def _is_boolean(self, operand: Operand) -> bool:
+    def _is_boolean(self, operand: Value) -> bool:
         """Check if operand is known to be boolean (0 or 1)."""
         if isinstance(operand, Const):
             return operand.value in (0, 1)
         if isinstance(operand, SSAValue):
-            return operand.id in self._boolean_values
+            return operand in self._boolean_values
         return False
 
-    def _try_constant_fold(self, opcode: str, left: Operand, right: Operand) -> Optional[int]:
+    def _try_constant_fold(self, opcode: str, left: Value, right: Value) -> Optional[int]:
         """Try to fold two constants. Returns result value or None."""
         if opcode not in FOLDABLE_OPS:
             return None
@@ -226,8 +226,8 @@ class SimplifyPass(Pass):
     def _try_simplify_identity(
         self,
         opcode: str,
-        left: Operand,
-        right: Operand,
+        left: Value,
+        right: Value,
         result: SSAValue
     ) -> tuple[Optional[Op], Optional[str]]:
         """Try to simplify using algebraic identities.
@@ -302,7 +302,7 @@ class SimplifyPass(Pass):
             # Strength reduction: % 2 -> & 1
             if opcode == "%" and right_is_const and right_val == 2:
                 # The result of & 1 is boolean (0 or 1)
-                self._boolean_values.add(result.id)
+                self._boolean_values.add(result)
                 return Op("&", result, [left, Const(1)], "alu"), "strength"
 
             # Strength reduction: * 2 -> << 1, * power_of_2 -> << log2(n)
@@ -328,11 +328,10 @@ class SimplifyPass(Pass):
         # Check parity pattern first as it's more specific
         if self._opts.get("parity_pattern", True):
             if true_const == 1 and false_const == 2:
-                if isinstance(cond, SSAValue) and cond.id in self._negated_boolean:
+                if isinstance(cond, SSAValue) and cond in self._negated_boolean:
                     # cond is ==(lsb, 0), so cond=1 when lsb=0, cond=0 when lsb=1
                     # select(cond, 1, 2) = 1 when lsb=0, 2 when lsb=1 = lsb + 1
-                    lsb_id = self._negated_boolean[cond.id]
-                    lsb = SSAValue(lsb_id)
+                    lsb = self._negated_boolean[cond]
                     self._parity_patterns += 1
                     return Op("+", result, [lsb, Const(1)], "alu")
 

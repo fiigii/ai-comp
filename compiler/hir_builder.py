@@ -7,7 +7,7 @@ Provides a builder API for constructing HIR in SSA form.
 from typing import Optional, Callable
 
 from .hir import (
-    SSAValue, VectorSSAValue, Const, Operand, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 
 
@@ -43,63 +43,63 @@ class HIRBuilder:
 
     # === ALU operations ===
 
-    def alu(self, op: str, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def alu(self, op: str, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         """Emit a binary ALU operation."""
         result = self._new_ssa(name)
         self._emit(Op(op, result, [a, b], "alu"))
         return result
 
-    def add(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def add(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("+", a, b, name)
 
-    def sub(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def sub(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("-", a, b, name)
 
-    def mul(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def mul(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("*", a, b, name)
 
-    def div(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def div(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("//", a, b, name)
 
-    def mod(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def mod(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("%", a, b, name)
 
-    def xor(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def xor(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("^", a, b, name)
 
-    def and_(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def and_(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("&", a, b, name)
 
-    def or_(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def or_(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("|", a, b, name)
 
-    def shl(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def shl(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("<<", a, b, name)
 
-    def shr(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def shr(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu(">>", a, b, name)
 
-    def lt(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def lt(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("<", a, b, name)
 
-    def eq(self, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def eq(self, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         return self.alu("==", a, b, name)
 
     # === Memory operations ===
 
-    def load(self, addr: Operand, name: Optional[str] = None) -> SSAValue:
+    def load(self, addr: Value, name: Optional[str] = None) -> SSAValue:
         """Load from memory at address."""
         result = self._new_ssa(name)
         self._emit(Op("load", result, [addr], "load"))
         return result
 
-    def store(self, addr: Operand, value: Operand):
+    def store(self, addr: Value, value: Value):
         """Store value to memory at address."""
         self._emit(Op("store", None, [addr, value], "store"))
 
     # === Flow operations ===
 
-    def select(self, cond: Operand, a: Operand, b: Operand, name: Optional[str] = None) -> SSAValue:
+    def select(self, cond: Value, a: Value, b: Value, name: Optional[str] = None) -> SSAValue:
         """Conditional select: cond ? a : b"""
         result = self._new_ssa(name)
         self._emit(Op("select", result, [cond, a, b], "flow"))
@@ -149,7 +149,7 @@ class HIRBuilder:
     def veq(self, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
         return self.valu("v==", a, b, name)
 
-    def vbroadcast(self, scalar: Operand, name: Optional[str] = None) -> VectorSSAValue:
+    def vbroadcast(self, scalar: Value, name: Optional[str] = None) -> VectorSSAValue:
         """Broadcast a scalar to all VLEN lanes."""
         result = self._new_vec_ssa(name)
         self._emit(Op("vbroadcast", result, [scalar], "valu"))
@@ -162,13 +162,13 @@ class HIRBuilder:
         self._emit(Op("multiply_add", result, [a, b, c], "valu"))
         return result
 
-    def vload(self, addr: Operand, name: Optional[str] = None) -> VectorSSAValue:
+    def vload(self, addr: Value, name: Optional[str] = None) -> VectorSSAValue:
         """Load VLEN consecutive words from memory."""
         result = self._new_vec_ssa(name)
         self._emit(Op("vload", result, [addr], "load"))
         return result
 
-    def vstore(self, addr: Operand, vec: VectorSSAValue):
+    def vstore(self, addr: Value, vec: VectorSSAValue):
         """Store VLEN consecutive words to memory."""
         self._emit(Op("vstore", None, [addr, vec], "store"))
 
@@ -184,7 +184,7 @@ class HIRBuilder:
         self._emit(Op("vextract", result, [vec, Const(lane)], "alu"))
         return result
 
-    def vinsert(self, vec: VectorSSAValue, scalar: Operand, lane: int, name: Optional[str] = None) -> VectorSSAValue:
+    def vinsert(self, vec: VectorSSAValue, scalar: Value, lane: int, name: Optional[str] = None) -> VectorSSAValue:
         """Insert a scalar into a vector lane (compile-time constant lane)."""
         result = self._new_vec_ssa(name)
         self._emit(Op("vinsert", result, [vec, scalar, Const(lane)], "alu"))
@@ -194,10 +194,10 @@ class HIRBuilder:
 
     def for_loop(
         self,
-        start: Operand,
-        end: Operand,
-        iter_args: list[Operand],
-        body_fn: Callable[[SSAValue, list[SSAValue]], list[Operand]],
+        start: Value,
+        end: Value,
+        iter_args: list[Value],
+        body_fn: Callable[[SSAValue, list[SSAValue]], list[Value]],
         pragma_unroll: int = 0
     ) -> list[SSAValue]:
         """
@@ -239,9 +239,9 @@ class HIRBuilder:
 
     def if_stmt(
         self,
-        cond: Operand,
-        then_fn: Callable[[], list[Operand]],
-        else_fn: Callable[[], list[Operand]],
+        cond: Value,
+        then_fn: Callable[[], list[Value]],
+        else_fn: Callable[[], list[Value]],
     ) -> list[SSAValue]:
         """
         Build an if statement.
