@@ -19,6 +19,7 @@ from .lir_dce import LIRDCEPass
 from .phi_elimination import PhiEliminationPass
 from .codegen import LIRToVLIWPass
 from .slp import SLPVectorizationPass
+from .mad_synthesis import MADSynthesisPass
 
 __all__ = [
     'LoopUnrollPass',
@@ -32,4 +33,5 @@ __all__ = [
     'PhiEliminationPass',
     'LIRToVLIWPass',
     'SLPVectorizationPass',
+    'MADSynthesisPass',
 ]
