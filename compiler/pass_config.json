@@ -28,6 +28,10 @@
       "enabled": true,
       "options": {}
     },
+    "mad-synthesis": {
+      "enabled": true,
+      "options": {}
+    },
     "simplify-cfg": {
       "enabled": true,
       "options": {
