@@ -112,6 +112,8 @@ class SLPContext:
     # Maps cache_key(result) -> op for ops that define values in this block
     # Used to determine if a value is externally defined
     result_to_op: dict[tuple, Op] = field(default_factory=dict)
+    # Cache for address base/offset analysis (keyed by _make_cache_key(value))
+    addr_analysis_cache: dict[tuple, tuple[Optional[tuple], int]] = field(default_factory=dict)
 
     def get_node(self, op: Op) -> Optional[DDGNode[Op]]:
         """Get DDG node for an op."""
@@ -410,45 +412,56 @@ class SLPVectorizationPass(Pass):
 
         Returns (base_pattern, offset) where base_pattern is a hashable tuple.
         """
+        cache_key = _make_cache_key(addr)
+        cached = ctx.addr_analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if isinstance(addr, Const):
-            return (("const",), addr.value)
+            result = (("const",), addr.value)
+            ctx.addr_analysis_cache[cache_key] = result
+            return result
 
         if isinstance(addr, SSAValue):
-            # Look up the defining op in DDG
-            for node in ctx.all_nodes():
-                if node.instruction.result and id(node.instruction.result) == id(addr):
-                    def_op = node.instruction
+            # Prefer O(1) lookup by stable cache key, instead of scanning the DDG.
+            def_op = ctx.result_to_op.get(cache_key)
+            if def_op is not None and def_op.opcode == "+":
+                left, right = def_op.operands[0], def_op.operands[1]
 
-                    if def_op.opcode == "+":
-                        left, right = def_op.operands[0], def_op.operands[1]
+                # Check if right is a constant
+                if isinstance(right, Const):
+                    left_base, left_offset = self._analyze_address(left, ctx)
+                    if left_base is not None:
+                        result = (left_base, left_offset + right.value)
+                        ctx.addr_analysis_cache[cache_key] = result
+                        return result
 
-                        # Check if right is a constant
-                        if isinstance(right, Const):
-                            left_base, left_offset = self._analyze_address(left, ctx)
-                            if left_base is not None:
-                                return (left_base, left_offset + right.value)
+                # Check if left is a constant (commutative)
+                if isinstance(left, Const):
+                    right_base, right_offset = self._analyze_address(right, ctx)
+                    if right_base is not None:
+                        result = (right_base, right_offset + left.value)
+                        ctx.addr_analysis_cache[cache_key] = result
+                        return result
 
-                        # Check if left is a constant (commutative)
-                        if isinstance(left, Const):
-                            right_base, right_offset = self._analyze_address(right, ctx)
-                            if right_base is not None:
-                                return (right_base, right_offset + left.value)
+                # Both non-constant: combine bases
+                left_base, left_offset = self._analyze_address(left, ctx)
+                right_base, right_offset = self._analyze_address(right, ctx)
 
-                        # Both non-constant: combine bases
-                        left_base, left_offset = self._analyze_address(left, ctx)
-                        right_base, right_offset = self._analyze_address(right, ctx)
+                if left_base is not None and right_base is not None:
+                    combined_base = (left_base, right_base)
+                    result = (combined_base, left_offset + right_offset)
+                    ctx.addr_analysis_cache[cache_key] = result
+                    return result
 
-                        if left_base is not None and right_base is not None:
-                            combined_base = (left_base, right_base)
-                            return (combined_base, left_offset + right_offset)
+            # Unknown or non-add def: treat the SSA itself as the base.
+            result = (cache_key, 0)
+            ctx.addr_analysis_cache[cache_key] = result
+            return result
 
-                    # Use the op as base
-                    return ((id(def_op),), 0)
-
-            # Unknown def - use the SSA value itself as base
-            return ((id(addr),), 0)
-
-        return (None, 0)
+        result = (None, 0)
+        ctx.addr_analysis_cache[cache_key] = result
+        return result
 
     def _extend_pack_via_ddg(self, seed: Pack, ctx: SLPContext) -> None:
         """
@@ -615,6 +628,7 @@ class SLPVectorizationPass(Pass):
         - SSA defined outside this block: placed at block start (not function entry, dominance)
         """
         pack_results: dict[int, VectorSSAValue] = {}
+        op_index: dict[int, int] = {id(op): i for i, op in enumerate(original_ops)}
 
         # Check which packs can be fully vectorized
         vectorizable_packs = [p for p in packs if self._can_fully_vectorize(p, ctx, packs)]
@@ -633,17 +647,12 @@ class SLPVectorizationPass(Pass):
         last_element_to_pack: dict[int, Pack] = {}
         pack_elements: set[int] = set()
         for pack in vectorizable_packs:
-            last_idx = -1
-            last_op = None
-            for elem in pack.elements:
-                for i, op in enumerate(original_ops):
-                    if id(op) == id(elem) and i > last_idx:
-                        last_idx = i
-                        last_op = elem
-            if last_op:
-                last_element_to_pack[id(last_op)] = pack
-            for op in pack.elements:
-                pack_elements.add(id(op))
+            elem_ids = [id(elem) for elem in pack.elements]
+            pack_elements.update(elem_ids)
+
+            last_elem_id = max(elem_ids, key=lambda eid: op_index.get(eid, -1))
+            if op_index.get(last_elem_id, -1) >= 0:
+                last_element_to_pack[last_elem_id] = pack
 
         # Generate code incrementally, tracking broadcasts for later placement
         result: list[Statement] = []
@@ -692,8 +701,11 @@ class SLPVectorizationPass(Pass):
             op_id = id(op)
 
             if op_id in pack_elements:
-                if op_id in last_element_to_pack and hash(last_element_to_pack[op_id]) not in emitted_packs:
+                if op_id in last_element_to_pack:
                     pack = last_element_to_pack[op_id]
+                    pack_hash = hash(pack)
+                    if pack_hash in emitted_packs:
+                        continue
                     ctx.pending_ops.clear()
 
                     vec_op = self._generate_pack_code(pack, ctx, pack_results, hir)
@@ -704,7 +716,7 @@ class SLPVectorizationPass(Pass):
 
                         result.append(vec_op)
                         self._ops_vectorized += VLEN
-                        emitted_packs.add(hash(pack))
+                        emitted_packs.add(pack_hash)
 
                         # Emit vextracts for scalar uses
                         if pack.opcode in ("load",) + tuple(VECTORIZABLE_ALU_OPS):
@@ -727,16 +739,13 @@ class SLPVectorizationPass(Pass):
                         emit_deferred_ops()
                     else:
                         ctx.pending_ops.clear()
-                        emitted_packs.add(hash(pack))
+                        emitted_packs.add(pack_hash)
                         # Emit scalar ops
-                        elem_positions = []
-                        for elem in pack.elements:
-                            for i, orig_op in enumerate(original_ops):
-                                if id(orig_op) == id(elem):
-                                    elem_positions.append((i, elem))
-                                    break
-                        elem_positions.sort(key=lambda x: x[0])
-                        for _, elem in elem_positions:
+                        elems_in_order = sorted(
+                            pack.elements,
+                            key=lambda elem: op_index.get(id(elem), -1),
+                        )
+                        for elem in elems_in_order:
                             result.append(elem)
                             if elem.result:
                                 defined_values.add(id(elem.result))
