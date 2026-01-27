@@ -518,7 +518,7 @@ class TestUseDefUpdate(unittest.TestCase):
         self.assertEqual(ctx.use_count(old_val), 2)
 
         # Replace all uses
-        count = ctx.replace_all_uses(old_val, new_val)
+        count = ctx.replace_all_uses(old_val, new_val, auto_invalidate=True)
         self.assertEqual(count, 2)
 
         # Verify the IR was modified
@@ -540,7 +540,7 @@ class TestUseDefUpdate(unittest.TestCase):
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_init, new_init)
+        count = ctx.replace_all_uses(old_init, new_init, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         loop = hir.body[2]  # After two consts
@@ -602,7 +602,7 @@ class TestUseDefConst(unittest.TestCase):
         ctx = UseDefContext(hir)
 
         # Replace val with Const(42)
-        count = ctx.replace_all_uses(val, Const(42))
+        count = ctx.replace_all_uses(val, Const(42), auto_invalidate=True)
         self.assertEqual(count, 2)
 
         # Verify the IR was modified
@@ -634,7 +634,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         old_yield = loop.yields[0]
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_yield, new_val)
+        count = ctx.replace_all_uses(old_yield, new_val, auto_invalidate=True)
 
         # Should have replaced the yield
         self.assertEqual(count, 1)
@@ -653,7 +653,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_start, new_start)
+        count = ctx.replace_all_uses(old_start, new_start, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         loop = hir.body[2]  # After two consts
@@ -673,7 +673,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_end, new_end)
+        count = ctx.replace_all_uses(old_end, new_end, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         loop = hir.body[2]  # After two consts
@@ -696,7 +696,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         hir = b.build()
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_cond, new_cond)
+        count = ctx.replace_all_uses(old_cond, new_cond, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         if_stmt = hir.body[2]  # After two consts
@@ -728,7 +728,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         self.assertIsNotNone(if_stmt)
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_then_val, new_val)
+        count = ctx.replace_all_uses(old_then_val, new_val, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         self.assertEqual(if_stmt.then_yields[0], new_val)
@@ -758,7 +758,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         self.assertIsNotNone(if_stmt)
 
         ctx = UseDefContext(hir)
-        count = ctx.replace_all_uses(old_else_val, new_val)
+        count = ctx.replace_all_uses(old_else_val, new_val, auto_invalidate=True)
 
         self.assertEqual(count, 1)
         self.assertEqual(if_stmt.else_yields[0], new_val)
@@ -779,7 +779,7 @@ class TestReplaceAllUsesIntegration(unittest.TestCase):
         self.assertEqual(ctx.use_count(v1), 2)
 
         # Replace v1 with v2
-        count = ctx.replace_all_uses(v1, v2)
+        count = ctx.replace_all_uses(v1, v2, auto_invalidate=True)
         self.assertEqual(count, 2)
 
         # Find the vadd op and verify operands were replaced

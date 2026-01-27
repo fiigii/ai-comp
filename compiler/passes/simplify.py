@@ -150,7 +150,7 @@ class SimplifyPass(Pass):
             folded = self._try_constant_fold(op.opcode, left, right)
             if folded is not None:
                 self._constants_folded += 1
-                self._use_def_ctx.replace_all_uses(op.result, Const(folded))
+                self._use_def_ctx.replace_all_uses(op.result, Const(folded), auto_invalidate=True)
                 return None
 
         # Try algebraic identity simplifications (returns op, metric_type)
@@ -245,56 +245,56 @@ class SimplifyPass(Pass):
             # x + 0 -> x, 0 + x -> x
             if opcode == "+":
                 if right_is_const and right_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, left)
+                    self._use_def_ctx.replace_all_uses(result, left, auto_invalidate=True)
                     return None, "identity"
                 if left_is_const and left_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, right)
+                    self._use_def_ctx.replace_all_uses(result, right, auto_invalidate=True)
                     return None, "identity"
 
             # x - 0 -> x
             if opcode == "-":
                 if right_is_const and right_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, left)
+                    self._use_def_ctx.replace_all_uses(result, left, auto_invalidate=True)
                     return None, "identity"
 
             # x * 1 -> x, 1 * x -> x
             if opcode == "*":
                 if right_is_const and right_val == 1:
-                    self._use_def_ctx.replace_all_uses(result, left)
+                    self._use_def_ctx.replace_all_uses(result, left, auto_invalidate=True)
                     return None, "identity"
                 if left_is_const and left_val == 1:
-                    self._use_def_ctx.replace_all_uses(result, right)
+                    self._use_def_ctx.replace_all_uses(result, right, auto_invalidate=True)
                     return None, "identity"
                 # x * 0 -> 0, 0 * x -> 0
                 if right_is_const and right_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    self._use_def_ctx.replace_all_uses(result, Const(0), auto_invalidate=True)
                     return None, "identity"
                 if left_is_const and left_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    self._use_def_ctx.replace_all_uses(result, Const(0), auto_invalidate=True)
                     return None, "identity"
 
             # x ^ 0 -> x, 0 ^ x -> x
             if opcode == "^":
                 if right_is_const and right_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, left)
+                    self._use_def_ctx.replace_all_uses(result, left, auto_invalidate=True)
                     return None, "identity"
                 if left_is_const and left_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, right)
+                    self._use_def_ctx.replace_all_uses(result, right, auto_invalidate=True)
                     return None, "identity"
 
             # x & 0 -> 0, 0 & x -> 0
             if opcode == "&":
                 if (right_is_const and right_val == 0) or (left_is_const and left_val == 0):
-                    self._use_def_ctx.replace_all_uses(result, Const(0))
+                    self._use_def_ctx.replace_all_uses(result, Const(0), auto_invalidate=True)
                     return None, "identity"
 
             # x | 0 -> x, 0 | x -> x
             if opcode == "|":
                 if right_is_const and right_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, left)
+                    self._use_def_ctx.replace_all_uses(result, left, auto_invalidate=True)
                     return None, "identity"
                 if left_is_const and left_val == 0:
-                    self._use_def_ctx.replace_all_uses(result, right)
+                    self._use_def_ctx.replace_all_uses(result, right, auto_invalidate=True)
                     return None, "identity"
 
         # Strength reductions (only if enabled)

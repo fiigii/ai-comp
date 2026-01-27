@@ -228,14 +228,14 @@ class UseDefContext:
 
     def replace_all_uses(self, old_ssa: Variable,
                          new_value: Value,
-                         auto_invalidate: bool = True) -> int:
+                         auto_invalidate: bool) -> int:
         """
         Replace all uses of old_ssa with new_value.
 
         Args:
             old_ssa: The SSA value to replace (must be SSAValue or VectorSSAValue)
             new_value: The replacement value (can be SSAValue, VectorSSAValue, or Const)
-            auto_invalidate: If True (default), invalidate the context after replacement.
+            auto_invalidate: If True, invalidate the context after replacement.
                            Set to False when doing batch replacements for better performance,
                            then call invalidate() manually when done.
 
