@@ -38,7 +38,7 @@ class SimplifyPass(Pass):
     - Constant folding: Const(a) op Const(b) -> Const(result)
     - Identity: x + 0 -> x, x * 1 -> x, x ^ 0 -> x, x | 0 -> x
     - Annihilation: x * 0 -> 0, x & 0 -> 0
-    - Strength reduction: % 2 -> & 1, * 2 -> << 1, * power_of_2 -> << log2(n)
+    - Strength reduction: % 2 -> & 1, << n -> * 2^n
     - Select optimization: select(cond, x, 0) -> *(x, cond) when cond is boolean
     - Parity pattern: ==(x & 1, 0) followed by select(cond, 1, 2) -> (x & 1) + 1
     """
@@ -305,13 +305,11 @@ class SimplifyPass(Pass):
                 self._boolean_values.add(result)
                 return Op("&", result, [left, Const(1)], "alu"), "strength"
 
-            # Strength reduction: * 2 -> << 1, * power_of_2 -> << log2(n)
-            if opcode == "*":
-                if right_is_const and right_val is not None and right_val > 0:
-                    # Check if power of 2: n & (n-1) == 0 for powers of 2
-                    if (right_val & (right_val - 1)) == 0:
-                        shift_amount = right_val.bit_length() - 1
-                        return Op("<<", result, [left, Const(shift_amount)], "alu"), "strength"
+            # Strength reduction: << n -> * 2^n (multiplication can be faster on VLIW due to more ALU slots)
+            if opcode == "<<":
+                if right_is_const and right_val is not None and right_val >= 0 and right_val < 32:
+                    mul_val = 1 << right_val
+                    return Op("*", result, [left, Const(mul_val)], "alu"), "strength"
 
         return None, None
 
