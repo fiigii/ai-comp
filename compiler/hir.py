@@ -46,8 +46,21 @@ class Const:
         return f"#{self.value}"
 
 
+@dataclass(frozen=True)
+class VectorConst:
+    """A compile-time constant vector (VLEN=8 elements)."""
+    values: tuple[int, ...]  # Exactly 8 values
+
+    def __post_init__(self):
+        if len(self.values) != 8:
+            raise ValueError(f"VectorConst must have exactly 8 values, got {len(self.values)}")
+
+    def __repr__(self):
+        return f"#vec[{','.join(str(v) for v in self.values)}]"
+
+
 # Type alias for any value (SSA value or constant)
-Value = Union[SSAValue, VectorSSAValue, Const]
+Value = Union[SSAValue, VectorSSAValue, Const, VectorConst]
 
 
 @dataclass
