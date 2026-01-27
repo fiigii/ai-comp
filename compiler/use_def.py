@@ -227,13 +227,17 @@ class UseDefContext:
                 return
 
     def replace_all_uses(self, old_ssa: Variable,
-                         new_value: Value) -> int:
+                         new_value: Value,
+                         auto_invalidate: bool = True) -> int:
         """
         Replace all uses of old_ssa with new_value.
 
         Args:
             old_ssa: The SSA value to replace (must be SSAValue or VectorSSAValue)
             new_value: The replacement value (can be SSAValue, VectorSSAValue, or Const)
+            auto_invalidate: If True (default), invalidate the context after replacement.
+                           Set to False when doing batch replacements for better performance,
+                           then call invalidate() manually when done.
 
         Returns the number of uses replaced.
         Note: This modifies the actual IR operands, not just the use-def mappings.
@@ -301,6 +305,7 @@ class UseDefContext:
                         stmt.else_yields[use_loc.operand_index] = new_value
                         count += 1
 
-        # After replacing, invalidate so mappings get rebuilt
-        self.invalidate()
+        # After replacing, optionally invalidate so mappings get rebuilt
+        if auto_invalidate:
+            self.invalidate()
         return count
