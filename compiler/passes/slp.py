@@ -86,6 +86,12 @@ class SLPContext:
     next_ssa_id: int = 0
     # Pending operations to emit (like broadcasts)
     pending_ops: list[Op] = field(default_factory=list)
+    # Deferred broadcasts: maps id(scalar_operand) -> broadcast op
+    # Used to place broadcasts after their defining instruction
+    deferred_broadcasts: dict[int, Op] = field(default_factory=dict)
+    # Maps id(result) -> op for ops that define values in this block
+    # Used to determine if a value is externally defined
+    result_to_op: dict[int, Op] = field(default_factory=dict)
 
     def get_node(self, op: Op) -> Optional[DDGNode[Op]]:
         """Get DDG node for an op."""
@@ -129,6 +135,10 @@ class SLPVectorizationPass(Pass):
         self._seeds_found = 0
         self._packs_created = 0
         self._ops_vectorized = 0
+        # Broadcasts to hoist to function entry (for values defined outside processed blocks)
+        self._entry_broadcasts: list[Op] = []
+        # Cache of already-emitted entry broadcasts by scalar value id
+        self._entry_broadcast_cache: dict[int, VectorSSAValue] = {}
 
     @property
     def name(self) -> str:
@@ -139,12 +149,29 @@ class SLPVectorizationPass(Pass):
         self._seeds_found = 0
         self._packs_created = 0
         self._ops_vectorized = 0
+        self._entry_broadcasts = []
+        self._entry_broadcast_cache = {}
 
         if not config.enabled:
             return hir
 
         # Transform the function body
         new_body = self._transform_statements(hir.body, hir)
+
+        # Insert hoisted broadcasts at function entry (after existing entry ops)
+        if self._entry_broadcasts:
+            # Find the insertion point: after initial loads/consts, before loops
+            insert_idx = 0
+            for i, stmt in enumerate(new_body):
+                if isinstance(stmt, Op) and stmt.opcode in ("load", "const"):
+                    insert_idx = i + 1
+                elif isinstance(stmt, (ForLoop, If)):
+                    break
+                elif isinstance(stmt, Op):
+                    # Non-load/const op - insert broadcasts before it
+                    break
+            # Insert broadcasts at the found position
+            new_body = new_body[:insert_idx] + self._entry_broadcasts + new_body[insert_idx:]
 
         # Record metrics
         if self._metrics:
@@ -237,11 +264,18 @@ class SLPVectorizationPass(Pass):
         builder = HIRDDGBuilder()
         ddg = builder.build(ops)
 
+        # Build map from id(result) -> op for ops that define values in this block
+        result_to_op: dict[int, Op] = {}
+        for op in ops:
+            if op.result:
+                result_to_op[id(op.result)] = op
+
         # Create SLP context
         ctx = SLPContext(
             ddg=ddg,
             next_vec_ssa_id=hir.num_vec_ssa_values,
-            next_ssa_id=hir.num_ssa_values
+            next_ssa_id=hir.num_ssa_values,
+            result_to_op=result_to_op
         )
 
         # Phase 1: Find seeds from DDG store roots
@@ -554,6 +588,12 @@ class SLPVectorizationPass(Pass):
         2. When we see the LAST element of a pack, emit vector op
         3. Skip other elements of vectorized packs
         4. Defer non-pack ops that depend on vectorized values
+
+        Broadcast placement:
+        - Broadcasts are placed immediately after the instruction that defines
+          their scalar operand
+        - For scalars not defined in this block (constants, external values),
+          broadcasts are emitted at the function's entry point
         """
         pack_results: dict[int, VectorSSAValue] = {}
 
@@ -586,12 +626,13 @@ class SLPVectorizationPass(Pass):
             for op in pack.elements:
                 pack_elements.add(id(op))
 
-        # Generate code
+        # Generate code incrementally, tracking broadcasts for later placement
         result: list[Statement] = []
         emitted_packs: set[int] = set()
         defined_values: set[int] = set()
         deferred_results: set[int] = set()
         deferred_ops: list[Op] = []
+        emitted_broadcasts: set[int] = set()  # Track which broadcasts have been emitted
 
         def emit_deferred_ops():
             nonlocal deferred_ops
@@ -620,6 +661,13 @@ class SLPVectorizationPass(Pass):
                         still_deferred.append(deferred_op)
                 deferred_ops = still_deferred
 
+        def emit_broadcasts_for_value(value_id: int):
+            """Emit any broadcasts that use the value with this id as their scalar operand."""
+            if value_id in ctx.deferred_broadcasts and value_id not in emitted_broadcasts:
+                broadcast_op = ctx.deferred_broadcasts[value_id]
+                result.append(broadcast_op)
+                emitted_broadcasts.add(value_id)
+
         for op in original_ops:
             op_id = id(op)
 
@@ -630,6 +678,7 @@ class SLPVectorizationPass(Pass):
 
                     vec_op = self._generate_pack_code(pack, ctx, pack_results, hir)
                     if vec_op:
+                        # Emit pending ops (non-broadcast ops like vextract, vadd, vgather)
                         while ctx.pending_ops:
                             result.append(ctx.pending_ops.pop(0))
 
@@ -671,6 +720,8 @@ class SLPVectorizationPass(Pass):
                             result.append(elem)
                             if elem.result:
                                 defined_values.add(id(elem.result))
+                                # Emit broadcasts for this newly defined value
+                                emit_broadcasts_for_value(id(elem.result))
             else:
                 # Non-pack op
                 needs_defer = False
@@ -692,6 +743,8 @@ class SLPVectorizationPass(Pass):
                     result.append(op)
                     if op.result:
                         defined_values.add(id(op.result))
+                        # Emit broadcasts for this newly defined value
+                        emit_broadcasts_for_value(id(op.result))
 
         # Emit remaining deferred ops
         while deferred_ops:
@@ -701,6 +754,28 @@ class SLPVectorizationPass(Pass):
                 for deferred_op in deferred_ops:
                     result.append(deferred_op)
                 break
+
+        # Emit any remaining deferred broadcasts that weren't emitted
+        # (these are for values defined in this block but processed before
+        # the broadcast was created during pack code generation)
+        for scalar_id, broadcast_op in ctx.deferred_broadcasts.items():
+            if scalar_id not in emitted_broadcasts:
+                # Find the position after the defining op
+                defining_op = ctx.result_to_op.get(scalar_id)
+                if defining_op:
+                    # Find where the defining op is in the result
+                    insert_pos = None
+                    for i, stmt in enumerate(result):
+                        if isinstance(stmt, Op) and id(stmt) == id(defining_op):
+                            insert_pos = i + 1
+                            break
+                    if insert_pos is not None:
+                        result.insert(insert_pos, broadcast_op)
+                        emitted_broadcasts.add(scalar_id)
+                        continue
+                # Fallback: emit at the current position
+                result.append(broadcast_op)
+                emitted_broadcasts.add(scalar_id)
 
         return result if result else original_ops
 
@@ -1349,10 +1424,32 @@ class SLPVectorizationPass(Pass):
         scalar_val: Value,
         ctx: SLPContext
     ) -> VectorSSAValue:
-        """Get or create a vbroadcast for a scalar value."""
+        """Get or create a vbroadcast for a scalar value.
+
+        The broadcast op placement depends on where the scalar is defined:
+        - If defined in the current block: placed after the defining instruction
+        - If defined outside the block (external): hoisted to function entry
+
+        Constants are always considered external and hoisted to function entry.
+        """
         cache_key = id(scalar_val)
+
+        # Check instance-level entry broadcast cache first (for externally-defined values)
+        if cache_key in self._entry_broadcast_cache:
+            return self._entry_broadcast_cache[cache_key]
+
+        # Check block-level cache
         if cache_key in ctx.broadcast_cache:
             return ctx.broadcast_cache[cache_key]
+
+        # Determine if value is external (not defined in current block)
+        is_external = False
+        if isinstance(scalar_val, Const):
+            # Constants are always external
+            is_external = True
+        elif isinstance(scalar_val, SSAValue):
+            # Check if defined in this block
+            is_external = cache_key not in ctx.result_to_op
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vbroadcast_result")
         ctx.next_vec_ssa_id += 1
@@ -1363,7 +1460,15 @@ class SLPVectorizationPass(Pass):
             operands=[scalar_val],
             engine="valu"
         )
-        ctx.pending_ops.append(broadcast_op)
+
+        if is_external:
+            # Hoist to function entry
+            self._entry_broadcasts.append(broadcast_op)
+            self._entry_broadcast_cache[cache_key] = vec_result
+        else:
+            # Store in deferred_broadcasts for later placement after the defining op
+            ctx.deferred_broadcasts[cache_key] = broadcast_op
+
         ctx.broadcast_cache[cache_key] = vec_result
 
         return vec_result
