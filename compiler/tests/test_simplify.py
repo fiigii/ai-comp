@@ -420,13 +420,13 @@ class TestSimplifyPass(unittest.TestCase):
 
         print("Simplify mod2 to and1 test passed!")
 
-    def test_simplify_mul2_to_shift(self):
-        """Test *(x, 2) -> <<(x, 1) strength reduction."""
+    def test_simplify_shift1_to_mul2(self):
+        """Test <<(x, 1) -> *(x, 2) strength reduction."""
         b = HIRBuilder()
         addr0 = b.const(0)
         x = b.load(addr0, "x")
-        two = b.const(2)
-        result = b.mul(x, two, "result")  # x * 2
+        one = b.const(1)
+        result = b.shl(x, one, "result")  # x << 1
         b.store(addr0, result)
 
         hir = b.build()
@@ -442,19 +442,19 @@ class TestSimplifyPass(unittest.TestCase):
         for val in [0, 1, 2, 3, 100, 1000]:
             mem = [val] + [0] * 99
             machine = self._run_program(instrs, mem)
-            expected = (val * 2) & 0xFFFFFFFF  # 32-bit wrap
+            expected = (val << 1) & 0xFFFFFFFF  # 32-bit wrap
             self.assertEqual(machine.mem[0], expected, f"Failed for input {val}")
 
-        print("Simplify mul2 to shift test passed!")
+        print("Simplify shift1 to mul2 test passed!")
 
-    def test_simplify_mul_power_of_2(self):
-        """Test *(x, 16) -> <<(x, 4) and other powers of 2."""
-        # Test multiply by 16 (2^4)
+    def test_simplify_shift_to_mul_power_of_2(self):
+        """Test <<(x, 4) -> *(x, 16) and other shift amounts."""
+        # Test shift by 4 (equivalent to * 16)
         b = HIRBuilder()
         addr0 = b.const(0)
         x = b.load(addr0, "x")
-        sixteen = b.const(16)
-        result = b.mul(x, sixteen, "result")  # x * 16
+        four = b.const(4)
+        result = b.shl(x, four, "result")  # x << 4
         b.store(addr0, result)
 
         hir = b.build()
@@ -468,10 +468,44 @@ class TestSimplifyPass(unittest.TestCase):
         for val in [0, 1, 2, 5, 100]:
             mem = [val] + [0] * 99
             machine = self._run_program(instrs, mem)
-            expected = (val * 16) & 0xFFFFFFFF
+            expected = (val << 4) & 0xFFFFFFFF
             self.assertEqual(machine.mem[0], expected, f"Failed for input {val}")
 
-        print("Simplify mul power of 2 test passed!")
+        print("Simplify shift to mul power of 2 test passed!")
+
+    def test_simplify_shift_various_amounts(self):
+        """Test <<(x, n) -> *(x, 2^n) for various shift amounts."""
+        test_cases = [
+            (0, 1),    # << 0 -> * 1
+            (1, 2),    # << 1 -> * 2
+            (2, 4),    # << 2 -> * 4
+            (3, 8),    # << 3 -> * 8
+            (5, 32),   # << 5 -> * 32
+            (10, 1024), # << 10 -> * 1024
+        ]
+
+        for shift_amt, mul_val in test_cases:
+            b = HIRBuilder()
+            addr0 = b.const(0)
+            x = b.load(addr0, "x")
+            shift_const = b.const(shift_amt)
+            result = b.shl(x, shift_const, "result")
+            b.store(addr0, result)
+
+            hir = b.build()
+
+            pm = PassManager()
+            pm.add_pass(SimplifyPass())
+            simplified = pm.run(hir)
+
+            instrs = compile_hir_to_vliw(simplified)
+
+            for val in [0, 1, 7, 100]:
+                mem = [val] + [0] * 99
+                machine = self._run_program(instrs, mem)
+                expected = (val << shift_amt) & 0xFFFFFFFF
+                self.assertEqual(machine.mem[0], expected,
+                               f"Failed for val={val}, shift={shift_amt}")
 
     def test_simplify_select_to_multiply(self):
         """Test select(cond, x, 0) -> *(x, cond) when cond is boolean."""
