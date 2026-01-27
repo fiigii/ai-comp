@@ -224,8 +224,10 @@ class CSEPass(Pass):
                 self._loads_eliminated += 1
 
             # Replace all uses of this result with the existing SSA
+            # Use auto_invalidate=False since we're doing batch replacements
+            # and don't need up-to-date use-def info after each replacement
             if op.result is not None:
-                self._use_def_ctx.replace_all_uses(op.result, existing_ssa)
+                self._use_def_ctx.replace_all_uses(op.result, existing_ssa, auto_invalidate=False)
 
             return None  # Eliminate the op
 
@@ -313,8 +315,10 @@ class CSEPass(Pass):
             operand_vns.append(vn)
 
         # Canonicalize commutative operations by sorting operands
+        # For 2 operands, direct comparison is faster than sorted()
         if op.opcode in COMMUTATIVE_OPS and len(operand_vns) == 2:
-            operand_vns = sorted(operand_vns, key=lambda x: str(x))
+            if operand_vns[0] > operand_vns[1]:
+                operand_vns = [operand_vns[1], operand_vns[0]]
 
         # Include memory epoch for load operations
         # This enables loads with same address but different epochs to have different value numbers
