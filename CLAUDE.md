@@ -101,7 +101,7 @@ python3 -m pytest compiler/tests/test_regressions.py -v
 python3 -m pytest compiler/tests/test_regressions.py::TestCompilerRegressions -v
 
 # Run with CLI flags
-python3 perf_takehome.py --trace --rounds 4 --batch-size 16
+python3 perf_takehome.py --trace
 ```
 
 ### Test Organization (compiler/tests/)

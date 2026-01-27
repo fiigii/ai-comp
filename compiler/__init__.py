@@ -12,6 +12,7 @@ Compilation pipeline: HIR -> LIR -> VLIW assembly
 from .hir import (
     SSAValue,
     Const,
+    VectorConst,
     Value,
     Op,
     Halt,
@@ -90,7 +91,7 @@ from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass
 
 __all__ = [
     # HIR
-    'SSAValue', 'Const', 'Value', 'Op', 'Halt', 'Pause', 'ForLoop', 'If',
+    'SSAValue', 'Const', 'VectorConst', 'Value', 'Op', 'Halt', 'Pause', 'ForLoop', 'If',
     'Statement', 'HIRFunction',
     # Builder
     'HIRBuilder',

@@ -10,7 +10,7 @@ from typing import Optional
 from problem import SCRATCH_SIZE
 
 from .hir import (
-    SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 
 # Vector length (must match VM's VLEN)
@@ -30,6 +30,9 @@ class LoweringContext:
         self._ssa_to_scratch: dict[Variable, int] = {}
         self._const_scratch: dict[int, int] = {}   # const value -> scratch addr
         self._pending_consts: list[tuple[int, int]] = []  # (scratch_addr, value) - deferred const loads
+        # Cache for VectorConst -> base scratch address
+        self._vconst_scratch: dict[tuple[int, ...], int] = {}
+        self._pending_vconsts: list[tuple[int, tuple[int, ...]]] = []  # (base_scratch, values)
 
     def new_block(self, prefix: str = "bb") -> BasicBlock:
         """Create a new basic block."""
@@ -95,8 +98,24 @@ class LoweringContext:
         """Get scratch address list for a vector operand."""
         if isinstance(op, VectorSSAValue):
             return self.get_vector_scratch_list(op)
+        elif isinstance(op, VectorConst):
+            return self.get_vconst(op.values)
         else:
-            raise ValueError(f"Expected VectorSSAValue, got: {op}")
+            raise ValueError(f"Expected VectorSSAValue or VectorConst, got: {op}")
+
+    def get_vconst(self, values: tuple[int, ...]) -> list[int]:
+        """Get scratch address list for a vector constant (with caching).
+
+        Vector constants are deferred and emitted to the entry block later.
+        """
+        if values not in self._vconst_scratch:
+            base = self._scratch_ptr
+            self._scratch_ptr += VLEN
+            self._vconst_scratch[values] = base
+            # Defer vconst load - will be emitted to entry block later
+            self._pending_vconsts.append((base, values))
+        base = self._vconst_scratch[values]
+        return list(range(base, base + VLEN))
 
     def get_const(self, value: int) -> int:
         """Get scratch address for a constant (with caching).
@@ -117,17 +136,22 @@ class LoweringContext:
         This must be called after lowering is complete to ensure constants
         are materialized in the entry block where they dominate all uses.
         """
-        if not self._pending_consts:
-            return
-
         entry_block = self.lir.blocks[self.lir.entry]
-        # Insert const loads at the beginning of the entry block
-        const_insts = [
-            LIRInst(LIROpcode.CONST, addr, [value], "load")
-            for addr, value in self._pending_consts
-        ]
-        entry_block.instructions = const_insts + entry_block.instructions
+        const_insts = []
+
+        # Emit scalar constants
+        for addr, value in self._pending_consts:
+            const_insts.append(LIRInst(LIROpcode.CONST, addr, [value], "load"))
         self._pending_consts = []
+
+        # Emit vector constants (one const per lane)
+        for base, values in self._pending_vconsts:
+            for i, value in enumerate(values):
+                const_insts.append(LIRInst(LIROpcode.CONST, base + i, [value], "load"))
+        self._pending_vconsts = []
+
+        if const_insts:
+            entry_block.instructions = const_insts + entry_block.instructions
 
     def emit(self, inst: LIRInst):
         """Emit an instruction to the current block."""

@@ -18,6 +18,7 @@ from .copy_prop import CopyPropagationPass
 from .lir_dce import LIRDCEPass
 from .phi_elimination import PhiEliminationPass
 from .codegen import LIRToVLIWPass
+from .slp import SLPVectorizationPass
 
 __all__ = [
     'LoopUnrollPass',
@@ -30,4 +31,5 @@ __all__ = [
     'LIRDCEPass',
     'PhiEliminationPass',
     'LIRToVLIWPass',
+    'SLPVectorizationPass',
 ]

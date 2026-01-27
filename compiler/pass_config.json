@@ -24,6 +24,10 @@
       "enabled": true,
       "options": {}
     },
+    "slp-vectorization": {
+      "enabled": true,
+      "options": {}
+    },
     "simplify-cfg": {
       "enabled": true,
       "options": {
