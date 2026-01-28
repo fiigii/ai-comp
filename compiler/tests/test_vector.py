@@ -7,7 +7,7 @@ from compiler.hir import SSAValue, VectorSSAValue, Const, HIRFunction, Op
 from compiler.hir_builder import HIRBuilder
 from compiler.lowering import lower_to_lir, VLEN
 from compiler.codegen import compile_to_vliw
-from compiler.phi_elimination import eliminate_phis
+from compiler.passes.phi_elimination import eliminate_phis
 from compiler.lir import LIROpcode
 
 
