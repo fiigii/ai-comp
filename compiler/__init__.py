@@ -77,7 +77,7 @@ from .ddg import (
 
 # Compilation stages
 from .lowering import lower_to_lir
-from .phi_elimination import eliminate_phis
+from .passes.phi_elimination import eliminate_phis
 from .codegen import compile_to_vliw
 
 # Main entry point
