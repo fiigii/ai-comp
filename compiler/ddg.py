@@ -106,6 +106,9 @@ class DDGBuilder(ABC, Generic[T]):
                 def_map[result_id] = node
 
         # Step 2: Build edges (operand dependencies)
+        # Note: operand_nodes maintains position correspondence with operands.
+        # If an operand is external (not defined in this block), we add None
+        # as a placeholder to keep indices aligned.
         used_results: set[Any] = set()
 
         for node in nodes:
@@ -116,6 +119,9 @@ class DDGBuilder(ABC, Generic[T]):
                     dep_node = def_map[op_id]
                     node.operand_nodes.append(dep_node)
                     dep_node.user_nodes.append(node)
+                else:
+                    # External operand - add None placeholder to maintain position
+                    node.operand_nodes.append(None)
 
         # Step 3: Identify roots (stores or unused results)
         roots: list[DDGNode[T]] = []
@@ -136,6 +142,8 @@ class DDGBuilder(ABC, Generic[T]):
             visited: set[int] = set()
 
             def visit(n: DDGNode[T]):
+                if n is None:
+                    return  # Skip None (external operands)
                 if n.id in visited:
                     return
                 visited.add(n.id)

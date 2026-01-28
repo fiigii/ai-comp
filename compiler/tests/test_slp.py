@@ -767,6 +767,82 @@ class TestSLPPass(unittest.TestCase):
             self.assertEqual(machine.mem[100 + i], 84)  # 42 + 42
         print("SLP broadcast no duplicate at entry test passed!")
 
+    def test_slp_simplified_base_plus_zero_address(self):
+        """
+        Regression test: SLP should vectorize stores when first iteration's
+        address is simplified from +(base, #0) to just base.
+
+        This tests the pattern where:
+        - Loop unroll generates: +(base, #0), +(base, #1), ..., +(base, #7)
+        - Simplify pass converts +(base, #0) to just base
+        - SLP should still recognize all 8 stores as consecutive
+
+        The bug was in DDG operand_nodes not maintaining position correspondence
+        when some operands are external (defined outside the block).
+        """
+        from compiler.hir import Op
+        from compiler.passes import SimplifyPass
+
+        b = HIRBuilder()
+
+        # Simulate external base (like inp_indices_p loaded from memory header)
+        base = b.load(b.const(100), "base")
+
+        # Create pattern that mimics unrolled loop after simplify:
+        # - Iteration 0: store to base directly (simplified from +(base, #0))
+        # - Iterations 1-7: store to +(base, #N)
+
+        # First, create values to store
+        values = [b.add(b.const(i), b.const(10), f"val_{i}") for i in range(VLEN)]
+
+        # Create addresses - simulate what happens after loop unroll + simplify:
+        # Iteration 0's address is just 'base' (after +(base, #0) -> base simplification)
+        # Iterations 1-7 have +(base, #N)
+        addrs = [base]  # Iteration 0: base directly
+        for i in range(1, VLEN):
+            addrs.append(b.add(base, b.const(i), f"addr_{i}"))
+
+        # Create 8 stores with these addresses
+        for i in range(VLEN):
+            b.store(addrs[i], values[i])
+
+        hir = b.build()
+
+        # Run SLP pass
+        slp_pass = SLPVectorizationPass()
+        pm = PassManager()
+        pm.add_pass(slp_pass)
+        transformed = pm.run(hir)
+
+        # Check that stores are vectorized (should have vstore, not 8 scalar stores)
+        scalar_stores = 0
+        vector_stores = 0
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                if stmt.opcode == "store":
+                    scalar_stores += 1
+                elif stmt.opcode == "vstore":
+                    vector_stores += 1
+
+        # Should have at least one vstore (the 8 scalar stores vectorized)
+        self.assertGreaterEqual(vector_stores, 1, "SLP should vectorize consecutive stores")
+        # All 8 stores should be vectorized into 1 vstore, so no scalar stores
+        self.assertEqual(scalar_stores, 0, "All stores should be vectorized")
+
+        # Verify correctness by compiling and running
+        instrs = compile_hir_to_vliw(transformed)
+        mem = [0] * 200
+        mem[100] = 50  # base address
+        machine = self._run_program(instrs, mem)
+
+        # Check that values were stored correctly at addresses 50-57
+        for i in range(VLEN):
+            expected = i + 10  # val_i = i + 10
+            self.assertEqual(machine.mem[50 + i], expected,
+                f"mem[{50 + i}] should be {expected}, got {machine.mem[50 + i]}")
+
+        print("SLP simplified base+0 address regression test passed!")
+
 
 if __name__ == "__main__":
     unittest.main()
