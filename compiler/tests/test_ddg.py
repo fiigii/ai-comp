@@ -559,6 +559,156 @@ class TestPrettyPrint:
         assert "└──" not in output
 
 
+class TestExternalOperands:
+    """Tests for DDG handling of external operands (defined outside the block)."""
+
+    def test_external_operand_placeholder(self):
+        """Test that external operands get None placeholders in operand_nodes."""
+        # Simulate a scenario where 'base' is defined outside the block
+        # and used in stores within the block
+        base = SSAValue(0, "base")  # External - not defined in ops list
+        val1 = SSAValue(1, "val1")
+        val2 = SSAValue(2, "val2")
+
+        # Only val1 and val2 are defined in this block
+        # base is external (not in ops list)
+        ops = [
+            Op("const", val1, [Const(42)], "load"),
+            Op("const", val2, [Const(43)], "load"),
+            # store uses external 'base' as address, internal 'val1' as value
+            Op("store", None, [base, val1], "store"),
+            Op("store", None, [base, val2], "store"),
+        ]
+
+        builder = HIRDDGBuilder()
+        ddgs = builder.build(ops)
+
+        # Get store nodes
+        store1_node = ddgs.inst_map[id(ops[2])]
+        store2_node = ddgs.inst_map[id(ops[3])]
+
+        # operand_nodes should maintain position correspondence:
+        # operand_nodes[0] = None (external base)
+        # operand_nodes[1] = node for val1/val2
+        assert len(store1_node.operand_nodes) == 2
+        assert store1_node.operand_nodes[0] is None  # External operand
+        assert store1_node.operand_nodes[1] is not None  # Internal val1
+        assert store1_node.operand_nodes[1].instruction.result == val1
+
+        assert len(store2_node.operand_nodes) == 2
+        assert store2_node.operand_nodes[0] is None  # External operand
+        assert store2_node.operand_nodes[1] is not None  # Internal val2
+        assert store2_node.operand_nodes[1].instruction.result == val2
+
+    def test_mixed_internal_external_operands(self):
+        """Test ops with mix of internal and external operands."""
+        ext1 = SSAValue(0, "ext1")  # External
+        ext2 = SSAValue(1, "ext2")  # External
+        int1 = SSAValue(2, "int1")  # Internal
+
+        ops = [
+            Op("const", int1, [Const(10)], "load"),
+            # add uses two external operands
+            Op("+", SSAValue(3, "sum1"), [ext1, ext2], "alu"),
+            # add uses one external, one internal
+            Op("+", SSAValue(4, "sum2"), [ext1, int1], "alu"),
+        ]
+
+        builder = HIRDDGBuilder()
+        ddgs = builder.build(ops)
+
+        # sum1 = ext1 + ext2: both operands external
+        sum1_node = ddgs.inst_map[id(ops[1])]
+        assert len(sum1_node.operand_nodes) == 2
+        assert sum1_node.operand_nodes[0] is None  # ext1 external
+        assert sum1_node.operand_nodes[1] is None  # ext2 external
+
+        # sum2 = ext1 + int1: first external, second internal
+        sum2_node = ddgs.inst_map[id(ops[2])]
+        assert len(sum2_node.operand_nodes) == 2
+        assert sum2_node.operand_nodes[0] is None  # ext1 external
+        assert sum2_node.operand_nodes[1] is not None  # int1 internal
+        assert sum2_node.operand_nodes[1].instruction.result == int1
+
+    def test_dag_traversal_skips_none(self):
+        """Test that DAG traversal correctly skips None (external) operand nodes."""
+        ext_base = SSAValue(0, "base")  # External
+        val = SSAValue(1, "val")
+
+        ops = [
+            Op("const", val, [Const(42)], "load"),
+            Op("store", None, [ext_base, val], "store"),
+        ]
+
+        builder = HIRDDGBuilder()
+        ddgs = builder.build(ops)
+
+        # Should have one DAG rooted at store
+        assert len(ddgs.dags) == 1
+        dag = ddgs.dags[0]
+
+        # DAG should include store and val's const, but not crash on None
+        assert dag.root.instruction.opcode == "store"
+        # Both ops should be in the DAG
+        assert len(dag.nodes) == 2
+
+    def test_slp_pattern_simplified_address(self):
+        """
+        Test the SLP pattern where simplify pass converts +(base, #0) to base.
+
+        This is the key pattern that was failing:
+        - Iteration 0: store(base, v1) - base used directly
+        - Iteration 1: store(+(base, #1), v2) - base used in add
+
+        Both should have operand_nodes with proper position correspondence.
+        """
+        # External base (simulating inp_indices_p defined outside loop body)
+        base = SSAValue(0, "inp_indices_p")
+
+        # Internal values and addresses
+        val0 = SSAValue(1, "val0")
+        val1 = SSAValue(2, "val1")
+        addr1 = SSAValue(3, "addr1")
+
+        ops = [
+            # Compute values
+            Op("const", val0, [Const(100)], "load"),
+            Op("const", val1, [Const(200)], "load"),
+            # Compute address for iteration 1: base + 1
+            Op("+", addr1, [base, Const(1)], "alu"),
+            # Iteration 0 store: uses base directly (after simplify removed +(base, #0))
+            Op("store", None, [base, val0], "store"),
+            # Iteration 1 store: uses addr1 = +(base, #1)
+            Op("store", None, [addr1, val1], "store"),
+        ]
+
+        builder = HIRDDGBuilder()
+        ddgs = builder.build(ops)
+
+        # Get store nodes
+        store0 = ddgs.inst_map[id(ops[3])]  # store(base, val0)
+        store1 = ddgs.inst_map[id(ops[4])]  # store(addr1, val1)
+
+        # Store 0: operands are [base (ext), val0 (int)]
+        assert len(store0.operand_nodes) == 2
+        assert store0.operand_nodes[0] is None  # base is external
+        assert store0.operand_nodes[1] is not None  # val0 is internal
+        assert store0.operand_nodes[1].instruction.result == val0
+
+        # Store 1: operands are [addr1 (int), val1 (int)]
+        assert len(store1.operand_nodes) == 2
+        assert store1.operand_nodes[0] is not None  # addr1 is internal
+        assert store1.operand_nodes[0].instruction.result == addr1
+        assert store1.operand_nodes[1] is not None  # val1 is internal
+        assert store1.operand_nodes[1].instruction.result == val1
+
+        # addr1's operands: [base (ext), Const(1)]
+        # Note: Const operands don't have DDG entries
+        addr1_node = ddgs.def_map[addr1]
+        assert len(addr1_node.operand_nodes) == 1  # Only base (Const is skipped)
+        assert addr1_node.operand_nodes[0] is None  # base is external
+
+
 class TestEdgeCases:
 
     def test_empty_block(self):
