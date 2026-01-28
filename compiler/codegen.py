@@ -6,8 +6,6 @@ Generates VLIW bundles from LIR instructions.
 
 from typing import Optional
 
-from problem import SCRATCH_SIZE
-
 from .lir import LIROpcode, LIRInst, LIRFunction
 
 
@@ -220,7 +218,7 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
                             max_scratch = max(max_scratch, op)
 
         zero_scratch = max_scratch + 1
-        assert zero_scratch < SCRATCH_SIZE, "Out of scratch space for zero constant"
+        # Note: SCRATCH_SIZE check moved to RegisterAllocationPass
 
         # Add const 0 at the beginning of entry block
         entry_block = lir.blocks[lir.entry]
