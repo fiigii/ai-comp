@@ -10,7 +10,7 @@ import os
 
 from .hir import HIRFunction
 from .pass_manager import CompilerPipeline
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass, SLPVectorizationPass, MADSynthesisPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, RegisterAllocationPass, LIRToVLIWPass, SLPVectorizationPass, MADSynthesisPass
 
 
 def compile_hir_to_vliw(
@@ -59,6 +59,7 @@ def compile_hir_to_vliw(
     pipeline.add_pass(LIRDCEPass())          # LIR -> LIR (remove dead COPYs)
     pipeline.add_pass(SimplifyCFGPass())     # LIR -> LIR (CFG cleanup after DCE)
     pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
+    pipeline.add_pass(RegisterAllocationPass())  # LIR -> LIR
     pipeline.add_pass(LIRToVLIWPass())       # LIR -> VLIW
 
     # Run the full pipeline

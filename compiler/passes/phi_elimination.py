@@ -147,7 +147,7 @@ class PhiEliminationPass(LIRPass):
         temp_scratch = config.options.get("temp_scratch", None)
         if temp_scratch is None:
             temp_scratch = lir.max_scratch_used + 1 if lir.max_scratch_used >= 0 else 0
-        assert temp_scratch < SCRATCH_SIZE, "No room for phi temp scratch"
+        # Note: SCRATCH_SIZE check moved to RegisterAllocationPass
 
         eliminate_phis(lir, temp_scratch=temp_scratch)
 

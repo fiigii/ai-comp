@@ -16,7 +16,7 @@
         "constant_folding": true,
         "identities": true,
         "strength_reduction": true,
-        "select_optimization": true,
+        "select_optimization": false,
         "parity_pattern": true
       }
     },
