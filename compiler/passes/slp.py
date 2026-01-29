@@ -157,6 +157,11 @@ class SLPVectorizationPass(Pass):
         self._seeds_found = 0
         self._packs_created = 0
         self._ops_vectorized = 0
+        # Global SSA id cursors for new values created during this pass.
+        # These must be monotonically increasing across all vectorized blocks
+        # in the function to avoid SSA id collisions.
+        self._next_vec_ssa_id = 0
+        self._next_ssa_id = 0
         # Broadcasts to hoist to function entry (for values defined outside processed blocks)
         self._entry_broadcasts: list[Op] = []
         # Cache of already-emitted entry broadcasts by stable cache key (via _make_cache_key())
@@ -171,6 +176,8 @@ class SLPVectorizationPass(Pass):
         self._seeds_found = 0
         self._packs_created = 0
         self._ops_vectorized = 0
+        self._next_vec_ssa_id = hir.num_vec_ssa_values
+        self._next_ssa_id = hir.num_ssa_values
         self._entry_broadcasts = []
         self._entry_broadcast_cache = {}
 
@@ -206,8 +213,8 @@ class SLPVectorizationPass(Pass):
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=hir.num_ssa_values,
-            num_vec_ssa_values=hir.num_vec_ssa_values + self._ops_vectorized
+            num_ssa_values=max(hir.num_ssa_values, self._next_ssa_id),
+            num_vec_ssa_values=max(hir.num_vec_ssa_values, self._next_vec_ssa_id),
         )
 
     def _transform_statements(
@@ -215,29 +222,49 @@ class SLPVectorizationPass(Pass):
         stmts: list[Statement],
         hir: HIRFunction
     ) -> list[Statement]:
-        """Transform a list of statements, vectorizing where possible."""
-        result = []
+        """Transform a list of statements, vectorizing straight-line Op segments.
+
+        Important: Preserve non-Op statements (Pause/Halt/ForLoop/If). These are
+        control-flow / synchronization markers and must not be dropped or moved.
+        """
+        transformed: list[Statement] = []
 
         for stmt in stmts:
             if isinstance(stmt, ForLoop):
-                result.append(self._transform_for_loop(stmt, hir))
+                transformed.append(self._transform_for_loop(stmt, hir))
             elif isinstance(stmt, If):
-                result.append(self._transform_if(stmt, hir))
-            elif isinstance(stmt, Op):
-                result.append(stmt)
+                transformed.append(self._transform_if(stmt, hir))
             else:
-                # Halt, Pause
-                result.append(stmt)
+                # Op, Halt, Pause
+                transformed.append(stmt)
 
-        # Try to vectorize flat op sequences in this block
-        ops_only = [s for s in result if isinstance(s, Op)]
-        if len(ops_only) >= VLEN:
-            vectorized = self._vectorize_block(ops_only, hir)
-            if vectorized is not None:
-                # Replace ops with vectorized version
-                return vectorized
+        # Vectorize contiguous Op runs only (basic-block like regions).
+        out: list[Statement] = []
+        i = 0
+        while i < len(transformed):
+            stmt = transformed[i]
+            if not isinstance(stmt, Op):
+                out.append(stmt)
+                i += 1
+                continue
 
-        return result
+            j = i
+            while j < len(transformed) and isinstance(transformed[j], Op):
+                j += 1
+
+            op_run = [s for s in transformed[i:j] if isinstance(s, Op)]
+            if len(op_run) >= VLEN:
+                vectorized = self._vectorize_block(op_run, hir)
+                if vectorized is not None:
+                    out.extend(vectorized)
+                else:
+                    out.extend(op_run)
+            else:
+                out.extend(op_run)
+
+            i = j
+
+        return out
 
     def _transform_for_loop(self, loop: ForLoop, hir: HIRFunction) -> ForLoop:
         """Transform a ForLoop, vectorizing its body."""
@@ -282,9 +309,10 @@ class SLPVectorizationPass(Pass):
         if len(ops) < VLEN:
             return None
 
-        # Build DDG for this block
+        # Build DDG for this block. We only need the use/def graph; building
+        # per-root DAGs is extremely expensive on large unrolled blocks.
         builder = HIRDDGBuilder()
-        ddg = builder.build(ops)
+        ddg = builder.build(ops, build_dags=False)
 
         # Build map from cache_key(result) -> op for ops that define values in this block
         result_to_op: dict[tuple, Op] = {}
@@ -295,8 +323,8 @@ class SLPVectorizationPass(Pass):
         # Create SLP context
         ctx = SLPContext(
             ddg=ddg,
-            next_vec_ssa_id=hir.num_vec_ssa_values,
-            next_ssa_id=hir.num_ssa_values,
+            next_vec_ssa_id=self._next_vec_ssa_id,
+            next_ssa_id=self._next_ssa_id,
             result_to_op=result_to_op
         )
 
@@ -323,7 +351,13 @@ class SLPVectorizationPass(Pass):
             return None
 
         # Phase 4: Generate vector code
-        return self._generate_vector_code(ops, legal_packs, ctx, hir)
+        vectorized = self._generate_vector_code(ops, legal_packs, ctx, hir)
+
+        # Advance global SSA cursors to avoid collisions across blocks.
+        self._next_vec_ssa_id = max(self._next_vec_ssa_id, ctx.next_vec_ssa_id)
+        self._next_ssa_id = max(self._next_ssa_id, ctx.next_ssa_id)
+
+        return vectorized
 
     def _find_seeds_from_ddg(self, ops: list[Op], ctx: SLPContext) -> list[Pack]:
         """
@@ -356,48 +390,59 @@ class SLPVectorizationPass(Pass):
         if len(ops) < VLEN:
             return packs
 
-        # Group by base address pattern
-        addr_groups: dict[tuple, list[tuple[Op, int]]] = {}  # base -> [(op, offset)]
+        # Group by base address pattern, then by constant offset.
+        #
+        # Note: With full unrolling (e.g., unrolling an outer "rounds" loop),
+        # the same offset can appear many times for the same base. A naive
+        # "sort-by-offset then take a contiguous window" approach fails because
+        # duplicates cluster as [0,0,0,...,1,1,1,...] and no 0..7 run exists.
+        addr_groups: dict[tuple, dict[int, list[Op]]] = {}  # base -> {offset -> [op, ...]}
 
         for op in ops:
             addr = op.operands[0]
             base, offset = self._analyze_address(addr, ctx)
-            if base is not None:
-                if base not in addr_groups:
-                    addr_groups[base] = []
-                addr_groups[base].append((op, offset))
+            if base is None:
+                continue
+            by_off = addr_groups.setdefault(base, {})
+            by_off.setdefault(offset, []).append(op)
 
-        # Find complete groups of VLEN consecutive offsets
-        for base_key, group in addr_groups.items():
-            if len(group) < VLEN:
+        # Find complete groups of VLEN consecutive offsets. If an offset occurs
+        # multiple times, form multiple packs by pairing the k-th occurrence of
+        # each offset together (this matches unrolled loop structure).
+        for _, by_off in addr_groups.items():
+            if sum(len(v) for v in by_off.values()) < VLEN:
                 continue
 
-            # Sort by offset
-            group.sort(key=lambda x: x[1])
+            offsets = sorted(by_off.keys())
+            offsets_set = set(offsets)
 
-            # Find runs of consecutive offsets
+            # Only consider non-overlapping packs. This is important for
+            # performance on large unrolled blocks.
             i = 0
-            while i <= len(group) - VLEN:
-                start_offset = group[i][1]
-                is_consecutive = all(
-                    group[i + j][1] == start_offset + j
-                    for j in range(VLEN)
-                )
+            while i < len(offsets):
+                start_offset = offsets[i]
+                if not all((start_offset + j) in offsets_set for j in range(VLEN)):
+                    i += 1
+                    continue
 
-                if is_consecutive:
-                    pack_ops = [group[i + j][0] for j in range(VLEN)]
+                max_packs = min(len(by_off[start_offset + j]) for j in range(VLEN))
+                for k in range(max_packs):
+                    pack_ops = [by_off[start_offset + j][k] for j in range(VLEN)]
 
                     # Check not already packed
-                    if not any(id(op) in ctx.packed_ops for op in pack_ops):
-                        opcode = pack_ops[0].opcode
-                        pack = Pack(elements=pack_ops, opcode=opcode, is_memory=True)
-                        packs.append(pack)
-                        for op in pack_ops:
-                            ctx.packed_ops.add(id(op))
-                        ctx.packs.append(pack)
+                    if any(id(op) in ctx.packed_ops for op in pack_ops):
+                        continue
 
-                    i += VLEN
-                else:
+                    opcode = pack_ops[0].opcode
+                    pack = Pack(elements=pack_ops, opcode=opcode, is_memory=True)
+                    packs.append(pack)
+                    for op in pack_ops:
+                        ctx.packed_ops.add(id(op))
+                    ctx.packs.append(pack)
+
+                # Advance to the next disjoint window start.
+                next_start = start_offset + VLEN
+                while i < len(offsets) and offsets[i] < next_start:
                     i += 1
 
         return packs
@@ -510,7 +555,7 @@ class SLPVectorizationPass(Pass):
                 # Check if they can form a pack
                 if self._can_form_pack(operand_ops, ctx):
                     new_pack = self._try_create_pack(operand_ops, ctx)
-                    if new_pack and new_pack not in ctx.packs:
+                    if new_pack:
                         ctx.packs.append(new_pack)
                         worklist.append(new_pack)
 
@@ -630,8 +675,9 @@ class SLPVectorizationPass(Pass):
         pack_results: dict[int, VectorSSAValue] = {}
         op_index: dict[int, int] = {id(op): i for i, op in enumerate(original_ops)}
 
-        # Check which packs can be fully vectorized
-        vectorizable_packs = [p for p in packs if self._can_fully_vectorize(p, ctx, packs)]
+        # Treat all discovered packs as candidates; if operand materialization
+        # fails, we fall back to emitting scalars in _generate_vector_code.
+        vectorizable_packs = packs
 
         if not vectorizable_packs:
             return original_ops
@@ -824,48 +870,6 @@ class SLPVectorizationPass(Pass):
                 if id(user_node.instruction) not in pack_elements:
                     return True
         return False
-
-    def _can_fully_vectorize(
-        self,
-        pack: Pack,
-        ctx: SLPContext,
-        all_packs: list[Pack]
-    ) -> bool:
-        """Check if a pack can be fully vectorized."""
-        if pack.opcode == "store":
-            operands = [pack.elements[lane].operands[1] for lane in range(VLEN)]
-
-            # All same (uniform)
-            if all(self._values_equal(operands[i], operands[0]) for i in range(VLEN)):
-                return True
-
-            # All from same vector
-            if all(isinstance(op, SSAValue) for op in operands):
-                first_vec = ctx.scalar_to_vector.get(operands[0])
-                if first_vec:
-                    vec_ssa, _ = first_vec
-                    if all(
-                        ctx.scalar_to_vector.get(op) == (vec_ssa, lane)
-                        for lane, op in enumerate(operands)
-                    ):
-                        return True
-
-            # Operands from other packs
-            for op in operands:
-                if isinstance(op, SSAValue):
-                    op_node = None
-                    for node in ctx.all_nodes():
-                        if node.instruction.result and id(node.instruction.result) == id(op):
-                            op_node = node
-                            break
-                    if op_node:
-                        in_pack = any(op_node.instruction in p.elements for p in all_packs if p != pack)
-                        if not in_pack:
-                            return False
-
-            return True
-
-        return True
 
     def _generate_pack_code(
         self,
@@ -1286,15 +1290,10 @@ class SLPVectorizationPass(Pass):
         # Check if all scalars come from loads
         load_ops = []
         for scalar in scalars:
-            load_op = None
-            for node in ctx.all_nodes():
-                if node.instruction.result and id(node.instruction.result) == id(scalar):
-                    if node.instruction.opcode == "load":
-                        load_op = node.instruction
-                    break
-            if load_op is None:
+            def_node = ctx.get_def_node(scalar)
+            if def_node is None or def_node.instruction.opcode != "load":
                 return None
-            load_ops.append(load_op)
+            load_ops.append(def_node.instruction)
 
         # Analyze addresses for gather pattern
         base_value = None
@@ -1308,14 +1307,10 @@ class SLPVectorizationPass(Pass):
                 return None
 
             # Find defining op
-            addr_op = None
-            for node in ctx.all_nodes():
-                if node.instruction.result and id(node.instruction.result) == id(addr):
-                    addr_op = node.instruction
-                    break
-
-            if addr_op is None or addr_op.opcode != "+":
+            addr_def_node = ctx.get_def_node(addr)
+            if addr_def_node is None or addr_def_node.instruction.opcode != "+":
                 return None
+            addr_op = addr_def_node.instruction
 
             left, right = addr_op.operands[0], addr_op.operands[1]
 
@@ -1356,11 +1351,9 @@ class SLPVectorizationPass(Pass):
             # Also mark the address calculation op
             addr = load_op.operands[0]
             if isinstance(addr, SSAValue):
-                for node in ctx.all_nodes():
-                    if node.instruction.result and id(node.instruction.result) == id(addr):
-                        if node.instruction.opcode == "+":
-                            ctx.packed_ops.add(id(node.instruction))
-                        break
+                addr_def_node = ctx.get_def_node(addr)
+                if addr_def_node is not None and addr_def_node.instruction.opcode == "+":
+                    ctx.packed_ops.add(id(addr_def_node.instruction))
 
         # Generate vgather
         vec_base = self._get_or_create_broadcast(base_value, ctx)

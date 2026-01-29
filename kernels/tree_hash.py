@@ -141,7 +141,7 @@ def build_tree_hash_kernel(
         end=rounds_const,
         iter_args=[],
         body_fn=round_body,
-        pragma_unroll=1
+        pragma_unroll=0
     )
 
     # Final pause (sync with reference_kernel2 second yield)
