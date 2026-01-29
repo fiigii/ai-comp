@@ -89,8 +89,17 @@ class DDGBuilder(ABC, Generic[T]):
         """Check if instruction has side effects (store, halt, etc.)."""
         pass
 
-    def build(self, instructions: list[T]) -> BlockDDGs[T]:
-        """Build DDGs for a list of instructions (basic block)."""
+    def build(self, instructions: list[T], *, build_dags: bool = True) -> BlockDDGs[T]:
+        """Build DDGs for a list of instructions (basic block).
+
+        Most users only need the use/def graph (def_map, inst_map, operand_nodes,
+        user_nodes). Building per-root DAGs (ddgs.dags) is much more expensive on
+        large blocks because it repeats traversal for each root.
+
+        build_dags=True keeps the previous behavior.
+        build_dags=False returns an empty dags list but still populates def_map
+        and inst_map and wires operand/user edges.
+        """
         # Step 1: Create nodes for all instructions
         nodes: list[DDGNode[T]] = []
         def_map: dict[Any, DDGNode[T]] = {}  # result_id -> defining node
@@ -109,12 +118,13 @@ class DDGBuilder(ABC, Generic[T]):
         # Note: operand_nodes maintains position correspondence with operands.
         # If an operand is external (not defined in this block), we add None
         # as a placeholder to keep indices aligned.
-        used_results: set[Any] = set()
+        used_results: Optional[set[Any]] = set() if build_dags else None
 
         for node in nodes:
             operand_ids = self.get_operand_ids(node.instruction)
             for op_id in operand_ids:
-                used_results.add(op_id)
+                if used_results is not None:
+                    used_results.add(op_id)
                 if op_id in def_map:
                     dep_node = def_map[op_id]
                     node.operand_nodes.append(dep_node)
@@ -123,10 +133,14 @@ class DDGBuilder(ABC, Generic[T]):
                     # External operand - add None placeholder to maintain position
                     node.operand_nodes.append(None)
 
+        if not build_dags:
+            return BlockDDGs(dags=[], def_map=def_map, inst_map=inst_map)
+
         # Step 3: Identify roots (stores or unused results)
         roots: list[DDGNode[T]] = []
         for node in nodes:
             result_id = self.get_result_id(node.instruction)
+            # used_results is non-None when build_dags=True.
             is_unused = result_id is not None and result_id not in used_results
             is_side_effect = self.is_side_effect(node.instruction)
 

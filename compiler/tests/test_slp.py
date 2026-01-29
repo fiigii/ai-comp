@@ -843,6 +843,101 @@ class TestSLPPass(unittest.TestCase):
 
         print("SLP simplified base+0 address regression test passed!")
 
+    def test_slp_handles_duplicate_offsets(self):
+        """
+        Regression test: SLP should still find seed packs when the same base+offset
+        store sequence repeats (e.g., from fully unrolling an outer loop).
+
+        Previously, seed finding sorted by offset and looked for a contiguous
+        window; duplicates clustered as [0,0,...,1,1,...] and no consecutive run
+        existed, causing SLP to skip vectorization entirely.
+        """
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base = b.const(100)
+        add_1000 = b.const(1000)
+
+        # Two identical offset ranges (0..VLEN-1) to the same base.
+        # Values are SSA (loads/adds) so SLP can build vector operands for vstore.
+        for i in range(VLEN):
+            val = b.load(b.const(i), f"in0_{i}")
+            addr = b.add(base, b.const(i), f"addr0_{i}")
+            b.store(addr, val)
+
+        for i in range(VLEN):
+            val = b.load(b.const(i), f"in1_{i}")
+            val = b.add(val, add_1000, f"plus_1000_{i}")
+            addr = b.add(base, b.const(i), f"addr1_{i}")
+            b.store(addr, val)
+
+        hir = b.build()
+
+        slp_pass = SLPVectorizationPass()
+        pm = PassManager()
+        pm.add_pass(slp_pass)
+        transformed = pm.run(hir)
+
+        # Should produce two vstores (one per repetition).
+        scalar_stores = 0
+        vector_stores = 0
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                if stmt.opcode == "store":
+                    scalar_stores += 1
+                elif stmt.opcode == "vstore":
+                    vector_stores += 1
+
+        self.assertEqual(scalar_stores, 0, "All stores should be vectorized")
+        self.assertGreaterEqual(vector_stores, 2, "Expected repeated vstore packs for duplicate offsets")
+
+        # Verify semantics: second repetition overwrites the first.
+        instrs = compile_hir_to_vliw(transformed)
+        mem = list(range(VLEN)) + [0] * 300
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], 1000 + i)
+
+        metrics = slp_pass.get_metrics()
+        self.assertIsNotNone(metrics)
+        self.assertGreaterEqual(metrics.custom.get("seeds_found", 0), 2)
+
+    def test_slp_preserves_pause_statements(self):
+        """
+        Regression test: SLP must preserve Pause statements.
+
+        Pauses are used to synchronize with reference kernels in perf_takehome.
+        """
+        from compiler.hir import Pause
+
+        b = HIRBuilder()
+        b.pause()
+
+        base = b.const(50)
+        for i in range(VLEN):
+            addr = b.add(base, b.const(i), f"addr_{i}")
+            b.store(addr, b.const(i + 10))
+
+        b.pause()
+
+        hir = b.build()
+
+        slp_pass = SLPVectorizationPass()
+        pm = PassManager()
+        pm.add_pass(slp_pass)
+        transformed = pm.run(hir)
+
+        # Ensure Pause nodes still exist in HIR.
+        pause_count = sum(1 for s in transformed.body if isinstance(s, Pause))
+        self.assertEqual(pause_count, 2, "SLP must not drop Pause statements")
+
+        # Ensure Pause also survives lowering/codegen.
+        instrs = compile_hir_to_vliw(transformed)
+        vliw_pause_count = sum(
+            1 for bundle in instrs for slot in bundle.get("flow", []) if slot[0] == "pause"
+        )
+        self.assertEqual(vliw_pause_count, 2, "Expected two pause instructions in VLIW output")
+
 
 if __name__ == "__main__":
     unittest.main()
