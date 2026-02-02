@@ -235,10 +235,11 @@ def get_dag_depth(dag: DataDependencyDAG) -> int:
     def compute_depth(node: DDGNode) -> int:
         if node.id in depths:
             return depths[node.id]
-        if not node.operand_nodes:
+        children = [d for d in node.operand_nodes if d is not None]
+        if not children:
             depths[node.id] = 0
         else:
-            depths[node.id] = 1 + max(compute_depth(d) for d in node.operand_nodes)
+            depths[node.id] = 1 + max(compute_depth(d) for d in children)
         return depths[node.id]
 
     return compute_depth(dag.root)
@@ -255,10 +256,11 @@ def get_dag_width(dag: DataDependencyDAG) -> dict[int, int]:
     def compute_depth(node: DDGNode) -> int:
         if node.id in depths:
             return depths[node.id]
-        if not node.operand_nodes:
+        children = [d for d in node.operand_nodes if d is not None]
+        if not children:
             depths[node.id] = 0
         else:
-            depths[node.id] = 1 + max(compute_depth(d) for d in node.operand_nodes)
+            depths[node.id] = 1 + max(compute_depth(d) for d in children)
         return depths[node.id]
 
     for node in dag.nodes:
@@ -276,10 +278,11 @@ def find_independent_nodes(dag: DataDependencyDAG) -> list[set[DDGNode]]:
     def compute_depth(node: DDGNode) -> int:
         if node.id in depths:
             return depths[node.id]
-        if not node.operand_nodes:
+        children = [d for d in node.operand_nodes if d is not None]
+        if not children:
             depths[node.id] = 0
         else:
-            depths[node.id] = 1 + max(compute_depth(d) for d in node.operand_nodes)
+            depths[node.id] = 1 + max(compute_depth(d) for d in children)
         return depths[node.id]
 
     for node in dag.nodes:
@@ -393,7 +396,7 @@ def print_dag_tree(dag: DataDependencyDAG) -> str:
         else:
             child_prefix = prefix + ("    " if is_last else "│   ")
 
-        children = node.operand_nodes
+        children = [c for c in node.operand_nodes if c is not None]
         for i, child in enumerate(children):
             print_tree(child, child_prefix, i == len(children) - 1, False)
 
@@ -425,7 +428,8 @@ def print_dag_dot(dag: DataDependencyDAG, name: str = "dag") -> str:
     # Add edges (from operand to user)
     for node in dag.nodes:
         for dep in node.operand_nodes:
-            lines.append(f"  n{dep.id} -> n{node.id};")
+            if dep is not None:
+                lines.append(f"  n{dep.id} -> n{node.id};")
 
     lines.append("}")
     return "\n".join(lines)

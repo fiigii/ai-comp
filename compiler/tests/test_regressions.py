@@ -470,5 +470,73 @@ class TestCompilerRegressions(unittest.TestCase):
         print("CSE no load hoist across loop stores test passed!")
 
 
+    def test_ddg_with_external_operands(self):
+        """
+        Regression test for P1: DDG functions crash with None operand_nodes.
+
+        When an operand is external (defined outside the current block), the DDG
+        stores None as a placeholder in operand_nodes to maintain position
+        correspondence. Functions like print_dag_tree, get_dag_depth, etc. must
+        filter out these None values to avoid AttributeError crashes.
+        """
+        from compiler.ddg import (
+            HIRDDGBuilder,
+            print_dag_tree,
+            print_dag_dot,
+            get_dag_depth,
+            get_dag_width,
+            find_independent_nodes,
+        )
+
+        b = HIRBuilder()
+
+        # Create a program where loop body uses external operands (defined outside)
+        addr0 = b.const(0)
+        addr1 = b.const(1)
+        zero = b.const(0)
+        two = b.const(2)
+
+        # val is defined outside the loop
+        val = b.load(addr0, "val")
+
+        def loop_body(i, params):
+            # Use 'val' (external operand - defined before the loop)
+            # and 'i' (loop variable) to create computations
+            result = b.add(val, i, "result")  # val is external to loop body
+            b.store(addr1, result)
+            return []
+
+        b.for_loop(start=zero, end=two, iter_args=[], body_fn=loop_body)
+
+        hir = b.build()
+
+        # Build DDGs for each block - this should have external operands
+        ddg_builder = HIRDDGBuilder()
+        for block in hir.body:
+            if hasattr(block, 'body') and block.body:  # ForLoop
+                # Build DDGs for the loop body - use build() method
+                ddgs = ddg_builder.build(block.body, build_dags=True)
+
+                # Test all DDG functions that iterate over operand_nodes
+                for dag in ddgs.dags:
+                    # These should NOT crash with AttributeError on None nodes
+                    tree_output = print_dag_tree(dag)
+                    self.assertIsInstance(tree_output, str)
+
+                    dot_output = print_dag_dot(dag)
+                    self.assertIsInstance(dot_output, str)
+
+                    depth = get_dag_depth(dag)
+                    self.assertIsInstance(depth, int)
+
+                    width = get_dag_width(dag)
+                    self.assertIsInstance(width, dict)
+
+                    levels = find_independent_nodes(dag)
+                    self.assertIsInstance(levels, list)
+
+        print("DDG with external operands test passed!")
+
+
 if __name__ == "__main__":
     unittest.main()
