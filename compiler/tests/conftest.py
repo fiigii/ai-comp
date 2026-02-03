@@ -31,8 +31,25 @@ from compiler import (
     compile_hir_to_vliw,
     lower_to_lir,
     eliminate_phis,
-    compile_to_vliw,
 )
+from compiler.passes import LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
+from compiler.pass_manager import PassConfig
+
+
+def _cfg(name, **opts):
+    """Helper to create PassConfig."""
+    return PassConfig(name=name, enabled=True, options=opts)
+
+
+def compile_to_vliw(lir: LIRFunction) -> list[dict]:
+    """Compile LIR to VLIW through the MIR pipeline.
+
+    Note: Phis must be eliminated before calling this function.
+    """
+    mir = LIRToMIRPass().run(lir, _cfg('lir-to-mir', enable_scheduling=True))
+    mir = MIRRegisterAllocationPass().run(mir, _cfg('mir-regalloc'))
+    bundles = MIRToVLIWPass().run(mir, _cfg('mir-codegen'))
+    return bundles
 
 
 def run_program(instrs, mem):

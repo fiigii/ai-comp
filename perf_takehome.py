@@ -42,7 +42,6 @@ from compiler import (
     HIRBuilder,
     Const,
     lower_to_lir,
-    compile_to_vliw,
     compile_hir_to_vliw,
 )
 from kernels.tree_hash import build_tree_hash_kernel
