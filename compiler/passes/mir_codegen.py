@@ -131,30 +131,9 @@ class MIRToVLIWPass(MIRCodegenPass):
         # Linearize blocks
         block_order = mir.get_block_order()
 
-        # First pass: compute label addresses (bundle-based)
-        label_map: dict[str, int] = {}
-        bundle_idx = 0
-        for block_name in block_order:
-            label_map[block_name] = bundle_idx
-            block = mir.blocks[block_name]
-            for bundle in block.bundles:
-                # Count how many VLIW bundles this MBundle will produce
-                # COND_JUMP may expand to 2 bundles (cond_jump + jump)
-                term = bundle.get_terminator()
-                if term and term.opcode == LIROpcode.COND_JUMP:
-                    # Will expand to cond_jump + maybe jump
-                    bundle_idx += 1
-                    # Check if false target is fallthrough
-                    false_target = term.operands[2]
-                    false_is_fallthrough = False
-                    # We'll handle this more precisely in second pass
-                    bundle_idx += 1  # Reserve space for potential jump
-                else:
-                    bundle_idx += 1
-
-        # Second pass: generate bundles with resolved labels
+        # Generate bundles and track block positions for label resolution
         bundles: list[dict] = []
-        bundle_positions: dict[str, int] = {}  # Block name to actual bundle index
+        bundle_positions: dict[str, int] = {}  # Block name -> bundle index
 
         for i, block_name in enumerate(block_order):
             block = mir.blocks[block_name]
@@ -177,15 +156,10 @@ class MIRToVLIWPass(MIRCodegenPass):
                                     vliw_bundle[engine] = []
                                 vliw_bundle[engine].append(slot)
 
-                    # Now emit cond_jump
+                    # Now emit cond_jump (labels resolved in final pass)
                     cond = term.operands[0]
                     true_target = term.operands[1]
                     false_target = term.operands[2]
-
-                    # Resolve true target
-                    if isinstance(true_target, str):
-                        # We'll fix this in a third pass
-                        pass
 
                     cond_slot = ("cond_jump", cond, true_target)
                     if "flow" not in vliw_bundle:
@@ -230,26 +204,21 @@ class MIRToVLIWPass(MIRCodegenPass):
                     if vliw_bundle:
                         bundles.append(vliw_bundle)
 
-        # Third pass: resolve label references in jumps
-        # Build final label map based on actual positions
-        final_label_map: dict[str, int] = {}
-        for block_name in block_order:
-            final_label_map[block_name] = bundle_positions[block_name]
-
+        # Resolve label references in jumps using bundle_positions
         for bundle in bundles:
             if "flow" in bundle:
                 new_flow = []
                 for slot in bundle["flow"]:
                     if slot[0] == "jump":
                         target = slot[1]
-                        if isinstance(target, str) and target in final_label_map:
-                            new_flow.append(("jump", final_label_map[target]))
+                        if isinstance(target, str) and target in bundle_positions:
+                            new_flow.append(("jump", bundle_positions[target]))
                         else:
                             new_flow.append(slot)
                     elif slot[0] == "cond_jump":
                         cond, target = slot[1], slot[2]
-                        if isinstance(target, str) and target in final_label_map:
-                            new_flow.append(("cond_jump", cond, final_label_map[target]))
+                        if isinstance(target, str) and target in bundle_positions:
+                            new_flow.append(("cond_jump", cond, bundle_positions[target]))
                         else:
                             new_flow.append(slot)
                     else:

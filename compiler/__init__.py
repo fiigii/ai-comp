@@ -1,11 +1,12 @@
 """
 IR Compiler for VLIW SIMD Virtual Machine
 
-Two-level IR:
+Three-level IR:
 - HIR (High-Level IR): SSA form with explicit loops and branches
 - LIR (Low-Level IR): Basic blocks with jumps, close to machine code
+- MIR (Machine IR): Bundled VLIW instructions after scheduling
 
-Compilation pipeline: HIR -> LIR -> VLIW assembly
+Compilation pipeline: HIR -> LIR -> MIR -> VLIW assembly
 """
 
 # HIR types
@@ -78,7 +79,6 @@ from .ddg import (
 # Compilation stages
 from .lowering import lower_to_lir
 from .passes.phi_elimination import eliminate_phis
-from .codegen import compile_to_vliw
 
 # Main entry point
 from .compile import compile_hir_to_vliw
@@ -87,7 +87,7 @@ from .compile import compile_hir_to_vliw
 from .printing import print_hir, print_lir, print_vliw
 
 # Passes
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LIRToVLIWPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass
 
 __all__ = [
     # HIR
@@ -111,9 +111,9 @@ __all__ = [
     'get_dag_depth', 'get_dag_width', 'find_independent_nodes',
     'print_dag', 'print_dag_tree', 'print_block_ddgs', 'print_dag_dot',
     # Compilation
-    'lower_to_lir', 'eliminate_phis', 'compile_to_vliw', 'compile_hir_to_vliw',
+    'lower_to_lir', 'eliminate_phis', 'compile_hir_to_vliw',
     # Printing
     'print_hir', 'print_lir', 'print_vliw',
     # Passes
-    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass', 'LIRToVLIWPass',
+    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass',
 ]

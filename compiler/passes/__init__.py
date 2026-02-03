@@ -18,8 +18,6 @@ from .simplify_cfg import SimplifyCFGPass
 from .copy_prop import CopyPropagationPass
 from .lir_dce import LIRDCEPass
 from .phi_elimination import PhiEliminationPass
-from .register_allocation import RegisterAllocationPass
-from .codegen import LIRToVLIWPass
 from .slp import SLPVectorizationPass
 from .mad_synthesis import MADSynthesisPass
 from .lir_to_mir import LIRToMIRPass
@@ -36,8 +34,6 @@ __all__ = [
     'CopyPropagationPass',
     'LIRDCEPass',
     'PhiEliminationPass',
-    'RegisterAllocationPass',
-    'LIRToVLIWPass',
     'SLPVectorizationPass',
     'MADSynthesisPass',
     'LIRToMIRPass',
