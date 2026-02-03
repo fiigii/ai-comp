@@ -209,13 +209,27 @@ class LIRDDGBuilder(DDGBuilder[LIRInst]):
         return inst.dest  # Scalar scratch address
 
     def get_operand_ids(self, inst: LIRInst) -> list[int | tuple]:
+        # Handle instructions with immediate operands (not scratch dependencies)
+        if inst.opcode == LIROpcode.CONST:
+            # CONST has [immediate_value] - no scratch dependencies
+            return []
+
+        if inst.opcode == LIROpcode.LOAD_OFFSET:
+            # LOAD_OFFSET has [base_scratch, offset_immediate]
+            # Only base_scratch is a dependency
+            base = inst.operands[0]
+            if isinstance(base, int):
+                return [base]
+            return []
+
+        # Default: all int operands are scratch addresses
         ids = []
         for op in inst.operands:
             if isinstance(op, int):
                 ids.append(op)  # Scratch address
             elif isinstance(op, list):
                 ids.append(tuple(op))  # Vector scratch addresses
-            # Skip immediates and labels
+            # Skip strings (labels)
         return ids
 
     def is_side_effect(self, inst: LIRInst) -> bool:
