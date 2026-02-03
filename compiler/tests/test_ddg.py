@@ -291,6 +291,69 @@ class TestLIRDDG:
         assert len(ddgs.dags) == 1
         assert ddgs.dags[0].root.instruction.opcode == LIROpcode.COND_JUMP
 
+    def test_const_has_no_operand_dependencies(self):
+        """Test that CONST instructions have no operand dependencies.
+
+        CONST has [immediate_value] which is NOT a scratch address.
+        This is a regression test for a bug where the immediate value
+        was incorrectly treated as a scratch address dependency.
+        """
+        insts = [
+            LIRInst(LIROpcode.CONST, 0, [42], "load"),    # scratch[0] = 42
+            LIRInst(LIROpcode.CONST, 1, [100], "load"),   # scratch[1] = 100
+            LIRInst(LIROpcode.ADD, 2, [0, 1], "alu"),     # scratch[2] = scratch[0] + scratch[1]
+            LIRInst(LIROpcode.STORE, None, [1, 2], "store"),
+        ]
+
+        builder = LIRDDGBuilder()
+        ddgs = builder.build(insts)
+
+        # Check that CONST instructions have no operand dependencies
+        const0_node = ddgs.def_map[0]
+        const1_node = ddgs.def_map[1]
+
+        # CONST should have empty operand_nodes (no dependencies)
+        assert len(const0_node.operand_nodes) == 0, \
+            f"CONST should have no dependencies, got {const0_node.operand_nodes}"
+        assert len(const1_node.operand_nodes) == 0, \
+            f"CONST should have no dependencies, got {const1_node.operand_nodes}"
+
+        # ADD should have 2 dependencies (scratch[0] and scratch[1])
+        add_node = ddgs.def_map[2]
+        assert len(add_node.operand_nodes) == 2
+        # The operand_nodes should be the CONST nodes (not None)
+        assert const0_node in add_node.operand_nodes
+        assert const1_node in add_node.operand_nodes
+
+    def test_load_offset_only_depends_on_base(self):
+        """Test that LOAD_OFFSET only depends on base address, not offset.
+
+        LOAD_OFFSET has [base_scratch, offset_immediate] where the offset
+        is an immediate value, NOT a scratch address.
+        This is a regression test for a bug where the offset was incorrectly
+        treated as a scratch address dependency.
+        """
+        insts = [
+            LIRInst(LIROpcode.CONST, 0, [1000], "load"),   # scratch[0] = 1000 (base addr)
+            # load_offset: scratch[1] = mem[scratch[0] + 5]
+            # operands are [base_scratch=0, offset_immediate=5]
+            LIRInst(LIROpcode.LOAD_OFFSET, 1, [0, 5], "load"),
+            LIRInst(LIROpcode.STORE, None, [0, 1], "store"),
+        ]
+
+        builder = LIRDDGBuilder()
+        ddgs = builder.build(insts)
+
+        # Get nodes
+        const_node = ddgs.def_map[0]
+        load_offset_node = ddgs.def_map[1]
+
+        # LOAD_OFFSET should only depend on base (scratch[0]), not the offset (5)
+        assert len(load_offset_node.operand_nodes) == 1, \
+            f"LOAD_OFFSET should have 1 dependency (base), got {len(load_offset_node.operand_nodes)}"
+        assert load_offset_node.operand_nodes[0] == const_node, \
+            "LOAD_OFFSET should depend on the CONST that defines the base address"
+
 
 class TestDAGUtilities:
 
