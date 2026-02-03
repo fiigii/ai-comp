@@ -5,7 +5,8 @@ This module contains passes for the compilation pipeline:
 - HIR optimization passes (e.g., loop unrolling)
 - Lowering pass (HIR -> LIR)
 - LIR transformation passes (e.g., phi elimination)
-- Codegen pass (LIR -> VLIW)
+- MIR passes (instruction scheduling, register allocation)
+- Codegen pass (MIR -> VLIW)
 """
 
 from .loop_unroll import LoopUnrollPass
@@ -21,6 +22,9 @@ from .register_allocation import RegisterAllocationPass
 from .codegen import LIRToVLIWPass
 from .slp import SLPVectorizationPass
 from .mad_synthesis import MADSynthesisPass
+from .lir_to_mir import LIRToMIRPass
+from .mir_register_allocation import MIRRegisterAllocationPass
+from .mir_codegen import MIRToVLIWPass
 
 __all__ = [
     'LoopUnrollPass',
@@ -36,4 +40,7 @@ __all__ = [
     'LIRToVLIWPass',
     'SLPVectorizationPass',
     'MADSynthesisPass',
+    'LIRToMIRPass',
+    'MIRRegisterAllocationPass',
+    'MIRToVLIWPass',
 ]

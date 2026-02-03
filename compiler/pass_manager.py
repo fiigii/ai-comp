@@ -1,16 +1,19 @@
 """
 Pass Manager Infrastructure
 
-Provides the framework for running optimization passes on HIR and LIR.
-Includes CompilerPipeline for full HIR -> LIR -> VLIW compilation.
+Provides the framework for running optimization passes on HIR, LIR, and MIR.
+Includes CompilerPipeline for full HIR -> LIR -> MIR -> VLIW compilation.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, TYPE_CHECKING
 
 from .hir import HIRFunction, ForLoop, If, Statement
 from .lir import LIRFunction
+
+if TYPE_CHECKING:
+    from .mir import MachineFunction
 
 
 @dataclass
@@ -154,6 +157,57 @@ class CodegenPass(CompilerPass):
     @abstractmethod
     def run(self, lir: LIRFunction, config: PassConfig) -> list[dict]:
         """Generate VLIW bundles from LIR."""
+        pass
+
+
+class MIRPass(CompilerPass):
+    """Base class for MIR transformation passes."""
+
+    @property
+    def input_type(self) -> str:
+        return "mir"
+
+    @property
+    def output_type(self) -> str:
+        return "mir"
+
+    @abstractmethod
+    def run(self, mir: "MachineFunction", config: PassConfig) -> "MachineFunction":
+        """Transform MIR and return new MachineFunction."""
+        pass
+
+
+class LIRToMIRLoweringPass(CompilerPass):
+    """Base class for passes that convert LIR to MIR."""
+
+    @property
+    def input_type(self) -> str:
+        return "lir"
+
+    @property
+    def output_type(self) -> str:
+        return "mir"
+
+    @abstractmethod
+    def run(self, lir: LIRFunction, config: PassConfig) -> "MachineFunction":
+        """Lower LIR to MIR with instruction scheduling."""
+        pass
+
+
+class MIRCodegenPass(CompilerPass):
+    """Base class for passes that convert MIR to VLIW bundles."""
+
+    @property
+    def input_type(self) -> str:
+        return "mir"
+
+    @property
+    def output_type(self) -> str:
+        return "vliw"
+
+    @abstractmethod
+    def run(self, mir: "MachineFunction", config: PassConfig) -> list[dict]:
+        """Generate VLIW bundles from MIR."""
         pass
 
 
@@ -352,6 +406,49 @@ class CompilerPipeline:
 
         self._print_custom_metrics(p)
 
+    def _print_lir_to_mir_metrics(self, p: CompilerPass, cfg: PassConfig,
+                                   lir_size: int, mir: "MachineFunction"):
+        """Print metrics for LIR -> MIR lowering pass."""
+        print(f"\n=== Pass: {p.name} (LIR → MIR) ===")
+        print(f"Config: {', '.join(f'{k}={v}' for k, v in cfg.options.items()) or '(default)'}")
+        print(f"LIR instructions: {lir_size} -> MIR bundles: {mir.total_bundles()}")
+        print(f"Blocks: {len(mir.blocks)}, Instructions: {mir.total_instructions()}")
+
+        self._print_custom_metrics(p)
+
+    def _print_mir_metrics(self, p: CompilerPass, cfg: PassConfig,
+                           before_bundles: int, before_insts: int,
+                           after_mir: "MachineFunction"):
+        """Print metrics for MIR -> MIR pass."""
+        after_bundles = after_mir.total_bundles()
+        after_insts = after_mir.total_instructions()
+
+        print(f"\n=== Pass: {p.name} (MIR → MIR) ===")
+        print(f"Config: {', '.join(f'{k}={v}' for k, v in cfg.options.items()) or '(default)'}")
+
+        if before_bundles > 0:
+            pct = ((after_bundles - before_bundles) / before_bundles) * 100
+            print(f"Bundles: {before_bundles} -> {after_bundles} ({pct:+.0f}%)")
+        else:
+            print(f"Bundles: {before_bundles} -> {after_bundles}")
+
+        if before_insts > 0:
+            pct = ((after_insts - before_insts) / before_insts) * 100
+            print(f"Instructions: {before_insts} -> {after_insts} ({pct:+.0f}%)")
+        else:
+            print(f"Instructions: {before_insts} -> {after_insts}")
+
+        self._print_custom_metrics(p)
+
+    def _print_mir_codegen_metrics(self, p: CompilerPass, cfg: PassConfig,
+                                    mir_bundles: int, bundles: list[dict]):
+        """Print metrics for MIR -> VLIW codegen pass."""
+        print(f"\n=== Pass: {p.name} (MIR → VLIW) ===")
+        print(f"Config: {', '.join(f'{k}={v}' for k, v in cfg.options.items()) or '(default)'}")
+        print(f"MIR bundles: {mir_bundles} -> VLIW bundles: {len(bundles)}")
+
+        self._print_custom_metrics(p)
+
     def _print_custom_metrics(self, p: CompilerPass):
         """Print pass-specific custom metrics."""
         metrics = p.get_metrics()
@@ -435,7 +532,7 @@ class CompilerPipeline:
         Returns:
             List of VLIW bundles
         """
-        from .printing import print_hir, print_lir, print_vliw
+        from .printing import print_hir, print_lir, print_vliw, print_mir
 
         if self.print_after_all:
             print("\n" + "=" * 60)
@@ -470,6 +567,9 @@ class CompilerPipeline:
                 elif p.input_type == "lir":
                     before_metrics["size"] = count_lir_instructions(state["ir"])
                     before_metrics["phis"] = count_lir_phis(state["ir"])
+                elif p.input_type == "mir":
+                    before_metrics["bundles"] = state["ir"].total_bundles()
+                    before_metrics["insts"] = state["ir"].total_instructions()
 
             # Run the pass
             result = p.run(state["ir"], cfg)
@@ -486,6 +586,13 @@ class CompilerPipeline:
                                             before_metrics["phis"], result)
                 elif p.input_type == "lir" and p.output_type == "vliw":
                     self._print_codegen_metrics(p, cfg, before_metrics["size"], result)
+                elif p.input_type == "lir" and p.output_type == "mir":
+                    self._print_lir_to_mir_metrics(p, cfg, before_metrics["size"], result)
+                elif p.input_type == "mir" and p.output_type == "mir":
+                    self._print_mir_metrics(p, cfg, before_metrics["bundles"],
+                                            before_metrics["insts"], result)
+                elif p.input_type == "mir" and p.output_type == "vliw":
+                    self._print_mir_codegen_metrics(p, cfg, before_metrics["bundles"], result)
 
             # Print IR after pass if requested
             if self.print_after_all:
@@ -496,6 +603,8 @@ class CompilerPipeline:
                     print_hir(result)
                 elif p.output_type == "lir":
                     print_lir(result)
+                elif p.output_type == "mir":
+                    print_mir(result)
                 elif p.output_type == "vliw":
                     print_vliw(result)
 

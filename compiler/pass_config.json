@@ -40,6 +40,12 @@
         "merge_blocks": true,
         "simplify_cond_jump": true
       }
+    },
+    "lir-to-mir": {
+      "enabled": true,
+      "options": {
+        "enable_scheduling": true
+      }
     }
   }
 }
