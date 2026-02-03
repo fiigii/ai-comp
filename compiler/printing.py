@@ -76,3 +76,47 @@ def print_vliw(bundles: list[dict]):
     for i, bundle in enumerate(bundles):
         print(f"[{i:4d}] {bundle}")
     print()
+
+
+def print_mir(mfunc):
+    """Pretty-print MachineFunction.
+
+    Format:
+    [bundle_num] { (0) inst1,
+                   (1) inst2,
+                   ...
+                 }
+    """
+    from .mir import MachineFunction
+
+    print(f"=== MIR (entry: {mfunc.entry}, {mfunc.total_bundles()} bundles, {mfunc.total_instructions()} insts) ===")
+
+    for name in mfunc.get_block_order():
+        block = mfunc.blocks[name]
+        pred_str = f" <- {', '.join(block.predecessors)}" if block.predecessors else ""
+        succ_str = f" -> {', '.join(block.successors)}" if block.successors else ""
+        print(f"\n{name}:{pred_str}{succ_str}")
+
+        for bundle_idx, bundle in enumerate(block.bundles):
+            num_insts = len(bundle.instructions)
+            bundle_prefix = f"  [{bundle_idx:4d}]"
+
+            if num_insts == 0:
+                print(f"{bundle_prefix} {{ <empty> }}")
+            elif num_insts == 1:
+                # Single instruction - compact format
+                inst = bundle.instructions[0]
+                print(f"{bundle_prefix} {{ (0) {inst} }}")
+            else:
+                # Multiple instructions - multi-line format
+                print(f"{bundle_prefix} {{ (0) {bundle.instructions[0]},")
+                indent = " " * (len(bundle_prefix) + 3)  # Align with first instruction
+                for inst_idx in range(1, num_insts):
+                    inst = bundle.instructions[inst_idx]
+                    if inst_idx == num_insts - 1:
+                        # Last instruction - no comma, close brace
+                        print(f"{indent}({inst_idx}) {inst} }}")
+                    else:
+                        print(f"{indent}({inst_idx}) {inst},")
+
+    print()
