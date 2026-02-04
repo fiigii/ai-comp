@@ -42,7 +42,7 @@
       }
     },
     "inst-scheduling": {
-      "enabled": false,
+      "enabled": true,
       "options": {}
     },
     "lir-to-mir": {
