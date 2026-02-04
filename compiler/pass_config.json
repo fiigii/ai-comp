@@ -41,11 +41,13 @@
         "simplify_cond_jump": true
       }
     },
+    "inst-scheduling": {
+      "enabled": false,
+      "options": {}
+    },
     "lir-to-mir": {
-      "enabled": true,
-      "options": {
-        "enable_scheduling": true
-      }
+      "enabled": false,
+      "options": {}
     }
   }
 }

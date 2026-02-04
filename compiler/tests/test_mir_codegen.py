@@ -3,7 +3,7 @@
 import unittest
 
 from compiler.lir import LIRFunction, BasicBlock, LIRInst, LIROpcode
-from compiler.passes import LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
+from compiler.passes import InstSchedulingPass, MIRRegisterAllocationPass, MIRToVLIWPass
 from compiler.pass_manager import PassConfig
 
 
@@ -14,7 +14,7 @@ def cfg(name, **opts):
 
 def compile_lir_to_vliw_via_mir(lir: LIRFunction) -> list[dict]:
     """Compile LIR to VLIW through the MIR path."""
-    mir = LIRToMIRPass().run(lir, cfg('lir-to-mir', enable_scheduling=True))
+    mir = InstSchedulingPass().run(lir, cfg('inst-scheduling'))
     mir = MIRRegisterAllocationPass().run(mir, cfg('mir-regalloc'))
     bundles = MIRToVLIWPass().run(mir, cfg('mir-codegen'))
     return bundles

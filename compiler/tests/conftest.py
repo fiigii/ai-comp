@@ -32,7 +32,7 @@ from compiler import (
     lower_to_lir,
     eliminate_phis,
 )
-from compiler.passes import LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
+from compiler.passes import InstSchedulingPass, MIRRegisterAllocationPass, MIRToVLIWPass
 from compiler.pass_manager import PassConfig
 
 
@@ -46,7 +46,7 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
 
     Note: Phis must be eliminated before calling this function.
     """
-    mir = LIRToMIRPass().run(lir, _cfg('lir-to-mir', enable_scheduling=True))
+    mir = InstSchedulingPass().run(lir, _cfg('inst-scheduling'))
     mir = MIRRegisterAllocationPass().run(mir, _cfg('mir-regalloc'))
     bundles = MIRToVLIWPass().run(mir, _cfg('mir-codegen'))
     return bundles
