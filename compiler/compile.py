@@ -14,7 +14,7 @@ from .passes import (
     DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass,
     SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass,
     SLPVectorizationPass, MADSynthesisPass,
-    LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
+    LIRToMIRPass, InstSchedulingPass, MIRRegisterAllocationPass, MIRToVLIWPass
 )
 
 
@@ -41,6 +41,13 @@ def compile_hir_to_vliw(
     with open(config_path) as f:
         config_data = json.load(f)
 
+    passes_cfg = config_data.get("passes", {})
+    inst_sched_enabled = passes_cfg.get("inst-scheduling", {}).get("enabled", False)
+
+    # Enforce mutual exclusion: exactly one LIR -> MIR lowering pass enabled
+    passes_cfg.setdefault("lir-to-mir", {})
+    passes_cfg["lir-to-mir"]["enabled"] = not inst_sched_enabled
+
     # Create pipeline with all passes in order
     pipeline = CompilerPipeline(
         print_after_all=print_after_all,
@@ -64,7 +71,11 @@ def compile_hir_to_vliw(
     pipeline.add_pass(LIRDCEPass())          # LIR -> LIR (remove dead COPYs)
     pipeline.add_pass(SimplifyCFGPass())     # LIR -> LIR (CFG cleanup after DCE)
     pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
-    pipeline.add_pass(LIRToMIRPass())        # LIR -> MIR (with instruction scheduling)
+    # LIR -> MIR (choose exactly one lowering pass)
+    if inst_sched_enabled:
+        pipeline.add_pass(InstSchedulingPass())
+    else:
+        pipeline.add_pass(LIRToMIRPass())
     pipeline.add_pass(MIRRegisterAllocationPass())  # MIR -> MIR
     pipeline.add_pass(MIRToVLIWPass())       # MIR -> VLIW
 
