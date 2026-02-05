@@ -98,7 +98,7 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
         use_ir: bool = True, print_after_all: bool = False, print_metrics: bool = False,
-        print_ddg_after_all: bool = False
+        print_ddg_after_all: bool = False, manual_opt_load: bool = False
     ):
         """
         Build kernel instructions.
@@ -109,10 +109,12 @@ class KernelBuilder:
             print_after_all: If True, print IR after each compilation pass (only for IR mode).
             print_metrics: If True, print pass metrics and diagnostics (only for IR mode).
             print_ddg_after_all: If True, print DDGs after each compilation pass (only for IR mode).
+            manual_opt_load: If True, use manually optimized load/store kernel (only for IR mode).
         """
         if use_ir:
             return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds,
-                                        print_after_all, print_metrics, print_ddg_after_all)
+                                        print_after_all, print_metrics, print_ddg_after_all,
+                                        manual_opt_load)
         return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
 
     def _build_kernel_unrolled(
@@ -207,7 +209,7 @@ class KernelBuilder:
     def build_kernel_ir(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
         print_after_all: bool = False, print_metrics: bool = False,
-        print_ddg_after_all: bool = False
+        print_ddg_after_all: bool = False, manual_opt_load: bool = False
     ):
         """
         Build kernel using the IR compiler with control flow (loops).
@@ -217,6 +219,7 @@ class KernelBuilder:
             print_after_all: If True, print IR after each compilation pass.
             print_metrics: If True, print pass metrics and diagnostics.
             print_ddg_after_all: If True, print DDGs after each compilation pass.
+            manual_opt_load: If True, use manually optimized load/store kernel.
         """
         self.instrs, _ = build_tree_hash_kernel(
             forest_height=forest_height,
@@ -226,6 +229,7 @@ class KernelBuilder:
             print_after_all=print_after_all,
             print_metrics=print_metrics,
             print_ddg_after_all=print_ddg_after_all,
+            manual_opt_load=manual_opt_load,
         )
         # Note: scratch_debug won't be populated with IR compiler
         # For now, leave it empty (debug info not critical for correctness)
@@ -245,6 +249,7 @@ def do_kernel_test(
     print_metrics: bool = False,
     print_ddg_after_all: bool = False,
     use_ir: bool = True,
+    manual_opt_load: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -255,7 +260,7 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
                     use_ir=use_ir, print_after_all=print_after_all, print_metrics=print_metrics,
-                    print_ddg_after_all=print_ddg_after_all)
+                    print_ddg_after_all=print_ddg_after_all, manual_opt_load=manual_opt_load)
     if print_vliw:
         for i, instr in enumerate(kb.instrs):
             print(f"[{i:4d}] {json.dumps(instr)}")
@@ -342,6 +347,7 @@ class Tests(unittest.TestCase):
 #    --print-vliw        Print the final VLIW instructions
 #    --print-after-all   Print IR after each compilation pass
 #    --no-ir             Use the original unrolled kernel instead of IR
+#    --manual-opt-load   Use manually optimized load/store kernel (2135 cycles vs 2607)
 
 if __name__ == "__main__":
     import sys
@@ -351,7 +357,7 @@ if __name__ == "__main__":
     # Only route to argparse when a known custom flag is present
     custom_flags = {'--print-vliw', '--print-after-all', '--print-ddg-after-all', '--no-ir', '--trace',
                     '--forest-height', '--rounds', '--batch-size',
-                    '--print-metrics'}
+                    '--print-metrics', '--manual-opt-load'}
     has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
 
     if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):
@@ -370,6 +376,8 @@ if __name__ == "__main__":
                             help="Print DDGs after each compilation pass")
         parser.add_argument("--no-ir", action="store_true",
                             help="Use the original unrolled kernel instead of IR")
+        parser.add_argument("--manual-opt-load", action="store_true",
+                            help="Use manually optimized load/store kernel")
         parser.add_argument("--trace", action="store_true",
                             help="Enable execution trace")
         parser.add_argument("--forest-height", type=int, default=10,
@@ -390,6 +398,7 @@ if __name__ == "__main__":
             print_metrics=args.print_metrics,
             print_ddg_after_all=args.print_ddg_after_all,
             use_ir=not args.no_ir,
+            manual_opt_load=args.manual_opt_load,
         )
     else:
         # Run unittest by default
