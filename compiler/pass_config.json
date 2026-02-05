@@ -38,7 +38,9 @@
     },
     "slp-vectorization": {
       "enabled": true,
-      "options": {}
+      "options": {
+        "restrict_ptr": true
+      }
     },
     "mad-synthesis": {
       "enabled": true,

@@ -17,8 +17,10 @@ from ..hir import (
     SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, ForLoop, If,
     Halt, Pause, Statement, HIRFunction
 )
+from ..alias_analysis import AliasAnalysis
 from ..pass_manager import Pass, PassConfig
 from ..ddg import HIRDDGBuilder, BlockDDGs, DDGNode
+from ..use_def import UseDefContext
 
 # Vector length for this architecture
 VLEN = 8
@@ -157,6 +159,7 @@ class SLPVectorizationPass(Pass):
         self._seeds_found = 0
         self._packs_created = 0
         self._ops_vectorized = 0
+        self._alias: Optional[AliasAnalysis] = None
         # Global SSA id cursors for new values created during this pass.
         # These must be monotonically increasing across all vectorized blocks
         # in the function to avoid SSA id collisions.
@@ -180,6 +183,7 @@ class SLPVectorizationPass(Pass):
         self._next_ssa_id = hir.num_ssa_values
         self._entry_broadcasts = []
         self._entry_broadcast_cache = {}
+        self._alias = AliasAnalysis(UseDefContext(hir), restrict_ptr=config.options.get("restrict_ptr", False))
 
         if not config.enabled:
             return hir
@@ -462,49 +466,17 @@ class SLPVectorizationPass(Pass):
         if cached is not None:
             return cached
 
-        if isinstance(addr, Const):
-            result = (("const",), addr.value)
+        if self._alias is None:
+            result = (None, 0)
             ctx.addr_analysis_cache[cache_key] = result
             return result
 
-        if isinstance(addr, SSAValue):
-            # Prefer O(1) lookup by stable cache key, instead of scanning the DDG.
-            def_op = ctx.result_to_op.get(cache_key)
-            if def_op is not None and def_op.opcode == "+":
-                left, right = def_op.operands[0], def_op.operands[1]
+        addr_key = self._alias.normalize(addr)
+        if addr_key is None:
+            result = (None, 0)
+        else:
+            result = (addr_key.base, addr_key.offset)
 
-                # Check if right is a constant
-                if isinstance(right, Const):
-                    left_base, left_offset = self._analyze_address(left, ctx)
-                    if left_base is not None:
-                        result = (left_base, left_offset + right.value)
-                        ctx.addr_analysis_cache[cache_key] = result
-                        return result
-
-                # Check if left is a constant (commutative)
-                if isinstance(left, Const):
-                    right_base, right_offset = self._analyze_address(right, ctx)
-                    if right_base is not None:
-                        result = (right_base, right_offset + left.value)
-                        ctx.addr_analysis_cache[cache_key] = result
-                        return result
-
-                # Both non-constant: combine bases
-                left_base, left_offset = self._analyze_address(left, ctx)
-                right_base, right_offset = self._analyze_address(right, ctx)
-
-                if left_base is not None and right_base is not None:
-                    combined_base = (left_base, right_base)
-                    result = (combined_base, left_offset + right_offset)
-                    ctx.addr_analysis_cache[cache_key] = result
-                    return result
-
-            # Unknown or non-add def: treat the SSA itself as the base.
-            result = (cache_key, 0)
-            ctx.addr_analysis_cache[cache_key] = result
-            return result
-
-        result = (None, 0)
         ctx.addr_analysis_cache[cache_key] = result
         return result
 
