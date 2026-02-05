@@ -21,6 +21,7 @@ from .phi_elimination import PhiEliminationPass
 from .slp import SLPVectorizationPass
 from .mad_synthesis import MADSynthesisPass
 from .load_elim import LoadElimPass
+from .dse import DSEPass
 from .lir_to_mir import LIRToMIRPass
 from .inst_scheduling import InstSchedulingPass
 from .mir_register_allocation import MIRRegisterAllocationPass
@@ -39,6 +40,7 @@ __all__ = [
     'SLPVectorizationPass',
     'MADSynthesisPass',
     'LoadElimPass',
+    'DSEPass',
     'LIRToMIRPass',
     'InstSchedulingPass',
     'MIRRegisterAllocationPass',

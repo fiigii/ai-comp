@@ -26,7 +26,15 @@
     },
     "load-elim": {
       "enabled": true,
-      "options": {}
+      "options": {
+        "restrict_ptr": true
+      }
+    },
+    "dse": {
+      "enabled": true,
+      "options": {
+        "restrict_ptr": true
+      }
     },
     "slp-vectorization": {
       "enabled": true,

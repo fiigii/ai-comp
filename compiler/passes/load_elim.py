@@ -96,7 +96,8 @@ class LoadElimPass(Pass):
             return hir
 
         self._use_def_ctx = UseDefContext(hir)
-        self._alias = AliasAnalysis(self._use_def_ctx)
+        restrict_ptr = config.options.get("restrict_ptr", False)
+        self._alias = AliasAnalysis(self._use_def_ctx, restrict_ptr=restrict_ptr)
 
         state = MemoryState(self._alias)
         new_body = self._transform_statements(hir.body, state)

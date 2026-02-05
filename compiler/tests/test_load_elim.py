@@ -9,7 +9,7 @@ from compiler.tests.conftest import (
     HIRBuilder,
     compile_hir_to_vliw,
 )
-from compiler import PassManager
+from compiler import PassManager, PassConfig
 from compiler.passes import LoadElimPass
 from compiler.hir import Op, ForLoop, If
 
@@ -52,6 +52,7 @@ class TestLoadElimPass(unittest.TestCase):
 
         pm = PassManager()
         pm.add_pass(LoadElimPass())
+        pm.config["load-elim"] = PassConfig(name="load-elim", enabled=True, options={"restrict_ptr": True})
         transformed = pm.run(hir)
 
         # One load should be eliminated
@@ -83,6 +84,7 @@ class TestLoadElimPass(unittest.TestCase):
 
         pm = PassManager()
         pm.add_pass(LoadElimPass())
+        pm.config["load-elim"] = PassConfig(name="load-elim", enabled=True, options={"restrict_ptr": True})
         transformed = pm.run(hir)
 
         self.assertEqual(
@@ -109,9 +111,10 @@ class TestLoadElimPass(unittest.TestCase):
 
         pm = PassManager()
         pm.add_pass(LoadElimPass())
+        pm.config["load-elim"] = PassConfig(name="load-elim", enabled=True, options={"restrict_ptr": False})
         transformed = pm.run(hir)
 
-        # Load should remain due to may-alias store
+        # With restrict_ptr disabled, load should remain due to may-alias store
         self.assertEqual(
             _count_opcodes(hir.body, "load"),
             _count_opcodes(transformed.body, "load"),
@@ -136,6 +139,7 @@ class TestLoadElimPass(unittest.TestCase):
 
         pm = PassManager()
         pm.add_pass(LoadElimPass())
+        pm.config["load-elim"] = PassConfig(name="load-elim", enabled=True, options={"restrict_ptr": True})
         transformed = pm.run(hir)
 
         self.assertEqual(
@@ -156,6 +160,7 @@ class TestLoadElimPass(unittest.TestCase):
 
         pm = PassManager()
         pm.add_pass(LoadElimPass())
+        pm.config["load-elim"] = PassConfig(name="load-elim", enabled=True, options={"restrict_ptr": True})
         transformed = pm.run(hir)
 
         self.assertEqual(
