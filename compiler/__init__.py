@@ -59,6 +59,9 @@ from .ssa_context import SSARenumberContext
 # Use-def chain infrastructure
 from .use_def import UseDefContext, DefLocation, UseLocation
 
+# Alias analysis
+from .alias_analysis import AliasAnalysis, AliasResult, AddrKey
+
 # Data Dependency Graph
 from .ddg import (
     DDGNode,
@@ -87,7 +90,7 @@ from .compile import compile_hir_to_vliw
 from .printing import print_hir, print_lir, print_vliw
 
 # Passes
-from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass
+from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LoadElimPass
 
 __all__ = [
     # HIR
@@ -105,6 +108,8 @@ __all__ = [
     'SSARenumberContext',
     # Use-def chain infrastructure
     'UseDefContext', 'DefLocation', 'UseLocation',
+    # Alias analysis
+    'AliasAnalysis', 'AliasResult', 'AddrKey',
     # Data Dependency Graph
     'DDGNode', 'DataDependencyDAG', 'BlockDDGs', 'DDGBuilder',
     'HIRDDGBuilder', 'LIRDDGBuilder',
@@ -115,5 +120,5 @@ __all__ = [
     # Printing
     'print_hir', 'print_lir', 'print_vliw',
     # Passes
-    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass',
+    'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass', 'LoadElimPass',
 ]
