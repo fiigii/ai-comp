@@ -42,6 +42,12 @@
         "restrict_ptr": true
       }
     },
+    "level-cache": {
+      "enabled": true,
+      "options": {
+        "max_range_size": 16
+      }
+    },
     "mad-synthesis": {
       "enabled": true,
       "options": {}

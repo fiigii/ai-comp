@@ -22,6 +22,7 @@ from .slp import SLPVectorizationPass
 from .mad_synthesis import MADSynthesisPass
 from .load_elim import LoadElimPass
 from .dse import DSEPass
+from .level_cache import LevelCachePass
 from .lir_to_mir import LIRToMIRPass
 from .inst_scheduling import InstSchedulingPass
 from .mir_register_allocation import MIRRegisterAllocationPass
@@ -41,6 +42,7 @@ __all__ = [
     'MADSynthesisPass',
     'LoadElimPass',
     'DSEPass',
+    'LevelCachePass',
     'LIRToMIRPass',
     'InstSchedulingPass',
     'MIRRegisterAllocationPass',
