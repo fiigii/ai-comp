@@ -172,6 +172,16 @@ class HIRBuilder:
         """Store VLEN consecutive words to memory."""
         self._emit(Op("vstore", None, [addr, vec], "store"))
 
+    def vgather(self, addr_vec: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
+        """Load from 8 different addresses (one per lane).
+
+        addr_vec: A VectorSSAValue containing 8 addresses
+        Returns: A VectorSSAValue with values from those addresses
+        """
+        result = self._new_vec_ssa(name)
+        self._emit(Op("vgather", result, [addr_vec], "load"))
+        return result
+
     def vselect(self, cond: VectorSSAValue, a: VectorSSAValue, b: VectorSSAValue, name: Optional[str] = None) -> VectorSSAValue:
         """Per-lane vector select: cond[i] ? a[i] : b[i]."""
         result = self._new_vec_ssa(name)
