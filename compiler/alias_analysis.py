@@ -41,12 +41,14 @@ class AliasAnalysis:
     - If base matches and ranges overlap:
         - exact same range => MUST_ALIAS
         - overlapping ranges => MAY_ALIAS
+    - If base differs and restrict_ptr is set => NO_ALIAS (ignores offsets)
     - If base differs and both are distinct memslot roots => NO_ALIAS
     - Otherwise => MAY_ALIAS
     """
 
-    def __init__(self, use_def: UseDefContext):
+    def __init__(self, use_def: UseDefContext, restrict_ptr: bool = False):
         self._use_def = use_def
+        self._restrict_ptr = restrict_ptr
         self._norm_cache: dict[SSAValue, Optional[AddrKey]] = {}
         self._alias_cache: dict[tuple[Optional[AddrKey], int, Optional[AddrKey], int], AliasResult] = {}
         self.alias_queries = 0
@@ -126,8 +128,9 @@ class AliasAnalysis:
         elif a_key.base == b_key.base:
             res = self._alias_same_base(a_key, a_width, b_key, b_width)
         else:
-            # Distinct memslot roots are considered no-alias
-            if _is_memslot_base(a_key.base) and _is_memslot_base(b_key.base):
+            if self._restrict_ptr:
+                res = AliasResult.NO_ALIAS
+            elif _is_memslot_base(a_key.base) and _is_memslot_base(b_key.base):
                 res = AliasResult.NO_ALIAS
             else:
                 res = AliasResult.MAY_ALIAS
