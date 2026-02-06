@@ -304,11 +304,10 @@ def _linear_scan(intervals: list[LiveInterval]) -> tuple[dict[int, int], int]:
     """
     allocation: dict[int, int] = {}
 
-    # Separate free lists for scalars and vectors
-    scalar_free: list[int] = []
-    vector_free: list[int] = []
+    # Free ranges of physical registers, inclusive ranges (start, end)
+    free_ranges: list[tuple[int, int]] = []
 
-    # Next available physical register
+    # Next available physical register (high-water mark)
     next_preg = 0
 
     # Active intervals sorted by end position
@@ -321,27 +320,18 @@ def _linear_scan(intervals: list[LiveInterval]) -> tuple[dict[int, int], int]:
             if a.end < interval.start:
                 # This interval has expired, free its register
                 preg = allocation[a.vreg]
-                if a.is_vector:
-                    vector_free.append(preg)
-                else:
-                    scalar_free.append(preg)
+                size = VLEN if a.is_vector else 1
+                _add_free_range(free_ranges, preg, preg + size - 1)
             else:
                 new_active.append(a)
         active = new_active
 
         # Allocate register for current interval
-        if interval.is_vector:
-            if vector_free:
-                preg = vector_free.pop()
-            else:
-                preg = next_preg
-                next_preg += VLEN
-        else:
-            if scalar_free:
-                preg = scalar_free.pop()
-            else:
-                preg = next_preg
-                next_preg += 1
+        size = VLEN if interval.is_vector else 1
+        preg = _alloc_from_free(free_ranges, size)
+        if preg is None:
+            preg = next_preg
+            next_preg += size
 
         allocation[interval.vreg] = preg
 
@@ -350,6 +340,63 @@ def _linear_scan(intervals: list[LiveInterval]) -> tuple[dict[int, int], int]:
 
     max_preg_used = next_preg - 1 if next_preg > 0 else 0
     return allocation, max_preg_used
+
+
+def _add_free_range(free_ranges: list[tuple[int, int]], start: int, end: int) -> None:
+    """Add a free range and merge overlaps/adjacent ranges."""
+    if start > end:
+        return
+    free_ranges.append((start, end))
+    free_ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in free_ranges:
+        if not merged or s > merged[-1][1] + 1:
+            merged.append((s, e))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+    free_ranges[:] = merged
+
+
+def _alloc_from_free(free_ranges: list[tuple[int, int]], size: int) -> int | None:
+    """Allocate a contiguous range of the given size from free_ranges."""
+
+    def pick_best(indices: list[int]) -> int | None:
+        best_idx = None
+        best_size = None
+        for i in indices:
+            s, e = free_ranges[i]
+            avail = e - s + 1
+            if avail < size:
+                continue
+            if best_size is None or avail < best_size:
+                best_idx = i
+                best_size = avail
+        return best_idx
+
+    idx = None
+    if size == 1:
+        small = [i for i, (s, e) in enumerate(free_ranges) if (e - s + 1) < VLEN]
+        idx = pick_best(small)
+        if idx is None:
+            larger = [i for i, (s, e) in enumerate(free_ranges) if (e - s + 1) > VLEN]
+            idx = pick_best(larger)
+        if idx is None:
+            exact = [i for i, (s, e) in enumerate(free_ranges) if (e - s + 1) == VLEN]
+            idx = pick_best(exact)
+    else:
+        idx = pick_best(list(range(len(free_ranges))))
+
+    if idx is None:
+        return None
+
+    s, e = free_ranges[idx]
+    alloc_start = s
+    alloc_end = s + size - 1
+    if alloc_end == e:
+        free_ranges.pop(idx)
+    else:
+        free_ranges[idx] = (alloc_end + 1, e)
+    return alloc_start
 
 
 def _rewrite_mir(mfunc: MachineFunction, allocation: dict[int, int],

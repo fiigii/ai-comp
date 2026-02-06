@@ -36,6 +36,13 @@
         "restrict_ptr": true
       }
     },
+    "tree-level-cache": {
+      "enabled": true,
+      "options": {
+        "levels": 3,
+        "estimate_ops": true
+      }
+    },
     "slp-vectorization": {
       "enabled": true,
       "options": {

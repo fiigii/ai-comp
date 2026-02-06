@@ -14,6 +14,7 @@ from .passes import (
     DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass,
     SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass,
     SLPVectorizationPass, MADSynthesisPass, LoadElimPass, DSEPass,
+    TreeLevelCachePass,
     LIRToMIRPass, InstSchedulingPass, MIRRegisterAllocationPass, MIRToVLIWPass
 )
 
@@ -64,6 +65,7 @@ def compile_hir_to_vliw(
     pipeline.add_pass(CSEPass())             # HIR -> HIR
     pipeline.add_pass(LoadElimPass())        # HIR -> HIR (store-to-load forwarding)
     pipeline.add_pass(DSEPass())             # HIR -> HIR (dead store elimination)
+    pipeline.add_pass(TreeLevelCachePass())  # HIR -> HIR (tree top-level cache)
     pipeline.add_pass(SLPVectorizationPass())  # HIR -> HIR (vectorization)
     pipeline.add_pass(DCEPass())             # HIR -> HIR
     pipeline.add_pass(CSEPass())             # HIR -> HIR (deduplicate SLP-generated broadcasts)
