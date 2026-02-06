@@ -62,16 +62,20 @@ class TreeLevelCachePass(Pass):
             self._add_metric_message("unable to infer batch_size, skipping")
             return hir
 
+        wrap_period = self._infer_wrap_period(hir.body)
         replacements = self._find_replacements(
-            hir.body, use_def, forest_values_p, batch_size, levels
+            hir.body, use_def, forest_values_p, batch_size, levels, wrap_period
         )
         if not replacements:
             self._add_metric_message("no eligible node loads found")
             return hir
 
         self._next_ssa_id = hir.num_ssa_values
-        preload_ops, node_vals = self._emit_preloads(forest_values_p, levels)
-        self._preloads_inserted = len(node_vals)
+        preload_ops: list[Op] = []
+        node_vals: list[SSAValue] = []
+        if replacements:
+            preload_ops, node_vals = self._emit_preloads(forest_values_p, levels)
+            self._preloads_inserted = len(node_vals)
 
         # Replace loads with select trees
         new_body: list[Statement] = []
@@ -104,12 +108,13 @@ class TreeLevelCachePass(Pass):
             metrics = {
                 "levels": levels,
                 "batch_size": batch_size,
+                "wrap_period": wrap_period,
                 "node_loads_seen": self._node_loads_seen,
                 "node_loads_replaced": self._node_loads_replaced,
                 "preloads_inserted": self._preloads_inserted,
             }
             if estimate_ops:
-                estimated_flow = self._estimate_flow_ops(levels, self._node_loads_replaced)
+                estimated_flow = self._estimate_flow_ops(replacements)
                 metrics["estimated_flow_ops"] = estimated_flow
                 metrics["estimated_loads_removed"] = self._node_loads_replaced
             self._metrics.custom = metrics
@@ -165,6 +170,33 @@ class TreeLevelCachePass(Pass):
             return 0
         return max(offsets) + 1
 
+    @staticmethod
+    def _infer_wrap_period(body: list[Statement]) -> Optional[int]:
+        """Infer deterministic wrap period from constant n_nodes if available.
+
+        For a complete binary tree (n_nodes == 2**h - 1), index depth advances
+        by one level each round and wraps to root every h rounds.
+        """
+        candidates: set[int] = set()
+        for stmt in body:
+            if not isinstance(stmt, Op) or stmt.opcode != "<" or len(stmt.operands) != 2:
+                continue
+            a, b = stmt.operands
+            if isinstance(a, Const):
+                candidates.add(a.value)
+            if isinstance(b, Const):
+                candidates.add(b.value)
+        if not candidates:
+            return None
+
+        n_nodes = max(candidates)
+        if n_nodes <= 0:
+            return None
+        full = n_nodes + 1
+        if full & (full - 1) != 0:
+            return None
+        return full.bit_length() - 1
+
     def _find_replacements(
         self,
         body: list[Statement],
@@ -172,6 +204,7 @@ class TreeLevelCachePass(Pass):
         forest_values_p: SSAValue,
         batch_size: int,
         levels: int,
+        wrap_period: Optional[int],
     ) -> dict[int, tuple[SSAValue, int, SSAValue]]:
         replacements: dict[int, tuple[SSAValue, int, SSAValue]] = {}
         node_load_idx = 0
@@ -188,8 +221,11 @@ class TreeLevelCachePass(Pass):
             self._node_loads_seen += 1
             round_idx = node_load_idx // batch_size
             node_load_idx += 1
-            if round_idx < levels:
-                replacements[idx] = (idx_ssa, round_idx, stmt.result)
+            phase = round_idx
+            if wrap_period is not None and wrap_period > 0:
+                phase = round_idx % wrap_period
+            if phase < levels:
+                replacements[idx] = (idx_ssa, phase, stmt.result)
         return replacements
 
     @staticmethod
@@ -260,21 +296,10 @@ class TreeLevelCachePass(Pass):
         return current[0]
 
     @staticmethod
-    def _estimate_flow_ops(levels: int, replacements: int) -> int:
-        """Estimate flow ops introduced by select trees per replacement."""
-        # For level L (0-based round index), select tree uses 2**L - 1 selects.
-        # We approximate average selects by summing over levels applied.
-        total_selects_per_batch = 0
-        for lvl in range(levels):
-            if lvl == 0:
-                selects = 0
-            else:
-                selects = (1 << lvl) - 1
-            total_selects_per_batch += selects
-
-        if levels == 0:
-            return 0
-        # replacements are across all levels; average selects per replacement:
-        # total_selects_per_batch / levels
-        avg_selects = total_selects_per_batch / levels
-        return int(avg_selects * replacements)
+    def _estimate_flow_ops(replacements: dict[int, tuple[SSAValue, int, SSAValue]]) -> int:
+        """Estimate flow ops introduced by select trees from exact levels."""
+        total = 0
+        for _, level, _ in replacements.values():
+            if level > 0:
+                total += (1 << level) - 1
+        return total

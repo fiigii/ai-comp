@@ -16,8 +16,8 @@
         "constant_folding": true,
         "identities": true,
         "strength_reduction": true,
-        "select_optimization": true,
-        "select_to_alu_mux": true,
+        "select_optimization": false,
+        "select_to_alu_mux": false,
         "parity_pattern": true
       }
     },
@@ -40,7 +40,7 @@
     "tree-level-cache": {
       "enabled": true,
       "options": {
-        "levels": 2,
+        "levels": 3,
         "estimate_ops": true
       }
     },
@@ -67,7 +67,12 @@
       "enabled": true,
       "options": {
         "prefer_load_fill": true,
-        "devectorize_valu_to_alu": true
+        "devectorize_valu_to_alu": true,
+        "devectorize_vector_ops_to_alu": true,
+        "devectorize_vbroadcast_to_alu": true,
+        "devectorize_multiply_add_to_alu": false,
+        "devectorize_multiply_add_pre_expand": false,
+        "prioritize_load_unblock": true
       }
     },
     "lir-to-mir": {

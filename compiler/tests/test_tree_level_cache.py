@@ -122,6 +122,51 @@ class TestTreeLevelCachePass(unittest.TestCase):
         select_count = _count_opcodes(transformed.body, "select")
         self.assertEqual(select_count, batch_size)
 
+    def test_replaces_levels_again_after_wrap_period(self):
+        b = HIRBuilder()
+        forest_values_p = b.load(b.const(4), "forest_values_p")
+        inp_indices_p = b.load(b.const(5), "inp_indices_p")
+        b.pause()
+
+        batch_size = 2
+        rounds = 5
+
+        # Provide a constant n_nodes-like compare so the pass can infer:
+        # n_nodes=7 -> wrap period = log2(7+1) = 3 rounds.
+        _ = b.lt(b.const(0), b.const(7), "period_hint")
+
+        for r in range(rounds):
+            for i in range(batch_size):
+                idx_addr = b.add(inp_indices_p, b.const(i), f"idx_addr_r{r}_{i}")
+                idx = b.load(idx_addr, f"idx_r{r}_{i}")
+                node_addr = b.add(forest_values_p, idx, f"node_addr_r{r}_{i}")
+                node_val = b.load(node_addr, f"node_val_r{r}_{i}")
+                tmp = b.add(node_val, b.const(1), f"tmp_r{r}_{i}")
+                b.store(b.const(200 + r * batch_size + i), tmp)
+
+        hir = b.build()
+
+        forest_before = _find_header_load(hir.body, 4)
+        self.assertIsNotNone(forest_before)
+        before_dynamic = _count_dynamic_node_loads(hir, forest_before)
+        self.assertEqual(before_dynamic, batch_size * rounds)
+
+        pm = PassManager()
+        pm.add_pass(TreeLevelCachePass())
+        pm.config["tree-level-cache"] = PassConfig(
+            name="tree-level-cache", enabled=True, options={"levels": 2}
+        )
+        transformed = pm.run(hir)
+
+        forest_after = _find_header_load(transformed.body, 4)
+        self.assertIsNotNone(forest_after)
+        after_dynamic = _count_dynamic_node_loads(transformed, forest_after)
+        # With period=3 and levels=2, cached rounds are phases 0 and 1:
+        # rounds 0,1,3,4 replaced, round 2 remains.
+        self.assertEqual(after_dynamic, batch_size * 1)
+
+        preload_count = _count_const_forest_loads(transformed, forest_after)
+        self.assertEqual(preload_count, (1 << 2) - 1)
 
 if __name__ == "__main__":
     unittest.main()

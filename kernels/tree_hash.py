@@ -52,12 +52,16 @@ def build_tree_hash_kernel(
         return b.load(addr, name)
 
     rounds_val = load_header(0, "rounds")
-    n_nodes_val = load_header(1, "n_nodes")
+    _n_nodes_loaded = load_header(1, "n_nodes")
     batch_size_val = load_header(2, "batch_size")
     forest_height_val = load_header(3, "forest_height")
     forest_values_p = load_header(4, "forest_values_p")
     inp_indices_p = load_header(5, "inp_indices_p")
     inp_values_p = load_header(6, "inp_values_p")
+
+    # n_nodes is a compile-time kernel parameter. Materializing it as Const
+    # enables downstream passes (e.g. periodic tree-level-cache round analysis).
+    n_nodes_val = Const(n_nodes)
 
     # Constants (as SSAValues for use in computations)
     zero = b.const(0)
