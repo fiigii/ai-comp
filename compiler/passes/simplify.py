@@ -40,6 +40,7 @@ class SimplifyPass(Pass):
     - Annihilation: x * 0 -> 0, x & 0 -> 0
     - Strength reduction: % 2 -> & 1, << n -> * 2^n
     - Select optimization: select(cond, x, 0) -> *(x, cond) when cond is boolean
+    - Select-to-ALU mux: select(cond, a, b) -> b + cond * (a - b) when cond is boolean
     - Parity pattern: ==(x & 1, 0) followed by select(cond, 1, 2) -> (x & 1) + 1
     """
 
@@ -49,6 +50,7 @@ class SimplifyPass(Pass):
         self._identities_simplified = 0
         self._strength_reductions = 0
         self._select_optimizations = 0
+        self._select_to_alu_mux = 0
         self._parity_patterns = 0
         # SSA values known to be boolean (0 or 1) - from comparisons or & 1
         self._boolean_values: set[SSAValue] = set()
@@ -59,6 +61,7 @@ class SimplifyPass(Pass):
         self._opts: dict[str, bool] = {}
         # Use-def context for efficient replacements
         self._use_def_ctx: Optional[UseDefContext] = None
+        self._next_ssa_id = 0
 
     @property
     def name(self) -> str:
@@ -71,6 +74,7 @@ class SimplifyPass(Pass):
         self._identities_simplified = 0
         self._strength_reductions = 0
         self._select_optimizations = 0
+        self._select_to_alu_mux = 0
         self._parity_patterns = 0
         self._boolean_values = set()
         self._negated_boolean = {}
@@ -81,6 +85,7 @@ class SimplifyPass(Pass):
             "identities": config.options.get("identities", True),
             "strength_reduction": config.options.get("strength_reduction", True),
             "select_optimization": config.options.get("select_optimization", True),
+            "select_to_alu_mux": config.options.get("select_to_alu_mux", False),
             "parity_pattern": config.options.get("parity_pattern", True),
         }
 
@@ -90,6 +95,7 @@ class SimplifyPass(Pass):
 
         # Create use-def context for efficient value replacement
         self._use_def_ctx = UseDefContext(hir)
+        self._next_ssa_id = hir.num_ssa_values
 
         # Transform body
         new_body = self._transform_statements(hir.body)
@@ -101,13 +107,15 @@ class SimplifyPass(Pass):
                 "identities_simplified": self._identities_simplified,
                 "strength_reductions": self._strength_reductions,
                 "select_optimizations": self._select_optimizations,
+                "select_to_alu_mux": self._select_to_alu_mux,
                 "parity_patterns": self._parity_patterns,
             }
 
         return HIRFunction(
             name=hir.name,
             body=new_body,
-            num_ssa_values=hir.num_ssa_values
+            num_ssa_values=max(hir.num_ssa_values, self._next_ssa_id),
+            num_vec_ssa_values=hir.num_vec_ssa_values,
         )
 
     def _transform_statements(self, stmts: list[Statement]) -> list[Statement]:
@@ -117,7 +125,11 @@ class SimplifyPass(Pass):
         for stmt in stmts:
             if isinstance(stmt, Op):
                 transformed = self._transform_op(stmt)
-                if transformed is not None:
+                if transformed is None:
+                    continue
+                if isinstance(transformed, list):
+                    result.extend(transformed)
+                else:
                     result.append(transformed)
             elif isinstance(stmt, ForLoop):
                 result.append(self._transform_for_loop(stmt))
@@ -129,7 +141,7 @@ class SimplifyPass(Pass):
 
         return result
 
-    def _transform_op(self, op: Op) -> Op:
+    def _transform_op(self, op: Op) -> Op | list[Op] | None:
         """Apply simplifications to a single Op."""
         # Handle select (3 operands)
         if op.opcode == "select" and op.result is not None and len(op.operands) == 3:
@@ -313,7 +325,7 @@ class SimplifyPass(Pass):
 
         return None, None
 
-    def _try_simplify_select(self, op: Op) -> Optional[Op]:
+    def _try_simplify_select(self, op: Op) -> Optional[Op | list[Op]]:
         """Try to simplify select operations."""
         cond, true_val, false_val = op.operands
         result = op.result
@@ -339,9 +351,26 @@ class SimplifyPass(Pass):
                 self._select_optimizations += 1
                 return Op("*", result, [true_val, cond], "alu")
 
+        # Generic boolean select to ALU mux:
+        # select(cond, a, b) = b + cond * (a - b), where cond is 0/1.
+        if self._opts.get("select_to_alu_mux", False) and self._is_boolean(cond):
+            self._select_to_alu_mux += 1
+            delta = self._new_temp("sel_delta")
+            scaled = self._new_temp("sel_scaled")
+            return [
+                Op("-", delta, [true_val, false_val], "alu"),
+                Op("*", scaled, [cond, delta], "alu"),
+                Op("+", result, [false_val, scaled], "alu"),
+            ]
+
         # select(cond, 0, x) -> *(x, 1-cond) is more complex, skip for now
 
         return None
+
+    def _new_temp(self, name: Optional[str] = None) -> SSAValue:
+        ssa = SSAValue(self._next_ssa_id, name)
+        self._next_ssa_id += 1
+        return ssa
 
     def _transform_for_loop(self, loop: ForLoop) -> ForLoop:
         """Transform a ForLoop."""

@@ -15,6 +15,21 @@ from compiler import (
     SimplifyPass,
     count_statements,
 )
+from compiler.hir import Op, ForLoop, If
+
+
+def _count_opcode(body, opcode: str) -> int:
+    count = 0
+    for stmt in body:
+        if isinstance(stmt, Op):
+            if stmt.opcode == opcode:
+                count += 1
+        elif isinstance(stmt, ForLoop):
+            count += _count_opcode(stmt.body, opcode)
+        elif isinstance(stmt, If):
+            count += _count_opcode(stmt.then_body, opcode)
+            count += _count_opcode(stmt.else_body, opcode)
+    return count
 
 
 class TestSimplifyPass(unittest.TestCase):
@@ -606,6 +621,81 @@ class TestSimplifyPass(unittest.TestCase):
                            f"Failed for x={x_val}, expected {expected}")
 
         print("Simplify parity pattern test passed!")
+
+    def test_select_to_alu_mux_knob_enabled(self):
+        """Lower select(cond,a,b) to ALU mux when select_to_alu_mux is enabled."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        a = b.load(b.const(1), "a")
+        c = b.load(b.const(2), "c")
+        cond = b.lt(x, b.const(5), "cond")
+        out = b.select(cond, a, c, "out")
+        b.store(b.const(3), out)
+
+        hir = b.build()
+        before_selects = _count_opcode(hir.body, "select")
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        pm.config["simplify"] = PassConfig(
+            name="simplify",
+            enabled=True,
+            options={
+                "constant_folding": True,
+                "identities": True,
+                "strength_reduction": True,
+                "select_optimization": True,
+                "select_to_alu_mux": True,
+                "parity_pattern": True,
+            },
+        )
+        simplified = pm.run(hir)
+
+        self.assertEqual(before_selects, 1)
+        self.assertEqual(_count_opcode(simplified.body, "select"), 0)
+        self.assertGreaterEqual(_count_opcode(simplified.body, "*"), 1)
+        self.assertGreaterEqual(_count_opcode(simplified.body, "-"), 1)
+        self.assertGreaterEqual(_count_opcode(simplified.body, "+"), 1)
+
+        instrs = compile_hir_to_vliw(simplified)
+        test_cases = [
+            (0, 11, 99, 11),
+            (4, 123, 7, 123),
+            (5, 42, 9, 9),
+            (8, 77, 33, 33),
+        ]
+        for x_val, a_val, c_val, expected in test_cases:
+            mem = [x_val, a_val, c_val, 0] + [0] * 96
+            machine = self._run_program(instrs, mem)
+            self.assertEqual(machine.mem[3], expected)
+
+    def test_select_to_alu_mux_knob_disabled(self):
+        """Keep generic select when select_to_alu_mux is disabled."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        a = b.load(b.const(1), "a")
+        c = b.load(b.const(2), "c")
+        cond = b.lt(x, b.const(5), "cond")
+        out = b.select(cond, a, c, "out")
+        b.store(b.const(3), out)
+
+        hir = b.build()
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        pm.config["simplify"] = PassConfig(
+            name="simplify",
+            enabled=True,
+            options={
+                "constant_folding": True,
+                "identities": True,
+                "strength_reduction": True,
+                "select_optimization": True,
+                "select_to_alu_mux": False,
+                "parity_pattern": True,
+            },
+        )
+        simplified = pm.run(hir)
+        self.assertEqual(_count_opcode(simplified.body, "select"), 1)
 
 
 if __name__ == "__main__":
