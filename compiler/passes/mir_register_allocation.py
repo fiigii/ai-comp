@@ -28,10 +28,10 @@ class LivenessInfo:
 
 @dataclass
 class LiveInterval:
-    """Live interval for a virtual register (bundle-indexed)."""
+    """Live interval for a virtual register (bundle-point indexed)."""
     vreg: int              # Virtual register (scratch address)
-    start: int             # First bundle index where live
-    end: int               # Last bundle index where live
+    start: int             # First point where live
+    end: int               # Last point where live
     is_vector: bool        # Whether this is a vector register (8 contiguous)
 
 
@@ -199,7 +199,15 @@ def _compute_liveness(mfunc: MachineFunction, vector_bases: set[int],
 
 def _build_live_intervals(mfunc: MachineFunction, liveness: dict[str, LivenessInfo],
                           vector_bases: set[int], vector_addrs: set[int]) -> list[LiveInterval]:
-    """Build live intervals for all virtual registers using bundle indices."""
+    """Build live intervals for all virtual registers using bundle points.
+
+    Each bundle contributes two timeline points:
+    - use point: reads happen from pre-bundle state
+    - def point: writes commit at bundle end
+
+    This allows an interval that ends on a bundle use point to free before
+    another interval that starts at the same bundle's def point.
+    """
     # Build addr_to_base map
     addr_to_base: dict[int, int] = {}
     for base in vector_bases:
@@ -233,6 +241,12 @@ def _build_live_intervals(mfunc: MachineFunction, liveness: dict[str, LivenessIn
         else:
             intervals[vreg] = (idx, idx, is_vector)
 
+    def use_point(bundle_idx: int) -> int:
+        return bundle_idx * 2
+
+    def def_point(bundle_idx: int) -> int:
+        return bundle_idx * 2 + 1
+
     # Process each block
     for name in block_order:
         block = mfunc.blocks[name]
@@ -242,41 +256,41 @@ def _build_live_intervals(mfunc: MachineFunction, liveness: dict[str, LivenessIn
         # Variables live at block entry extend from block start
         for vreg in info.live_in:
             is_vec = vreg in vector_bases
-            update_interval(vreg, block_start, is_vec)
+            update_interval(vreg, use_point(block_start), is_vec)
 
         # Variables live at block exit extend to block end
         for vreg in info.live_out:
             is_vec = vreg in vector_bases
-            update_interval(vreg, block_end, is_vec)
+            update_interval(vreg, def_point(block_end), is_vec)
 
         # Process bundles
         idx = block_start
         for bundle in block.bundles:
-            # Process defs
-            for inst in bundle.instructions:
-                defs = inst.get_defs()
-                for d in defs:
-                    if d in vector_addrs:
-                        if d in vector_bases:
-                            update_interval(d, idx, True)
-                        # Skip non-base vector elements
-                    else:
-                        update_interval(d, idx, False)
-
-            # Process uses
+            # Process uses first (reads pre-bundle state)
             for inst in bundle.instructions:
                 uses = inst.get_uses()
                 for u in uses:
                     if u in vector_addrs:
                         if u in vector_bases:
-                            update_interval(u, idx, True)
+                            update_interval(u, use_point(idx), True)
                         else:
                             # Map to base
                             base = addr_to_base.get(u)
                             if base is not None:
-                                update_interval(base, idx, True)
+                                update_interval(base, use_point(idx), True)
                     else:
-                        update_interval(u, idx, False)
+                        update_interval(u, use_point(idx), False)
+
+            # Process defs second (writes at bundle end)
+            for inst in bundle.instructions:
+                defs = inst.get_defs()
+                for d in defs:
+                    if d in vector_addrs:
+                        if d in vector_bases:
+                            update_interval(d, def_point(idx), True)
+                        # Skip non-base vector elements
+                    else:
+                        update_interval(d, def_point(idx), False)
 
             idx += 1
 

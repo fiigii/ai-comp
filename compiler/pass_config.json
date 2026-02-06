@@ -65,7 +65,10 @@
     },
     "inst-scheduling": {
       "enabled": true,
-      "options": {}
+      "options": {
+        "prefer_load_fill": true,
+        "devectorize_valu_to_alu": true
+      }
     },
     "lir-to-mir": {
       "enabled": false,

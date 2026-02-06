@@ -47,6 +47,37 @@ class TestMIRRegisterAllocation(unittest.TestCase):
         # High-water mark should reflect only the vector allocation.
         self.assertEqual(mfunc.max_scratch_used, 7)
 
+    def test_use_then_def_in_same_bundle_can_reuse_register(self):
+        # Bundle 0: define scalar v10
+        b0 = MBundle(
+            instructions=[MachineInst(LIROpcode.CONST, 10, [7], "load")]
+        )
+        # Bundle 1: use v10, define v11 (same bundle use->def should permit reuse)
+        b1 = MBundle(
+            instructions=[MachineInst(LIROpcode.ADD, 11, [10, 10], "alu")]
+        )
+        # Bundle 2: keep v11 live
+        b2 = MBundle(
+            instructions=[MachineInst(LIROpcode.ADD, 12, [11, 11], "alu")]
+        )
+
+        block = MachineBasicBlock(
+            name="entry",
+            bundles=[b0, b1, b2],
+            predecessors=[],
+            successors=[],
+        )
+        mfunc = MachineFunction(entry="entry", blocks={"entry": block})
+
+        cfg = PassConfig(name="mir-regalloc", enabled=True, options={})
+        MIRRegisterAllocationPass().run(mfunc, cfg)
+
+        const_dest = mfunc.blocks["entry"].bundles[0].instructions[0].dest
+        add1 = mfunc.blocks["entry"].bundles[1].instructions[0]
+        self.assertEqual(add1.dest, const_dest)
+        self.assertEqual(add1.operands[0], const_dest)
+        self.assertEqual(add1.operands[1], const_dest)
+
 
 if __name__ == "__main__":
     unittest.main()

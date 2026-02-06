@@ -11,14 +11,14 @@ def _cfg(name, **opts):
     return PassConfig(name=name, enabled=True, options=opts)
 
 
-def _schedule_single_block(instructions):
+def _schedule_single_block(instructions, **opts):
     entry = BasicBlock(
         name="entry",
         instructions=instructions,
         terminator=LIRInst(LIROpcode.HALT, None, [], "flow"),
     )
     lir = LIRFunction(entry="entry", blocks={"entry": entry})
-    mir = InstSchedulingPass().run(lir, _cfg("inst-scheduling"))
+    mir = InstSchedulingPass().run(lir, _cfg("inst-scheduling", **opts))
     return mir.blocks["entry"].bundles
 
 
@@ -105,6 +105,68 @@ class TestInstructionScheduling(unittest.TestCase):
             _bundle_signature(bundles_a),
             _bundle_signature(bundles_b),
             "Scheduling must be deterministic",
+        )
+
+    def test_devectorize_valu_to_alu_when_valu_saturated(self):
+        def vec(base):
+            return [base + i for i in range(8)]
+
+        instructions = [
+            LIRInst(LIROpcode.VADD, vec(100 + i * 8), [vec(1000), vec(2000)], "valu")
+            for i in range(7)
+        ]
+
+        bundles_no_dev = _schedule_single_block(
+            instructions,
+            devectorize_valu_to_alu=False,
+        )
+        bundles_dev = _schedule_single_block(
+            instructions,
+            devectorize_valu_to_alu=True,
+        )
+
+        non_term_no_dev = bundles_no_dev[:-1]
+        non_term_dev = bundles_dev[:-1]
+        self.assertEqual(len(non_term_no_dev), 2)
+        self.assertEqual(len(non_term_dev), 1)
+
+        first_bundle = non_term_dev[0]
+        valu_count = sum(1 for inst in first_bundle.instructions if inst.engine == "valu")
+        alu_count = sum(1 for inst in first_bundle.instructions if inst.engine == "alu")
+        self.assertEqual(valu_count, 6)
+        self.assertEqual(alu_count, 8)
+        self.assertTrue(
+            any(inst.opcode == LIROpcode.ADD and inst.engine == "alu" for inst in first_bundle.instructions),
+            "Expected devectorized scalar ALU instructions",
+        )
+
+    def test_devectorize_valu_to_alu_skips_multiply_add(self):
+        def vec(base):
+            return [base + i for i in range(8)]
+
+        instructions = [
+            LIRInst(LIROpcode.VADD, vec(100 + i * 8), [vec(1000), vec(2000)], "valu")
+            for i in range(6)
+        ]
+        instructions.append(
+            LIRInst(LIROpcode.MULTIPLY_ADD, vec(200), [vec(300), vec(400), vec(500)], "valu")
+        )
+
+        bundles = _schedule_single_block(
+            instructions,
+            devectorize_valu_to_alu=True,
+        )
+
+        non_term = bundles[:-1]
+        self.assertEqual(len(non_term), 2)
+        self.assertEqual(
+            sum(1 for inst in non_term[0].instructions if inst.engine == "alu"),
+            0,
+            "multiply_add must not be devectorized",
+        )
+        self.assertTrue(
+            any(inst.opcode == LIROpcode.MULTIPLY_ADD for inst in non_term[1].instructions),
+            "multiply_add should remain a valu instruction",
         )
 
 
