@@ -15,10 +15,11 @@
       "options": {
         "constant_folding": true,
         "identities": true,
-        "strength_reduction": true,
-        "select_optimization": false,
+        "canonicalization": true,
+        "select_to_mul": false,
         "select_to_alu_mux": false,
-        "parity_pattern": true
+        "parity_pattern": true,
+        "add_mul_fold": true
       }
     },
     "cse": {
@@ -40,7 +41,7 @@
     "tree-level-cache": {
       "enabled": true,
       "options": {
-        "levels": 3,
+        "levels": 4,
         "estimate_ops": true
       }
     },

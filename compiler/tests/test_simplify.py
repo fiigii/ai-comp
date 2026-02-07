@@ -643,8 +643,8 @@ class TestSimplifyPass(unittest.TestCase):
             options={
                 "constant_folding": True,
                 "identities": True,
-                "strength_reduction": True,
-                "select_optimization": True,
+                "canonicalization": True,
+                "select_to_mul": True,
                 "select_to_alu_mux": True,
                 "parity_pattern": True,
             },
@@ -688,14 +688,139 @@ class TestSimplifyPass(unittest.TestCase):
             options={
                 "constant_folding": True,
                 "identities": True,
-                "strength_reduction": True,
-                "select_optimization": True,
+                "canonicalization": True,
+                "select_to_mul": True,
                 "select_to_alu_mux": False,
                 "parity_pattern": True,
             },
         )
         simplified = pm.run(hir)
         self.assertEqual(_count_opcode(simplified.body, "select"), 1)
+
+
+    # --- Add-Mul Fold Tests ---
+
+    def test_add_mul_fold_basic(self):
+        """Test (a + C) + (a * K) -> a * (K+1) + C."""
+        b = HIRBuilder()
+        addr0 = b.const(0)
+        a = b.load(addr0, "a")
+
+        # t1 = a + 7
+        t1 = b.add(a, b.const(7), "t1")
+        # t2 = a * 4  (from strength reduction of a << 2)
+        t2 = b.mul(a, b.const(4), "t2")
+        # result = t1 + t2 = (a + 7) + (a * 4) = a * 5 + 7
+        result = b.add(t1, t2, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        # Verify the mul opcode is present (from the fold) and no extra additions
+        muls = _count_opcode(simplified.body, "*")
+        self.assertGreaterEqual(muls, 1, "Should have at least one multiply from fold")
+
+        # Verify correctness by executing
+        instrs = compile_hir_to_vliw(simplified)
+        for a_val in [0, 1, 2, 5, 10, 100]:
+            mem = [a_val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            expected = (a_val * 5 + 7) & 0xFFFFFFFF
+            self.assertEqual(machine.mem[0], expected,
+                           f"Failed for a={a_val}: got {machine.mem[0]}, expected {expected}")
+
+        print("Add-mul fold basic test passed!")
+
+    def test_add_mul_fold_commuted(self):
+        """Test commuted variant: (a * K) + (a + C) -> a * (K+1) + C."""
+        b = HIRBuilder()
+        addr0 = b.const(0)
+        a = b.load(addr0, "a")
+
+        # t1 = a * 8
+        t1 = b.mul(a, b.const(8), "t1")
+        # t2 = a + 3
+        t2 = b.add(a, b.const(3), "t2")
+        # result = t1 + t2 = (a * 8) + (a + 3) = a * 9 + 3
+        result = b.add(t1, t2, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        simplified = pm.run(hir)
+
+        instrs = compile_hir_to_vliw(simplified)
+        for a_val in [0, 1, 3, 7, 50]:
+            mem = [a_val] + [0] * 99
+            machine = self._run_program(instrs, mem)
+            expected = (a_val * 9 + 3) & 0xFFFFFFFF
+            self.assertEqual(machine.mem[0], expected,
+                           f"Failed for a={a_val}: got {machine.mem[0]}, expected {expected}")
+
+        print("Add-mul fold commuted test passed!")
+
+    def test_add_mul_fold_disabled(self):
+        """Test that add_mul_fold can be disabled via config."""
+        b = HIRBuilder()
+        addr0 = b.const(0)
+        a = b.load(addr0, "a")
+
+        t1 = b.add(a, b.const(7), "t1")
+        t2 = b.mul(a, b.const(4), "t2")
+        result = b.add(t1, t2, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+        original_adds = _count_opcode(hir.body, "+")
+
+        pm = PassManager()
+        pm.add_pass(SimplifyPass())
+        pm.config["simplify"] = PassConfig(
+            name="simplify",
+            enabled=True,
+            options={
+                "constant_folding": True,
+                "identities": True,
+                "canonicalization": True,
+                "add_mul_fold": False,
+            },
+        )
+        simplified = pm.run(hir)
+
+        # With fold disabled, the original + count should be preserved
+        self.assertEqual(_count_opcode(simplified.body, "+"), original_adds)
+        print("Add-mul fold disabled test passed!")
+
+    def test_add_mul_fold_metrics(self):
+        """Test that add_mul_fold reports metrics."""
+        b = HIRBuilder()
+        addr0 = b.const(0)
+        a = b.load(addr0, "a")
+
+        t1 = b.add(a, b.const(7), "t1")
+        t2 = b.mul(a, b.const(4), "t2")
+        result = b.add(t1, t2, "result")
+        b.store(addr0, result)
+
+        hir = b.build()
+
+        simplify_pass = SimplifyPass()
+        pm = PassManager()
+        pm.add_pass(simplify_pass)
+        pm.run(hir)
+
+        metrics = simplify_pass.get_metrics()
+        self.assertIsNotNone(metrics)
+        self.assertIn("add_mul_folds", metrics.custom)
+        self.assertGreater(metrics.custom["add_mul_folds"], 0)
+        print(f"Add-mul fold metrics: {metrics.custom}")
+        print("Add-mul fold metrics test passed!")
 
 
 if __name__ == "__main__":

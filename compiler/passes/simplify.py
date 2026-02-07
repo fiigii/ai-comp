@@ -38,8 +38,8 @@ class SimplifyPass(Pass):
     - Constant folding: Const(a) op Const(b) -> Const(result)
     - Identity: x + 0 -> x, x * 1 -> x, x ^ 0 -> x, x | 0 -> x
     - Annihilation: x * 0 -> 0, x & 0 -> 0
-    - Strength reduction: % 2 -> & 1, << n -> * 2^n
-    - Select optimization: select(cond, x, 0) -> *(x, cond) when cond is boolean
+    - Canonicalization: % 2 -> & 1, << n -> * 2^n
+    - Select-to-mul: select(cond, x, 0) -> *(x, cond) when cond is boolean
     - Select-to-ALU mux: select(cond, a, b) -> b + cond * (a - b) when cond is boolean
     - Parity pattern: ==(x & 1, 0) followed by select(cond, 1, 2) -> (x & 1) + 1
     """
@@ -48,10 +48,11 @@ class SimplifyPass(Pass):
         super().__init__()
         self._constants_folded = 0
         self._identities_simplified = 0
-        self._strength_reductions = 0
-        self._select_optimizations = 0
+        self._canonicalizations = 0
+        self._select_to_muls = 0
         self._select_to_alu_mux = 0
         self._parity_patterns = 0
+        self._add_mul_folds = 0
         # SSA values known to be boolean (0 or 1) - from comparisons or & 1
         self._boolean_values: set[SSAValue] = set()
         # Maps SSA value -> the SSA value it's negated from (for ==(x, 0) where x is boolean)
@@ -72,10 +73,11 @@ class SimplifyPass(Pass):
         self._init_metrics()
         self._constants_folded = 0
         self._identities_simplified = 0
-        self._strength_reductions = 0
-        self._select_optimizations = 0
+        self._canonicalizations = 0
+        self._select_to_muls = 0
         self._select_to_alu_mux = 0
         self._parity_patterns = 0
+        self._add_mul_folds = 0
         self._boolean_values = set()
         self._negated_boolean = {}
 
@@ -83,10 +85,11 @@ class SimplifyPass(Pass):
         self._opts = {
             "constant_folding": config.options.get("constant_folding", True),
             "identities": config.options.get("identities", True),
-            "strength_reduction": config.options.get("strength_reduction", True),
-            "select_optimization": config.options.get("select_optimization", True),
+            "canonicalization": config.options.get("canonicalization", True),
+            "select_to_mul": config.options.get("select_to_mul", True),
             "select_to_alu_mux": config.options.get("select_to_alu_mux", False),
             "parity_pattern": config.options.get("parity_pattern", True),
+            "add_mul_fold": config.options.get("add_mul_fold", True),
         }
 
         # Check if pass is enabled
@@ -105,10 +108,11 @@ class SimplifyPass(Pass):
             self._metrics.custom = {
                 "constants_folded": self._constants_folded,
                 "identities_simplified": self._identities_simplified,
-                "strength_reductions": self._strength_reductions,
-                "select_optimizations": self._select_optimizations,
+                "canonicalizations": self._canonicalizations,
+                "select_to_muls": self._select_to_muls,
                 "select_to_alu_mux": self._select_to_alu_mux,
                 "parity_patterns": self._parity_patterns,
+                "add_mul_folds": self._add_mul_folds,
             }
 
         return HIRFunction(
@@ -171,8 +175,8 @@ class SimplifyPass(Pass):
             # Increment appropriate counter
             if metric_type == "identity":
                 self._identities_simplified += 1
-            elif metric_type == "strength":
-                self._strength_reductions += 1
+            elif metric_type == "canonicalization":
+                self._canonicalizations += 1
             if simplified is None:
                 return None
             # Track boolean status if the simplified op produces a boolean
@@ -200,6 +204,13 @@ class SimplifyPass(Pass):
             right_val = self._get_const_value(right)
             if right_val == 1:
                 self._boolean_values.add(op.result)
+
+        # Try algebraic add-mul fold: (a + C) + (a * K) -> a * (K+1) + C
+        if op.opcode == "+" and self._opts.get("add_mul_fold", True):
+            folded = self._try_fold_add_mul(op)
+            if folded is not None:
+                self._add_mul_folds += 1
+                return folded
 
         return op
 
@@ -245,7 +256,7 @@ class SimplifyPass(Pass):
         """Try to simplify using algebraic identities.
 
         Returns tuple of (replacement Op or None, metric_type or None).
-        metric_type is "identity" for algebraic identities, "strength" for strength reductions.
+        metric_type is "identity" for algebraic identities, "canonicalization" for canonicalizations.
         """
         left_val = self._get_const_value(left)
         right_val = self._get_const_value(right)
@@ -309,20 +320,97 @@ class SimplifyPass(Pass):
                     self._use_def_ctx.replace_all_uses(result, right, auto_invalidate=False)
                     return None, "identity"
 
-        # Strength reductions (only if enabled)
-        if self._opts.get("strength_reduction", True):
-            # Strength reduction: % 2 -> & 1
+        # Canonicalizations (only if enabled)
+        if self._opts.get("canonicalization", True):
+            # Canonicalization: % 2 -> & 1
             if opcode == "%" and right_is_const and right_val == 2:
                 # The result of & 1 is boolean (0 or 1)
                 self._boolean_values.add(result)
-                return Op("&", result, [left, Const(1)], "alu"), "strength"
+                return Op("&", result, [left, Const(1)], "alu"), "canonicalization"
 
-            # Strength reduction: << n -> * 2^n (multiplication can be faster on VLIW due to more ALU slots)
+            # Canonicalization: << n -> * 2^n (multiplication can be faster on VLIW due to more ALU slots)
             if opcode == "<<":
                 if right_is_const and right_val is not None and right_val >= 0 and right_val < 32:
                     mul_val = 1 << right_val
-                    return Op("*", result, [left, Const(mul_val)], "alu"), "strength"
+                    return Op("*", result, [left, Const(mul_val)], "alu"), "canonicalization"
 
+        return None, None
+
+    def _try_fold_add_mul(self, op: Op) -> Optional[list[Op]]:
+        """Try to fold (a + C) + (a * K) -> a * (K+1) + C.
+
+        This pattern arises after canonicalization converts << to *,
+        producing val + C + val * K which can be a single multiply-add.
+        """
+        assert op.opcode == "+" and op.result is not None
+        left, right = op.operands
+
+        # Both operands must be SSA values with known definitions
+        if not isinstance(left, SSAValue) or not isinstance(right, SSAValue):
+            return None
+
+        left_def = self._use_def_ctx.get_def(left)
+        right_def = self._use_def_ctx.get_def(right)
+
+        if left_def is None or right_def is None:
+            return None
+
+        left_stmt = left_def.statement
+        right_stmt = right_def.statement
+
+        if not isinstance(left_stmt, Op) or not isinstance(right_stmt, Op):
+            return None
+
+        # Try both orderings: (add_side, mul_side)
+        for add_op, add_val, mul_op, mul_val in [
+            (left_stmt, left, right_stmt, right),
+            (right_stmt, right, left_stmt, left),
+        ]:
+            if add_op.opcode != "+" or mul_op.opcode != "*":
+                continue
+            if len(add_op.operands) != 2 or len(mul_op.operands) != 2:
+                continue
+
+            # Extract: add_op = a + C (or C + a), mul_op = a * K (or K * a)
+            a_add, c_val = self._extract_var_const(add_op)
+            a_mul, k_val = self._extract_var_const(mul_op)
+
+            if a_add is None or a_mul is None:
+                continue
+            if a_add != a_mul:
+                continue
+
+            # Check that the mul intermediate has only one use (this combining ADD)
+            if self._use_def_ctx.use_count(mul_val) != 1:
+                continue
+
+            # Fold: result = a * (K+1) + C
+            new_k = ((k_val + 1) % (1 << 32))
+            c_const = c_val % (1 << 32)
+            temp = self._new_temp("amf")
+            return [
+                Op("*", temp, [a_add, Const(new_k)], "alu"),
+                Op("+", op.result, [temp, Const(c_const)], "alu"),
+            ]
+
+        return None
+
+    def _extract_var_const(self, op: Op) -> tuple[Optional[SSAValue], Optional[int]]:
+        """Extract (variable, constant) from a binary op like a + C or C + a.
+
+        Returns (None, None) if not in the expected form.
+        """
+        if len(op.operands) != 2:
+            return None, None
+
+        left, right = op.operands
+        left_val = self._get_const_value(left)
+        right_val = self._get_const_value(right)
+
+        if right_val is not None and isinstance(left, SSAValue):
+            return left, right_val
+        if left_val is not None and isinstance(right, SSAValue):
+            return right, left_val
         return None, None
 
     def _try_simplify_select(self, op: Op) -> Optional[Op | list[Op]]:
@@ -346,9 +434,9 @@ class SimplifyPass(Pass):
                     return Op("+", result, [lsb, Const(1)], "alu")
 
         # select(cond, x, 0) -> *(x, cond) when cond is boolean (0/1)
-        if self._opts.get("select_optimization", True):
+        if self._opts.get("select_to_mul", True):
             if false_const == 0 and self._is_boolean(cond):
-                self._select_optimizations += 1
+                self._select_to_muls += 1
                 return Op("*", result, [true_val, cond], "alu")
 
         # Generic boolean select to ALU mux:

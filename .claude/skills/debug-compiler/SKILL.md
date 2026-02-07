@@ -7,25 +7,28 @@ description: Compiler development and debugging instructions
 
 ## Debugging Tips
 
-When developing the compiler, if you run into an unexplained bug, you often need to start from the generated VLIW assembly and trace the cause upward, pass by pass. Each time, you can diff the previous pass’s printed outputs (IR, DDG, metrics, etc.) against the outputs from the pass you want to debug, to see what changes the pass made and whether those changes match your expectations. You can use the following tools.
+When developing the compiler, if you run into an unexplained bug, you often need to start from the generated VLIW assembly and trace the cause upward, pass by pass. Each time, you can diff the previous pass's printed outputs (IR, DDG, metrics, etc.) against the outputs from the pass you want to debug, to see what changes the pass made and whether those changes match your expectations. You can use the following tools.
 
 ## Tools to debug compiler
 
 ```bash
 # Print IR after each compilation pass
-python3 perf_takehome.py --print-after-all 
+python3 programs/tree_hash.py --print-after-all
 
 # Print pass metrics and diagnostics
-python3 perf_takehome.py --print-metrics 
+python3 programs/tree_hash.py --print-metrics
 
 # Print Data Dependency Graphs after each pass
-python3 perf_takehome.py --print-ddg-after-all 
+python3 programs/tree_hash.py --print-ddg-after-all
 
 # Combine flags for comprehensive debugging
-python3 perf_takehome.py --print-after-all --print-metrics 
+python3 programs/tree_hash.py --print-after-all --print-metrics
 
 # Save output to file for splitting
-python3 perf_takehome.py --print-after-all --print-metrics  > dump.txt
+python3 programs/tree_hash.py --print-after-all --print-metrics > dump.txt
+
+# Generate execution trace for Perfetto
+python3 programs/tree_hash.py --trace
 ```
 
 ## Debugging Flags
@@ -58,6 +61,14 @@ Prints Data Dependency Graphs after each compilation pass. Useful for:
 - Debugging scheduling issues
 - Analyzing instruction dependencies
 
+### `--trace`
+Generates an execution trace viewable in Perfetto:
+```bash
+python3 programs/tree_hash.py --trace
+python3 original_performance_takehome/watch_trace.py
+# Then open http://localhost:8000 and click "Open Perfetto"
+```
+
 ## Tools
 
 ### `tools/split_dump.py`
@@ -70,10 +81,9 @@ Splits `--print-metrics` or `--print-after-all` output into per-pass files for e
 python3 tools/split_dump.py dump.txt -o passes/
 
 # Split from stdin
-python3 perf_takehome.py --print-after-all --print-metrics  | python3 tools/split_dump.py -o passes/
+python3 programs/tree_hash.py --print-after-all --print-metrics | python3 tools/split_dump.py -o passes/
 ```
 
 **Output:** Creates numbered files like `01-PassName.txt`, `02-AnotherPass.txt` in the output directory.
-
 
 This makes it easy to diff passes or focus on a specific pass without scrolling through large dumps.
