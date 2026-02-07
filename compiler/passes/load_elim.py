@@ -16,7 +16,7 @@ from ..hir import (
 from ..alias_analysis import AliasAnalysis, AliasResult, AddrKey
 from ..pass_manager import Pass, PassConfig
 from ..use_def import UseDefContext
-from problem import VLEN
+from vm import VLEN
 
 
 @dataclass

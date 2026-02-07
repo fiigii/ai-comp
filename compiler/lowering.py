@@ -7,7 +7,7 @@ Lowers high-level IR (with loops and branches) to low-level IR
 
 from typing import Optional
 
-from problem import SCRATCH_SIZE
+from vm import SCRATCH_SIZE
 
 from .hir import (
     SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction

@@ -92,6 +92,25 @@ from .printing import print_hir, print_lir, print_vliw
 # Passes
 from .passes import DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass, SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass, LoadElimPass, DSEPass, TreeLevelCachePass
 
+
+# Public API
+def compile(hir, **kwargs):
+    """Compile HIR program to VLIW instructions."""
+    return compile_hir_to_vliw(hir, **kwargs)
+
+
+def execute(instrs, mem, debug_info=None, n_cores=None, trace=False, **kwargs):
+    """Execute VLIW instructions on the VM."""
+    from vm import Machine, DebugInfo, N_CORES as DEFAULT_CORES
+    if debug_info is None:
+        debug_info = DebugInfo(scratch_map={})
+    if n_cores is None:
+        n_cores = DEFAULT_CORES
+    machine = Machine(mem, instrs, debug_info, n_cores=n_cores, trace=trace, **kwargs)
+    machine.run()
+    return machine
+
+
 __all__ = [
     # HIR
     'SSAValue', 'Const', 'VectorConst', 'Value', 'Op', 'Halt', 'Pause', 'ForLoop', 'If',
@@ -121,4 +140,6 @@ __all__ = [
     'print_hir', 'print_lir', 'print_vliw',
     # Passes
     'DCEPass', 'LoopUnrollPass', 'CSEPass', 'SimplifyPass', 'HIRToLIRPass', 'SimplifyCFGPass', 'CopyPropagationPass', 'LIRDCEPass', 'PhiEliminationPass', 'LoadElimPass', 'DSEPass', 'TreeLevelCachePass',
+    # Public API
+    'compile', 'execute',
 ]

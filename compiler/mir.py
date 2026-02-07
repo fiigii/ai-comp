@@ -13,7 +13,7 @@ Pipeline Order:
 from dataclasses import dataclass, field
 from typing import Optional
 
-from problem import VLEN
+from vm import VLEN
 
 from .lir import LIROpcode
 

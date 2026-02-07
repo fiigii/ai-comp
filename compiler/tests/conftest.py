@@ -11,7 +11,7 @@ sys.path.insert(0, _repo_root)
 import unittest
 import random
 
-from problem import (
+from vm import (
     Machine,
     build_mem_image,
     reference_kernel2,
@@ -20,7 +20,7 @@ from problem import (
     N_CORES,
     DebugInfo,
 )
-from perf_takehome import KernelBuilder
+from programs.tree_hash import KernelBuilder
 from compiler import (
     HIRBuilder,
     LIRFunction,

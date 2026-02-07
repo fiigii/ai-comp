@@ -572,7 +572,7 @@ class TestVectorCSE:
         from compiler.passes.cse import CSEPass
         from compiler.pass_manager import PassConfig
         from compiler import compile_hir_to_vliw
-        from problem import Machine, DebugInfo, N_CORES
+        from vm import Machine, DebugInfo, N_CORES
 
         b = HIRBuilder()
 
@@ -620,7 +620,7 @@ class TestVectorCSE:
         from compiler.passes.cse import CSEPass
         from compiler.pass_manager import PassConfig
         from compiler import compile_hir_to_vliw
-        from problem import Machine, DebugInfo, N_CORES
+        from vm import Machine, DebugInfo, N_CORES
 
         b = HIRBuilder()
 
@@ -686,7 +686,7 @@ class TestVectorCSE:
         from compiler.passes.cse import CSEPass
         from compiler.pass_manager import PassConfig
         from compiler import compile_hir_to_vliw
-        from problem import Machine, DebugInfo, N_CORES
+        from vm import Machine, DebugInfo, N_CORES
 
         b = HIRBuilder()
 
@@ -749,7 +749,7 @@ class TestVectorKernel:
     def _run_kernel(self, hir, mem):
         """Compile and run a kernel, returning the machine state."""
         from compiler import compile_hir_to_vliw
-        from problem import Machine, DebugInfo, N_CORES
+        from vm import Machine, DebugInfo, N_CORES
 
         instrs = compile_hir_to_vliw(hir)
         machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)

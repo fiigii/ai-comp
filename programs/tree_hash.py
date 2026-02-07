@@ -2,11 +2,36 @@
 Tree Hash Kernel
 
 Implements the tree traversal + hash computation kernel using the IR compiler.
+
+Usage:
+    python programs/tree_hash.py
+    python programs/tree_hash.py --trace
+    python programs/tree_hash.py --print-after-all
+    python programs/tree_hash.py --print-metrics
 """
 
-from problem import HASH_STAGES
+import os
+import sys
 
-from compiler import HIRBuilder, Const, compile_hir_to_vliw
+# Ensure project root is on the path
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_this_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from vm import (
+    DebugInfo,
+    N_CORES,
+    Machine,
+    Tree,
+    Input,
+    HASH_STAGES,
+    build_mem_image,
+    reference_kernel2,
+)
+
+import compiler
+from compiler import HIRBuilder, Const
 
 
 def build_tree_hash_kernel(
@@ -14,12 +39,9 @@ def build_tree_hash_kernel(
     n_nodes: int,
     batch_size: int,
     rounds: int,
-    print_after_all: bool = False,
-    print_metrics: bool = False,
-    print_ddg_after_all: bool = False,
-) -> tuple[list[dict], dict]:
+) -> 'HIRFunction':
     """
-    Build IR-based tree hash kernel.
+    Build HIR for the tree hash kernel.
 
     This kernel performs:
     1. Load batch of indices and values from memory
@@ -35,14 +57,9 @@ def build_tree_hash_kernel(
         n_nodes: Number of nodes in the forest
         batch_size: Number of elements in a batch
         rounds: Number of rounds to process
-        print_after_all: If True, print IR after each compilation pass
-        print_metrics: If True, print pass metrics and diagnostics
-        print_ddg_after_all: If True, print DDGs after each compilation pass
 
     Returns:
-        Tuple of (instructions, debug_info) where:
-        - instructions: List of VLIW instruction bundles
-        - debug_info: Dictionary with debug information (currently empty for IR kernel)
+        HIRFunction ready for compilation.
     """
     b = HIRBuilder()
 
@@ -151,16 +168,113 @@ def build_tree_hash_kernel(
     # Final pause (sync with reference_kernel2 second yield)
     b.pause()
 
-    # Compile HIR -> LIR -> VLIW
-    hir = b.build()
-    instrs = compile_hir_to_vliw(
-        hir,
-        print_after_all=print_after_all,
-        print_metrics=print_metrics,
-        print_ddg_after_all=print_ddg_after_all
+    return b.build()
+
+
+class KernelBuilder:
+    """Kernel builder that uses the IR compiler."""
+
+    def __init__(self):
+        self.instrs = []
+        self.scratch_debug = {}
+
+    def debug_info(self):
+        return DebugInfo(scratch_map=self.scratch_debug)
+
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        **compile_kwargs
+    ):
+        hir = build_tree_hash_kernel(forest_height, n_nodes, batch_size, rounds)
+        self.instrs = compiler.compile(hir, **compile_kwargs)
+
+
+BASELINE = 147734
+
+
+def do_kernel_test(
+    forest_height: int,
+    rounds: int,
+    batch_size: int,
+    seed: int = 123,
+    trace: bool = False,
+    prints: bool = False,
+    print_vliw: bool = False,
+    print_after_all: bool = False,
+    print_metrics: bool = False,
+    print_ddg_after_all: bool = False,
+):
+    import random
+
+    print(f"{forest_height=}, {rounds=}, {batch_size=}")
+    random.seed(seed)
+    forest = Tree.generate(forest_height)
+    inp = Input.generate(forest, batch_size, rounds)
+    mem = build_mem_image(forest, inp)
+
+    kb = KernelBuilder()
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
+                    print_after_all=print_after_all, print_metrics=print_metrics,
+                    print_ddg_after_all=print_ddg_after_all)
+
+    if print_vliw:
+        from programs import print_vliw as _print_vliw
+        _print_vliw(kb.instrs)
+
+    value_trace = {}
+    machine = Machine(
+        mem,
+        kb.instrs,
+        kb.debug_info(),
+        n_cores=N_CORES,
+        value_trace=value_trace,
+        trace=trace,
     )
+    machine.prints = prints
+    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+        machine.run()
+        inp_values_p = ref_mem[6]
+        if prints:
+            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+        assert (
+            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+        ), f"Incorrect result on round {i}"
+        inp_indices_p = ref_mem[5]
+        if prints:
+            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
 
-    # Debug info is empty for IR-compiled kernel
-    debug_info = {}
+    print("CYCLES: ", machine.cycle)
+    print("Speedup over baseline: ", BASELINE / machine.cycle)
+    return machine.cycle
 
-    return instrs, debug_info
+
+if __name__ == "__main__":
+    import argparse
+    from programs import add_compiler_flags, COMPILER_FLAGS, compiler_kwargs
+
+    program_flags = {'--forest-height', '--rounds', '--batch-size'}
+    all_flags = COMPILER_FLAGS | program_flags
+    has_flag = any(arg.split('=')[0] in all_flags for arg in sys.argv[1:])
+
+    if has_flag or len(sys.argv) == 1:
+        parser = argparse.ArgumentParser(description="Tree hash kernel")
+        add_compiler_flags(parser)
+        parser.add_argument("--forest-height", type=int, default=10,
+                            help="Forest height (default: 10)")
+        parser.add_argument("--rounds", type=int, default=16,
+                            help="Number of rounds (default: 16)")
+        parser.add_argument("--batch-size", type=int, default=256,
+                            help="Batch size (default: 256)")
+        args = parser.parse_args()
+
+        do_kernel_test(
+            args.forest_height,
+            args.rounds,
+            args.batch_size,
+            trace=args.trace,
+            print_vliw=args.print_vliw,
+            **compiler_kwargs(args),
+        )

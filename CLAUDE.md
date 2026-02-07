@@ -4,11 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) and any other AI age
 
 ## Overview
 
-This is Anthropic's original performance engineering take-home challenge. The task is to optimize a kernel running on a simulated VLIW SIMD virtual machine. The goal is to minimize cycle count for a tree traversal + hash computation workload.
+This is an optimizing compiler for Anthropic's original performance engineering take-home challenge. The task is to optimize a kernel running on a simulated VLIW SIMD virtual machine. The goal is to minimize cycle count for a tree traversal + hash computation workload.
 
-This project is to solve this challenge by developing a optimizing compiler.
-
-**Important:** Do not modify files in the `tests/` folder. The submission tests use a frozen copy of the simulator to prevent cheating.
+The upstream challenge code lives in `original_performance_takehome/` (an unmodified copy of [anthropics/original_performance_takehome](https://github.com/anthropics/original_performance_takehome)). This project provides an optimizing compiler that targets that VM.
 
 ## ⚠️ Essential Reading: VLIW ISA Documentation
 
@@ -25,30 +23,39 @@ This project is to solve this challenge by developing a optimizing compiler.
 ## Commands
 
 ```bash
+# Run the tree hash program (compile + execute)
+python programs/tree_hash.py
+
+# Run with trace output
+python programs/tree_hash.py --trace
+
+# Run with compiler diagnostics
+python programs/tree_hash.py --print-after-all
+python programs/tree_hash.py --print-metrics
+
 # Run submission tests (validates correctness and shows cycle count)
 python tests/submission_tests.py
 
-# Run development tests with trace output
-python perf_takehome.py Tests.test_kernel_trace
-
-# Run cycle count test
-python perf_takehome.py Tests.test_kernel_cycles
+# Run all compiler tests
+python3 -m pytest compiler/tests/ -v
 
 # View trace in Perfetto (run after generating trace)
-python watch_trace.py
+python original_performance_takehome/watch_trace.py
 # Then open http://localhost:8000 and click "Open Perfetto"
 ```
 
 ## Architecture
 
 ### Project Structure & Module Organization
-- `compiler/`: IR definitions, passes, lowering, and codegen for the VLIW SIMD target.
-- `kernels/`: IR-based kernel builders (e.g., `kernels/tree_hash.py`).
-- `tests/` and `compiler/tests/`: correctness and regression tests (pytest-based).
-- `docs/`: architecture reference (`docs/VLIW_ISA.md` is essential).
-- `perf_takehome.py` / `problem.py`: simulator and benchmark entry points.
+- `original_performance_takehome/`: Unmodified upstream challenge code (VM simulator, reference kernel, tests). **Do not modify any files in this directory.**
+- `vm/`: Thin wrapper re-exporting `original_performance_takehome.problem` for convenient imports.
+- `compiler/`: IR definitions, passes, lowering, and codegen for the VLIW SIMD target. Exports `compile()` and `execute()` APIs.
+- `programs/`: Program implementations using the IR compiler (e.g., `programs/tree_hash.py`).
+- `tests/`: Submission correctness and regression tests (pytest-based).
+- `compiler/tests/`: Compiler-specific tests.
+- `docs/`: Architecture reference (`docs/VLIW_ISA.md` is essential).
 
-### Virtual Machine (problem.py)
+### Virtual Machine (original_performance_takehome/problem.py)
 
 A VLIW SIMD simulator with:
 - **Engines**: Execute multiple slots per cycle in parallel
@@ -63,9 +70,15 @@ A VLIW SIMD simulator with:
 - **Scratch**: Per-core register file (1536 words), used like registers/cache
 - **Memory**: Shared flat array of 32-bit words
 
-### Kernel (perf_takehome.py)
+### Compiler API (compiler/)
 
-`KernelBuilder.build_kernel()` generates instructions for the reference algorithm:
+The compiler package exports two main APIs:
+- `compile(hir, **kwargs)`: Compile HIR program to VLIW instructions
+- `execute(instrs, mem, **kwargs)`: Execute VLIW instructions on the VM
+
+### Program (programs/tree_hash.py)
+
+`KernelBuilder.build_kernel()` generates optimized instructions for the tree hash algorithm:
 1. Load batch of indices and values from memory
 2. For each round and batch element:
    - Look up node value at current index
@@ -101,7 +114,7 @@ python3 -m pytest compiler/tests/test_regressions.py -v
 python3 -m pytest compiler/tests/test_regressions.py::TestCompilerRegressions -v
 
 # Run with CLI flags
-python3 perf_takehome.py --trace
+python3 programs/tree_hash.py --trace
 ```
 
 ### Test Organization (compiler/tests/)
@@ -131,7 +144,6 @@ When fixing compiler bugs, always add a regression test that:
 
 Always validate submissions with:
 ```bash
-git diff origin/main tests/  # Must be empty
 python3 tests/submission_tests.py  # Correctness test must pass; speed tests are informational only
 ```
 

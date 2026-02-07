@@ -7,7 +7,7 @@ Uses a parallel copy algorithm to handle cycles (e.g., swaps) correctly.
 
 from typing import Optional
 
-from problem import SCRATCH_SIZE
+from vm import SCRATCH_SIZE
 
 from ..pass_manager import LIRPass, PassConfig
 from ..lir import LIROpcode, LIRInst, LIRFunction

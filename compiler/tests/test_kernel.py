@@ -25,7 +25,7 @@ class TestIRCompiler(unittest.TestCase):
         mem = build_mem_image(forest, inp)
 
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds)
 
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
@@ -53,7 +53,7 @@ class TestIRCompiler(unittest.TestCase):
         mem = build_mem_image(forest, inp)
 
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds)
 
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
@@ -81,7 +81,7 @@ class TestIRCompiler(unittest.TestCase):
         mem = build_mem_image(forest, inp)
 
         kb = KernelBuilder()
-        kb.build_kernel_ir(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds)
 
         print(f"Generated {len(kb.instrs)} instructions")
 
@@ -103,40 +103,33 @@ class TestIRCompiler(unittest.TestCase):
         )
         print(f"Full test passed! Cycles: {machine.cycle}")
 
-    def test_ir_vs_original_kernel(self):
-        """Compare IR kernel output with original build_kernel."""
+    def test_ir_vs_reference_kernel(self):
+        """Compare IR kernel output with reference_kernel2."""
         random.seed(456)
         forest = Tree.generate(6)
         inp = Input.generate(forest, 16, 4)
 
-        # Run original unrolled kernel (use_ir=False)
-        mem1 = build_mem_image(forest, inp)
-        kb1 = KernelBuilder()
-        kb1.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds, use_ir=False)
-        machine1 = Machine(mem1, kb1.instrs, kb1.debug_info(), n_cores=N_CORES)
-        machine1.enable_pause = False
-        machine1.enable_debug = False
-        machine1.run()
+        # Get reference result
+        mem_ref = build_mem_image(forest, inp)
+        for _ in reference_kernel2(mem_ref):
+            pass
 
-        # Run IR kernel (use_ir=True)
-        mem2 = build_mem_image(forest, inp)
-        kb2 = KernelBuilder()
-        kb2.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds,
-                         use_ir=True)
-        machine2 = Machine(mem2, kb2.instrs, kb2.debug_info(), n_cores=N_CORES)
-        machine2.enable_pause = False
-        machine2.enable_debug = False
-        machine2.run()
+        # Run IR kernel
+        mem_ir = build_mem_image(forest, inp)
+        kb = KernelBuilder()
+        kb.build_kernel(forest.height, len(forest.values), len(inp.indices), inp.rounds)
+        machine = Machine(mem_ir, kb.instrs, kb.debug_info(), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
 
-        inp_values_p = mem1[6]
+        inp_values_p = mem_ref[6]
         self.assertEqual(
-            machine1.mem[inp_values_p:inp_values_p + len(inp.values)],
-            machine2.mem[inp_values_p:inp_values_p + len(inp.values)],
-            "IR kernel output doesn't match original kernel"
+            machine.mem[inp_values_p:inp_values_p + len(inp.values)],
+            mem_ref[inp_values_p:inp_values_p + len(inp.values)],
+            "IR kernel output doesn't match reference kernel"
         )
-        print(f"Comparison test passed!")
-        print(f"Original kernel: {machine1.cycle} cycles, {len(kb1.instrs)} instructions")
-        print(f"IR kernel: {machine2.cycle} cycles, {len(kb2.instrs)} instructions")
+        print(f"Comparison test passed! IR kernel: {machine.cycle} cycles")
 
 
 if __name__ == "__main__":

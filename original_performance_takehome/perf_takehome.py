@@ -17,8 +17,6 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
-import json
-import os
 import random
 import unittest
 
@@ -37,14 +35,6 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
-
-from compiler import (
-    HIRBuilder,
-    Const,
-    lower_to_lir,
-    compile_hir_to_vliw,
-)
-from kernels.tree_hash import build_tree_hash_kernel
 
 
 class KernelBuilder:
@@ -96,30 +86,9 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        use_ir: bool = True, print_after_all: bool = False, print_metrics: bool = False,
-        print_ddg_after_all: bool = False
-    ):
-        """
-        Build kernel instructions.
-
-        Args:
-            use_ir: If True (default), use the IR compiler with control flow.
-                    If False, use the original unrolled implementation.
-            print_after_all: If True, print IR after each compilation pass (only for IR mode).
-            print_metrics: If True, print pass metrics and diagnostics (only for IR mode).
-            print_ddg_after_all: If True, print DDGs after each compilation pass (only for IR mode).
-        """
-        if use_ir:
-            return self.build_kernel_ir(forest_height, n_nodes, batch_size, rounds,
-                                        print_after_all, print_metrics, print_ddg_after_all)
-        return self._build_kernel_unrolled(forest_height, n_nodes, batch_size, rounds)
-
-    def _build_kernel_unrolled(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Original unrolled kernel implementation.
         Like reference_kernel2 but building actual instructions.
         Scalar implementation using only scalar ALU and load/store.
         """
@@ -204,33 +173,6 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
-    def build_kernel_ir(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        print_after_all: bool = False, print_metrics: bool = False,
-        print_ddg_after_all: bool = False
-    ):
-        """
-        Build kernel using the IR compiler with control flow (loops).
-        This uses SSA-form HIR which is lowered to LIR and then to VLIW.
-
-        Args:
-            print_after_all: If True, print IR after each compilation pass.
-            print_metrics: If True, print pass metrics and diagnostics.
-            print_ddg_after_all: If True, print DDGs after each compilation pass.
-        """
-        self.instrs, _ = build_tree_hash_kernel(
-            forest_height=forest_height,
-            n_nodes=n_nodes,
-            batch_size=batch_size,
-            rounds=rounds,
-            print_after_all=print_after_all,
-            print_metrics=print_metrics,
-            print_ddg_after_all=print_ddg_after_all,
-        )
-        # Note: scratch_debug won't be populated with IR compiler
-        # For now, leave it empty (debug info not critical for correctness)
-
-
 BASELINE = 147734
 
 def do_kernel_test(
@@ -240,11 +182,6 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
-    print_vliw: bool = False,
-    print_after_all: bool = False,
-    print_metrics: bool = False,
-    print_ddg_after_all: bool = False,
-    use_ir: bool = True,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -253,12 +190,8 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
-                    use_ir=use_ir, print_after_all=print_after_all, print_metrics=print_metrics,
-                    print_ddg_after_all=print_ddg_after_all)
-    if print_vliw:
-        for i, instr in enumerate(kb.instrs):
-            print(f"[{i:4d}] {json.dumps(instr)}")
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -338,59 +271,5 @@ class Tests(unittest.TestCase):
 # To run the proper checks to see which thresholds you pass:
 #    python tests/submission_tests.py
 
-# Command line flags:
-#    --print-vliw        Print the final VLIW instructions
-#    --print-after-all   Print IR after each compilation pass
-#    --no-ir             Use the original unrolled kernel instead of IR
-
 if __name__ == "__main__":
-    import sys
-    import argparse
-
-    # Check if running with custom flags (not unittest flags)
-    # Only route to argparse when a known custom flag is present
-    custom_flags = {'--print-vliw', '--print-after-all', '--print-ddg-after-all', '--no-ir', '--trace',
-                    '--forest-height', '--rounds', '--batch-size',
-                    '--print-metrics'}
-    has_custom_flag = any(arg.split('=')[0] in custom_flags for arg in sys.argv[1:])
-
-    if len(sys.argv) > 1 and sys.argv[1].startswith("Tests."):
-        # Running a specific test
-        unittest.main()
-    elif has_custom_flag:
-        # Custom flags - run do_kernel_test directly
-        parser = argparse.ArgumentParser(description="Performance engineering take-home")
-        parser.add_argument("--print-vliw", action="store_true",
-                            help="Print the final VLIW instructions")
-        parser.add_argument("--print-after-all", action="store_true",
-                            help="Print IR after each compilation pass")
-        parser.add_argument("--print-metrics", action="store_true",
-                            help="Print pass metrics and diagnostics")
-        parser.add_argument("--print-ddg-after-all", action="store_true",
-                            help="Print DDGs after each compilation pass")
-        parser.add_argument("--no-ir", action="store_true",
-                            help="Use the original unrolled kernel instead of IR")
-        parser.add_argument("--trace", action="store_true",
-                            help="Enable execution trace")
-        parser.add_argument("--forest-height", type=int, default=10,
-                            help="Forest height (default: 10)")
-        parser.add_argument("--rounds", type=int, default=16,
-                            help="Number of rounds (default: 16)")
-        parser.add_argument("--batch-size", type=int, default=256,
-                            help="Batch size (default: 256)")
-        args = parser.parse_args()
-
-        do_kernel_test(
-            args.forest_height,
-            args.rounds,
-            args.batch_size,
-            trace=args.trace,
-            print_vliw=args.print_vliw,
-            print_after_all=args.print_after_all,
-            print_metrics=args.print_metrics,
-            print_ddg_after_all=args.print_ddg_after_all,
-            use_ir=not args.no_ir,
-        )
-    else:
-        # Run unittest by default
-        unittest.main()
+    unittest.main()

@@ -10,7 +10,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass, field
 
-from problem import SCRATCH_SIZE, VLEN
+from vm import SCRATCH_SIZE, VLEN
 
 from ..pass_manager import MIRPass, PassConfig
 from ..lir import LIROpcode
