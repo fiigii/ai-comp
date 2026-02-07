@@ -19,6 +19,19 @@ if _project_root not in sys.path:
 
 from .tree_hash import build_tree_hash_kernel
 
+_ENGINE_PRINT_ORDER = ("load", "alu", "valu", "store", "flow")
+
+
+def _ordered_vliw_bundle(bundle: dict) -> dict:
+    ordered: dict = {}
+    for engine in _ENGINE_PRINT_ORDER:
+        if engine in bundle:
+            ordered[engine] = bundle[engine]
+    for engine in sorted(bundle.keys()):
+        if engine not in ordered:
+            ordered[engine] = bundle[engine]
+    return ordered
+
 
 def add_compiler_flags(parser: argparse.ArgumentParser) -> None:
     """Add common compiler diagnostic flags to an argument parser."""
@@ -53,7 +66,7 @@ def compiler_kwargs(args: argparse.Namespace) -> dict:
 def print_vliw(instrs: list[dict]) -> None:
     """Pretty-print VLIW instruction bundles."""
     for i, instr in enumerate(instrs):
-        print(f"[{i:4d}] {json.dumps(instr)}")
+        print(f"[{i:4d}] {json.dumps(_ordered_vliw_bundle(instr))}")
 
 
 __all__ = [
