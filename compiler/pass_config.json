@@ -41,7 +41,7 @@
     "tree-level-cache": {
       "enabled": true,
       "options": {
-        "levels": 4,
+        "levels": 3,
         "estimate_ops": true
       }
     },
