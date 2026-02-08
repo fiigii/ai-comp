@@ -14,8 +14,11 @@ from compiler import (
     PassConfig,
     Const,
     count_statements,
+    lower_to_lir,
+    eliminate_phis,
 )
 from compiler.passes import SLPVectorizationPass, LoopUnrollPass, DCEPass, CSEPass
+from compiler.passes import LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
 from compiler.passes.slp import VLEN
 
 
@@ -29,6 +32,15 @@ class TestSLPPass(unittest.TestCase):
         machine.enable_debug = False
         machine.run()
         return machine
+
+    def _compile_hir_via_mir_only(self, hir):
+        """Compile HIR through lowering+MIR only (skip full HIR optimization pipeline)."""
+        lir = lower_to_lir(hir)
+        eliminate_phis(lir)
+        cfg = PassConfig(name="test", enabled=True, options={})
+        mir = LIRToMIRPass().run(lir, cfg)
+        mir = MIRRegisterAllocationPass().run(mir, cfg)
+        return MIRToVLIWPass().run(mir, cfg)
 
     # --- Basic Seed Discovery Tests ---
 
@@ -112,7 +124,7 @@ class TestSLPPass(unittest.TestCase):
         transformed = pm.run(hir)
 
         # Compile and verify correctness
-        instrs = compile_hir_to_vliw(transformed)
+        instrs = self._compile_hir_via_mir_only(transformed)
         mem = list(range(VLEN)) + [0] * 200  # [0, 1, 2, ..., 7, 0, 0, ...]
         machine = self._run_program(instrs, mem)
 
@@ -145,7 +157,7 @@ class TestSLPPass(unittest.TestCase):
         transformed = pm.run(hir)
 
         # Even if not vectorized, should still produce correct results
-        instrs = compile_hir_to_vliw(transformed)
+        instrs = self._compile_hir_via_mir_only(transformed)
         mem = [0] * 200
         machine = self._run_program(instrs, mem)
 
@@ -230,7 +242,7 @@ class TestSLPPass(unittest.TestCase):
         pm_no_slp.add_pass(SLPVectorizationPass())
         pm_no_slp.config["slp-vectorization"] = PassConfig(name="slp-vectorization", enabled=False)
         no_slp_hir = pm_no_slp.run(hir)
-        instrs_no_slp = compile_hir_to_vliw(no_slp_hir)
+        instrs_no_slp = self._compile_hir_via_mir_only(no_slp_hir)
 
         mem_no_slp = [i * 10 for i in range(VLEN)] + [0] * 200
         machine_no_slp = self._run_program(instrs_no_slp, mem_no_slp)
@@ -239,7 +251,7 @@ class TestSLPPass(unittest.TestCase):
         pm_slp = PassManager()
         pm_slp.add_pass(SLPVectorizationPass())
         slp_hir = pm_slp.run(hir)
-        instrs_slp = compile_hir_to_vliw(slp_hir)
+        instrs_slp = self._compile_hir_via_mir_only(slp_hir)
 
         mem_slp = [i * 10 for i in range(VLEN)] + [0] * 200
         machine_slp = self._run_program(instrs_slp, mem_slp)
