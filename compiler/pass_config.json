@@ -67,11 +67,12 @@
     "inst-scheduling": {
       "enabled": true,
       "options": {
-        "prefer_load_fill": true,
+        "prefer_load_fill": false,
         "devectorize_valu_to_alu": true,
         "devectorize_vector_ops_to_alu": true,
         "devectorize_vbroadcast_to_alu": true,
         "devectorize_multiply_add_to_alu": false,
+        "devectorize_partial_alu_fill": true,
         "prioritize_load_unblock": true,
         "register_pressure_limit": 0
       }
