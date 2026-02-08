@@ -16,7 +16,7 @@
         "constant_folding": true,
         "identities": true,
         "canonicalization": true,
-        "select_to_mul": false,
+        "select_to_mul": true,
         "select_to_alu_mux": false,
         "parity_pattern": true,
         "add_mul_fold": true
@@ -72,13 +72,21 @@
         "devectorize_vector_ops_to_alu": true,
         "devectorize_vbroadcast_to_alu": true,
         "devectorize_multiply_add_to_alu": false,
-        "devectorize_multiply_add_pre_expand": false,
-        "prioritize_load_unblock": true
+        "prioritize_load_unblock": true,
+        "register_pressure_limit": 0
       }
     },
     "lir-to-mir": {
       "enabled": false,
       "options": {}
+    },
+    "mir-register-allocation": {
+      "enabled": true,
+      "options": {
+        "enable_spilling": false,
+        "spill_infra_size": 35,
+        "debug_spills": false
+      }
     }
   }
 }

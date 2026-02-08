@@ -3,12 +3,14 @@ MIR Register Allocation Pass
 
 Implements linear scan register allocation on MIR with bundle-aware liveness.
 Each bundle gets a unique index since bundles are atomic scheduling units.
+Supports register spilling to memory when scratch registers are exhausted.
 """
 
 from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass, field
+from typing import Optional
 
 from vm import SCRATCH_SIZE, VLEN
 
@@ -33,6 +35,15 @@ class LiveInterval:
     start: int             # First point where live
     end: int               # Last point where live
     is_vector: bool        # Whether this is a vector register (8 contiguous)
+
+
+@dataclass
+class SpillInfo:
+    """Information about a spilled interval."""
+    vreg: int              # Virtual register that was spilled
+    mem_offset: int        # Offset from spill base address in memory
+    is_vector: bool        # Whether this is a vector spill
+    interval: LiveInterval # The original live interval
 
 
 def _is_contiguous_vector_list(op: list) -> bool:
@@ -306,7 +317,7 @@ def _build_live_intervals(mfunc: MachineFunction, liveness: dict[str, LivenessIn
 
 
 def _linear_scan(intervals: list[LiveInterval]) -> tuple[dict[int, int], int]:
-    """Linear scan register allocation.
+    """Linear scan register allocation (no spilling).
 
     Args:
         intervals: List of live intervals sorted by start position
@@ -316,44 +327,119 @@ def _linear_scan(intervals: list[LiveInterval]) -> tuple[dict[int, int], int]:
         - allocation: maps virtual register to physical register
         - max_preg_used: highest physical register used
     """
+    allocation, max_preg_used, _ = _linear_scan_with_spill(intervals, reg_limit=-1)
+    return allocation, max_preg_used
+
+
+def _linear_scan_with_spill(
+    intervals: list[LiveInterval],
+    reg_limit: int = -1,
+    use_counts: dict[int, int] | None = None,
+) -> tuple[dict[int, int], int, list[SpillInfo]]:
+    """Linear scan register allocation with spill support.
+
+    When reg_limit > 0 and allocation would exceed it, evicts the active
+    interval with the fewest uses (lowest reload cost) and marks it as spilled.
+    The caller must insert spill store/load code around def/use sites.
+
+    Args:
+        intervals: List of live intervals sorted by start position
+        reg_limit: Max physical registers to use (-1 = unlimited)
+        use_counts: Optional map of vreg -> total use count for spill cost estimation
+
+    Returns:
+        (allocation, max_preg_used, spills) where:
+        - allocation: maps virtual register to physical register
+        - max_preg_used: highest physical register used
+        - spills: list of SpillInfo for spilled intervals
+    """
     allocation: dict[int, int] = {}
-
-    # Free ranges of physical registers, inclusive ranges (start, end)
     free_ranges: list[tuple[int, int]] = []
-
-    # Next available physical register (high-water mark)
     next_preg = 0
-
-    # Active intervals sorted by end position
     active: list[LiveInterval] = []
+    spills: list[SpillInfo] = []
+    spill_offset = 0
+
+    def _spill_cost(iv: LiveInterval) -> int:
+        """Estimate the cost of spilling this interval (lower = better to spill)."""
+        if use_counts is None:
+            # Fall back to span-based heuristic (prefer spilling long-lived)
+            return -(iv.end - iv.start)
+        # Each use requires ~3 bundles for reload. Prefer spilling fewer-use values.
+        return use_counts.get(iv.vreg, 0)
 
     for interval in intervals:
         # Expire old intervals
         new_active = []
         for a in active:
             if a.end < interval.start:
-                # This interval has expired, free its register
-                preg = allocation[a.vreg]
-                size = VLEN if a.is_vector else 1
-                _add_free_range(free_ranges, preg, preg + size - 1)
+                if a.vreg in allocation:
+                    preg = allocation[a.vreg]
+                    size = VLEN if a.is_vector else 1
+                    _add_free_range(free_ranges, preg, preg + size - 1)
             else:
                 new_active.append(a)
         active = new_active
 
-        # Allocate register for current interval
         size = VLEN if interval.is_vector else 1
         preg = _alloc_from_free(free_ranges, size)
+
         if preg is None:
-            preg = next_preg
-            next_preg += size
+            if reg_limit > 0 and next_preg + size > reg_limit:
+                # Would exceed limit. Must spill to free a register.
+                # Pick the active interval with the LOWEST spill cost (fewest uses).
+                best_vi = None
+                best_cost = None
+                for vi in range(len(active)):
+                    candidate = active[vi]
+                    if candidate.end <= interval.end:
+                        continue  # Current interval lives longer
+                    cand_size = VLEN if candidate.is_vector else 1
+                    if cand_size < size:
+                        continue  # Too small
+                    cost = _spill_cost(candidate)
+                    if best_cost is None or cost < best_cost:
+                        best_cost = cost
+                        best_vi = vi
+
+                if best_vi is not None:
+                    victim = active.pop(best_vi)
+                    victim_preg = allocation[victim.vreg]
+                    del allocation[victim.vreg]
+                    cand_size = VLEN if victim.is_vector else 1
+
+                    spills.append(SpillInfo(
+                        vreg=victim.vreg,
+                        mem_offset=spill_offset,
+                        is_vector=victim.is_vector,
+                        interval=victim,
+                    ))
+                    spill_offset += VLEN if victim.is_vector else 1
+
+                    _add_free_range(free_ranges, victim_preg, victim_preg + cand_size - 1)
+                    preg = _alloc_from_free(free_ranges, size)
+                    if preg is None:
+                        preg = next_preg
+                        next_preg += size
+                else:
+                    # No suitable victim found — spill current interval
+                    spills.append(SpillInfo(
+                        vreg=interval.vreg,
+                        mem_offset=spill_offset,
+                        is_vector=interval.is_vector,
+                        interval=interval,
+                    ))
+                    spill_offset += VLEN if interval.is_vector else 1
+                    continue
+            else:
+                preg = next_preg
+                next_preg += size
 
         allocation[interval.vreg] = preg
-
-        # Add to active list, keep sorted by end
         bisect.insort_right(active, interval, key=lambda x: x.end)
 
     max_preg_used = next_preg - 1 if next_preg > 0 else 0
-    return allocation, max_preg_used
+    return allocation, max_preg_used, spills
 
 
 def _add_free_range(free_ranges: list[tuple[int, int]], start: int, end: int) -> None:
@@ -545,12 +631,196 @@ def _materialize_zero_for_copies(mfunc: MachineFunction, max_preg_used: int) -> 
     return zero_scratch
 
 
+def _split_live_ranges(
+    mfunc: MachineFunction,
+    spills: list[SpillInfo],
+    vector_bases: set[int],
+    vector_addrs: set[int],
+) -> None:
+    """Split long live ranges by inserting store/load to memory.
+
+    For each spilled interval, inserts:
+    - vstore/store after each def bundle (save to memory)
+    - vload/load into a FRESH vreg before each use bundle, then rewrites the
+      using instruction to reference the fresh vreg.
+
+    This breaks long live intervals into short def→store and load→use pairs.
+    Each reload gets its own vreg so the original vreg is dead after the spill
+    store, and reloaded copies are only live for 1-2 bundles.
+    The spill area is at mem[inp_values_p + batch_size] = mem[mem[6] + mem[2]].
+    """
+    if not spills:
+        return
+
+    # Find max virtual register in use
+    max_vreg = 0
+    for block in mfunc.blocks.values():
+        for bundle in block.bundles:
+            for inst in bundle.instructions:
+                for d in inst.get_defs():
+                    if isinstance(d, int):
+                        max_vreg = max(max_vreg, d)
+                for u in inst.get_uses():
+                    if isinstance(u, int):
+                        max_vreg = max(max_vreg, u)
+
+    next_fresh = max_vreg + 1
+
+    def alloc_fresh(size: int = 1) -> int:
+        nonlocal next_fresh
+        base = next_fresh
+        next_fresh += size
+        return base
+
+    # Allocate fresh virtual registers for spill infrastructure
+    spill_base_vreg = alloc_fresh()       # Holds spill base memory address
+    spill_addr_vreg = alloc_fresh()       # Temp for address computation (reused)
+    spill_const_vreg = alloc_fresh()      # Temp for constants (reused)
+
+    # Build addr_to_base map
+    addr_to_base: dict[int, int] = {}
+    for base in vector_bases:
+        for i in range(VLEN):
+            addr_to_base[base + i] = base
+
+    # Build spill lookup
+    spilled_vregs: dict[int, SpillInfo] = {s.vreg: s for s in spills}
+
+    # Insert spill base address computation at entry block
+    entry_block = mfunc.blocks[mfunc.entry]
+    b1 = MBundle()
+    b1.add_instruction(MachineInst(LIROpcode.CONST, spill_const_vreg, [6], "load"))
+    b1.add_instruction(MachineInst(LIROpcode.CONST, spill_addr_vreg, [2], "load"))
+    b2 = MBundle()
+    b2.add_instruction(MachineInst(LIROpcode.LOAD, spill_const_vreg, [spill_const_vreg], "load"))
+    b2.add_instruction(MachineInst(LIROpcode.LOAD, spill_addr_vreg, [spill_addr_vreg], "load"))
+    b3 = MBundle()
+    b3.add_instruction(MachineInst(LIROpcode.ADD, spill_base_vreg,
+                                    [spill_const_vreg, spill_addr_vreg], "alu"))
+    entry_block.bundles.insert(0, b1)
+    entry_block.bundles.insert(1, b2)
+    entry_block.bundles.insert(2, b3)
+
+    # Walk all blocks and insert store/load around spilled vreg defs/uses.
+    # Each reload goes into a FRESH vreg and we rewrite the using instructions.
+    block_order = mfunc.get_block_order()
+    for block_name in block_order:
+        block = mfunc.blocks[block_name]
+        new_bundles: list[MBundle] = []
+
+        for bundle in block.bundles:
+            # Identify spilled vregs used/defined by this bundle
+            bundle_uses: set[int] = set()
+            bundle_defs: set[int] = set()
+
+            for inst in bundle.instructions:
+                for u in inst.get_uses():
+                    vreg = u
+                    if u in vector_addrs and u not in vector_bases:
+                        vreg = addr_to_base.get(u, u)
+                    if vreg in spilled_vregs:
+                        bundle_uses.add(vreg)
+
+                for d in inst.get_defs():
+                    vreg = d
+                    if d in vector_addrs and d not in vector_bases:
+                        vreg = addr_to_base.get(d, d)
+                    if vreg in spilled_vregs:
+                        bundle_defs.add(vreg)
+
+            # For each spilled vreg used: allocate fresh vreg, reload into it,
+            # and rewrite the using instruction's operands.
+            rewrite_map: dict[int, int] = {}  # old_addr -> new_addr
+            for vreg in bundle_uses:
+                sp = spilled_vregs[vreg]
+                if sp.is_vector:
+                    fresh_base = alloc_fresh(VLEN)
+                    # Record rewrite for all lanes
+                    for i in range(VLEN):
+                        rewrite_map[vreg + i] = fresh_base + i
+                    # Also mark fresh_base as vector
+                    vector_bases.add(fresh_base)
+                    for i in range(VLEN):
+                        vector_addrs.add(fresh_base + i)
+                        addr_to_base[fresh_base + i] = fresh_base
+                else:
+                    fresh = alloc_fresh()
+                    rewrite_map[vreg] = fresh
+
+                # Emit reload into fresh vreg
+                addr_b1 = MBundle()
+                addr_b1.add_instruction(
+                    MachineInst(LIROpcode.CONST, spill_addr_vreg, [sp.mem_offset], "load")
+                )
+                addr_b2 = MBundle()
+                addr_b2.add_instruction(
+                    MachineInst(LIROpcode.ADD, spill_addr_vreg,
+                                [spill_base_vreg, spill_addr_vreg], "alu")
+                )
+                load_b = MBundle()
+                if sp.is_vector:
+                    load_b.add_instruction(
+                        MachineInst(LIROpcode.VLOAD,
+                                    list(range(fresh_base, fresh_base + VLEN)),
+                                    [spill_addr_vreg], "load")
+                    )
+                else:
+                    load_b.add_instruction(
+                        MachineInst(LIROpcode.LOAD, fresh, [spill_addr_vreg], "load")
+                    )
+                new_bundles.extend([addr_b1, addr_b2, load_b])
+
+            # Rewrite the using instructions' operands
+            if rewrite_map:
+                for inst in bundle.instructions:
+                    new_operands = []
+                    for op in inst.operands:
+                        if isinstance(op, list):
+                            new_operands.append([rewrite_map.get(x, x) if isinstance(x, int) else x for x in op])
+                        elif isinstance(op, int) and op in rewrite_map:
+                            new_operands.append(rewrite_map[op])
+                        else:
+                            new_operands.append(op)
+                    inst.operands = new_operands
+
+            new_bundles.append(bundle)
+
+            # Insert store after bundle for each spilled vreg defined
+            for vreg in bundle_defs:
+                sp = spilled_vregs[vreg]
+                addr_b1 = MBundle()
+                addr_b1.add_instruction(
+                    MachineInst(LIROpcode.CONST, spill_addr_vreg, [sp.mem_offset], "load")
+                )
+                addr_b2 = MBundle()
+                addr_b2.add_instruction(
+                    MachineInst(LIROpcode.ADD, spill_addr_vreg,
+                                [spill_base_vreg, spill_addr_vreg], "alu")
+                )
+                store_b = MBundle()
+                if sp.is_vector:
+                    store_b.add_instruction(
+                        MachineInst(LIROpcode.VSTORE, None,
+                                    [spill_addr_vreg,
+                                     list(range(vreg, vreg + VLEN))], "store")
+                    )
+                else:
+                    store_b.add_instruction(
+                        MachineInst(LIROpcode.STORE, None,
+                                    [spill_addr_vreg, vreg], "store")
+                    )
+                new_bundles.extend([addr_b1, addr_b2, store_b])
+
+        block.bundles = new_bundles
+
+
 class MIRRegisterAllocationPass(MIRPass):
     """
     Register allocation pass for MIR.
 
     Uses linear scan algorithm with bundle-aware liveness analysis.
     Each bundle gets a unique index since bundles are atomic scheduling units.
+    Supports spilling to memory when register pressure exceeds SCRATCH_SIZE.
     """
 
     @property
@@ -560,6 +830,11 @@ class MIRRegisterAllocationPass(MIRPass):
     def run(self, mir: MachineFunction, config: PassConfig) -> MachineFunction:
         """Run register allocation on MIR."""
         self._init_metrics()
+
+        # Read config options
+        enable_spilling = bool(config.options.get("enable_spilling", True))
+        spill_infra_size = int(config.options.get("spill_infra_size", 35))
+        debug_spills = bool(config.options.get("debug_spills", False))
 
         # Step 1: Detect vector bases
         vector_bases, vector_addrs = _detect_vector_bases(mir)
@@ -586,35 +861,98 @@ class MIRRegisterAllocationPass(MIRPass):
 
         # Step 4: Linear scan allocation
         allocation, max_preg_used = _linear_scan(intervals)
+        n_spills = 0
 
-        # Check if we exceeded SCRATCH_SIZE
-        if max_preg_used >= SCRATCH_SIZE:
-            raise RuntimeError(
-                f"Register allocation failed: need {max_preg_used + 1} registers "
-                f"but only {SCRATCH_SIZE} available"
-            )
+        if max_preg_used < SCRATCH_SIZE:
+            # Fits without spilling
+            _rewrite_mir(mir, allocation, vector_bases, vector_addrs)
+            max_preg_used = _materialize_zero_for_copies(mir, max_preg_used)
 
-        # Step 5: Rewrite MIR
-        _rewrite_mir(mir, allocation, vector_bases, vector_addrs)
+            if max_preg_used >= SCRATCH_SIZE:
+                raise RuntimeError(
+                    f"Register allocation failed: need {max_preg_used + 1} registers "
+                    f"but only {SCRATCH_SIZE} available"
+                )
+        else:
+            # Need spilling: identify intervals to spill, insert store/load,
+            # then re-run allocation on the modified MIR.
+            import sys
 
-        # Step 6: Materialize zero constant for COPY operations
-        max_preg_used = _materialize_zero_for_copies(mir, max_preg_used)
+            if not enable_spilling:
+                raise RuntimeError(
+                    f"Register allocation failed: need {max_preg_used + 1} registers "
+                    f"but only {SCRATCH_SIZE} available (spilling disabled by config)"
+                )
 
-        if max_preg_used >= SCRATCH_SIZE:
-            raise RuntimeError(
-                f"Register allocation failed: need {max_preg_used + 1} registers "
-                f"but only {SCRATCH_SIZE} available"
-            )
+            reg_limit = SCRATCH_SIZE - spill_infra_size
+
+            # Compute use counts per vreg (normalized to vector bases)
+            # to avoid spilling high-use broadcast constants
+            _addr_to_base: dict[int, int] = {}
+            for base in vector_bases:
+                for i in range(VLEN):
+                    _addr_to_base[base + i] = base
+
+            use_counts: dict[int, int] = {}
+            for block in mir.blocks.values():
+                for bundle in block.bundles:
+                    for inst in bundle.instructions:
+                        for u in inst.get_uses():
+                            vreg = _addr_to_base.get(u, u)
+                            use_counts[vreg] = use_counts.get(vreg, 0) + 1
+
+            _, _, spills = _linear_scan_with_spill(intervals, reg_limit, use_counts)
+            if not spills:
+                raise RuntimeError(
+                    f"Register allocation failed: need {max_preg_used + 1} registers "
+                    f"but only {SCRATCH_SIZE} available (no spill candidates)"
+                )
+            n_spills = len(spills)
+            if debug_spills:
+                print(f"[regalloc] Spilling {n_spills} intervals to memory", file=sys.stderr)
+                for sp in spills:
+                    uc = use_counts.get(sp.vreg, 0)
+                    span = sp.interval.end - sp.interval.start
+                    print(f"  spill vreg={sp.vreg} uses={uc} span={span} vec={sp.is_vector}", file=sys.stderr)
+
+            # Insert store/load instructions with fresh vregs per reload
+            _split_live_ranges(mir, spills, vector_bases, vector_addrs)
+
+            # Re-detect vectors (split_live_ranges adds new vector bases)
+            vector_bases2, vector_addrs2 = _detect_vector_bases(mir)
+            liveness2 = _compute_liveness(mir, vector_bases2, vector_addrs2)
+            intervals2 = _build_live_intervals(mir, liveness2, vector_bases2, vector_addrs2)
+            allocation2, max_preg_used = _linear_scan(intervals2)
+
+            if debug_spills:
+                print(f"[regalloc] After spill: {len(intervals2)} intervals, "
+                      f"max_preg={max_preg_used}", file=sys.stderr)
+
+            if max_preg_used >= SCRATCH_SIZE:
+                raise RuntimeError(
+                    f"Register allocation failed after spilling: need {max_preg_used + 1} "
+                    f"registers but only {SCRATCH_SIZE} available "
+                    f"({n_spills} intervals spilled)"
+                )
+
+            _rewrite_mir(mir, allocation2, vector_bases2, vector_addrs2)
+            max_preg_used = _materialize_zero_for_copies(mir, max_preg_used)
+
+            if max_preg_used >= SCRATCH_SIZE:
+                raise RuntimeError(
+                    f"Register allocation failed: need {max_preg_used + 1} registers "
+                    f"but only {SCRATCH_SIZE} available"
+                )
 
         mir.max_scratch_used = max_preg_used
 
-        # Record metrics
         if self._metrics:
             self._metrics.custom = {
                 "virtual_regs": len(intervals),
                 "physical_regs_used": max_preg_used + 1,
                 "scalars_allocated": n_scalars,
                 "vectors_allocated": n_vectors,
+                "spills": n_spills,
             }
 
         return mir

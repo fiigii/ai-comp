@@ -518,60 +518,6 @@ def _devectorize_valu_to_alu_with_knobs(
     return _devectorize_valu_to_alu(inst)
 
 
-def _pre_expand_multiply_add_valu_to_alu(
-    instructions: list[MachineInst],
-    enabled: bool,
-    budget: int = -1,
-    spread: bool = True,
-) -> tuple[list[MachineInst], int]:
-    if not enabled:
-        return instructions, 0
-
-    if budget == 0:
-        return instructions, 0
-
-    candidate_positions: list[int] = []
-    for i, inst in enumerate(instructions):
-        if inst.engine == "valu" and inst.opcode == LIROpcode.MULTIPLY_ADD:
-            if _expand_multiply_add_to_alu(inst) is not None:
-                candidate_positions.append(i)
-
-    if not candidate_positions:
-        return instructions, 0
-
-    selected_positions: set[int]
-    if budget < 0 or budget >= len(candidate_positions):
-        selected_positions = set(candidate_positions)
-    elif spread:
-        # Select evenly across the stream to reduce long saturated phases.
-        selected_positions = set()
-        n = len(candidate_positions)
-        for k in range(budget):
-            idx = int((k * n) / budget)
-            if idx >= n:
-                idx = n - 1
-            selected_positions.add(candidate_positions[idx])
-        if len(selected_positions) < budget:
-            for pos in candidate_positions:
-                if pos not in selected_positions:
-                    selected_positions.add(pos)
-                    if len(selected_positions) >= budget:
-                        break
-    else:
-        selected_positions = set(candidate_positions[:budget])
-
-    expanded: list[MachineInst] = []
-    expanded_count = 0
-    for idx, inst in enumerate(instructions):
-        if idx in selected_positions and inst.engine == "valu" and inst.opcode == LIROpcode.MULTIPLY_ADD:
-            scalar = _expand_multiply_add_to_alu(inst)
-            if scalar is not None:
-                expanded.extend(scalar)
-                expanded_count += 1
-                continue
-        expanded.append(inst)
-    return expanded, expanded_count
-
 
 def _schedule_block(
     instructions: list[MachineInst],
@@ -582,6 +528,7 @@ def _schedule_block(
     devectorize_vbroadcast_to_alu: bool = True,
     devectorize_multiply_add_to_alu: bool = False,
     prioritize_load_unblock: bool = False,
+    register_pressure_limit: int = 0,
 ) -> tuple[list[MBundle], dict[str, dict[str, int]]]:
     """Schedule a block's instructions into MIR bundles.
 
@@ -607,6 +554,57 @@ def _schedule_block(
     bundles: list[MBundle] = []
     current_bundle = 0
     scheduled_count = 0
+
+    # Register pressure tracking
+    pressure_aware = register_pressure_limit > 0
+    remaining_uses: dict[int, int] = {}  # scratch addr -> remaining use count
+    live_regs: set[int] = set()          # currently live scratch addresses
+    live_reg_count = 0                   # weighted count (vectors count as VLEN)
+
+    # Pre-compute use counts for pressure tracking
+    if pressure_aware:
+        from collections import Counter
+        from vm import VLEN as _VLEN
+        use_counter: Counter[int] = Counter()
+        for node in nodes:
+            for u in node.inst.get_uses():
+                use_counter[u] += 1
+        remaining_uses = dict(use_counter)
+
+        # Detect vector bases (contiguous groups of VLEN addresses)
+        all_defs: set[int] = set()
+        _vec_bases: set[int] = set()
+        for node in nodes:
+            inst = node.inst
+            if inst.dest is not None and isinstance(inst.dest, list) and inst.dest:
+                base = inst.dest[0]
+                if isinstance(base, int):
+                    _vec_bases.add(base)
+            all_defs.update(inst.get_defs())
+        # For pressure estimation: vector defs count as VLEN regs
+        _vec_addrs: set[int] = set()
+        for base in _vec_bases:
+            for i in range(_VLEN):
+                _vec_addrs.add(base + i)
+
+        def _reg_size(addr: int) -> int:
+            return _VLEN if addr in _vec_bases else (0 if addr in _vec_addrs else 1)
+
+        def _kill_score(node_idx: int) -> int:
+            """How many registers this instruction frees (last use of values)."""
+            freed = 0
+            for u in nodes[node_idx].inst.get_uses():
+                if u in remaining_uses and remaining_uses[u] == 1:
+                    freed += _reg_size(u)
+            return freed
+
+        def _def_cost(node_idx: int) -> int:
+            """How many new live registers this instruction creates."""
+            cost = 0
+            for d in nodes[node_idx].inst.get_defs():
+                if d not in live_regs:
+                    cost += _reg_size(d)
+            return cost
 
     # Bundle-level utilization diagnostics
     bundle_end_reasons = {"deps": 0, "slot_limit": 0}
@@ -661,13 +659,29 @@ def _schedule_block(
                         any_ready_load = True
                         break
 
+            # Under high pressure, prefer instructions that free registers
+            high_pressure = pressure_aware and live_reg_count > register_pressure_limit
+
             for idx in sorted(ready):
                 inst = nodes[idx].inst
                 if only_engine is not None and inst.engine != only_engine:
                     continue
                 if not bundle.has_slot_available(inst.engine):
                     continue
-                if prioritize_load_unblock and only_engine is None and load_slot_open and not any_ready_load:
+
+                if high_pressure:
+                    # Under pressure: maximize freed regs, minimize new defs
+                    kill = _kill_score(idx)
+                    cost = _def_cost(idx)
+                    pressure_key = kill - cost  # net register freedom
+                    key = (
+                        pressure_key,
+                        heights[idx],
+                        load_unblock_scores[idx],
+                        _engine_priority(inst.engine),
+                        -nodes[idx].index,
+                    )
+                elif prioritize_load_unblock and only_engine is None and load_slot_open and not any_ready_load:
                     dist = load_distance[idx]
                     key = (
                         -dist if dist < 10**9 else -10**9,
@@ -692,10 +706,26 @@ def _schedule_block(
             return slot_limits[engine] - used_in_bundle_by_engine[engine]
 
         def mark_node_scheduled(node_idx: int) -> None:
-            nonlocal scheduled_count
+            nonlocal scheduled_count, live_reg_count
             ready.remove(node_idx)
             scheduled[node_idx] = True
             scheduled_count += 1
+            if pressure_aware:
+                # Update live register tracking
+                inst = nodes[node_idx].inst
+                # Process uses: decrement remaining_uses, kill if last use
+                for u in inst.get_uses():
+                    if u in remaining_uses:
+                        remaining_uses[u] -= 1
+                        if remaining_uses[u] == 0:
+                            if u in live_regs:
+                                live_regs.discard(u)
+                                live_reg_count -= _reg_size(u)
+                # Process defs: add to live set
+                for d in inst.get_defs():
+                    if d not in live_regs:
+                        live_regs.add(d)
+                        live_reg_count += _reg_size(d)
             for succ, delay in nodes[node_idx].succs.items():
                 remaining_preds[succ] -= 1
                 target_bundle = current_bundle + delay
@@ -762,6 +792,7 @@ def _schedule_block(
                 break
 
             inst = nodes[best_idx].inst
+
             if not bundle.add_instruction(inst):
                 ready.remove(best_idx)
                 continue
@@ -843,16 +874,8 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         devectorize_vector_ops_to_alu = bool(config.options.get("devectorize_vector_ops_to_alu", True))
         devectorize_vbroadcast_to_alu = bool(config.options.get("devectorize_vbroadcast_to_alu", True))
         devectorize_multiply_add_to_alu = bool(config.options.get("devectorize_multiply_add_to_alu", False))
-        devectorize_multiply_add_pre_expand = bool(
-            config.options.get("devectorize_multiply_add_pre_expand", False)
-        )
-        devectorize_multiply_add_pre_expand_budget = int(
-            config.options.get("devectorize_multiply_add_pre_expand_budget", -1)
-        )
-        devectorize_multiply_add_pre_expand_spread = bool(
-            config.options.get("devectorize_multiply_add_pre_expand_spread", True)
-        )
         prioritize_load_unblock = bool(config.options.get("prioritize_load_unblock", False))
+        register_pressure_limit = int(config.options.get("register_pressure_limit", 0))
 
         mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used)
 
@@ -871,20 +894,11 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         total_devectorized_valu_ops = 0
         total_devectorized_alu_ops = 0
         total_devectorized_multiply_add_ops = 0
-        total_preexpanded_multiply_add_ops = 0
 
         for block_name in block_order:
             lir_block = lir.blocks[block_name]
 
             machine_insts = [_lir_inst_to_machine_inst(inst) for inst in lir_block.instructions]
-            if devectorize_multiply_add_to_alu and devectorize_multiply_add_pre_expand:
-                machine_insts, expanded = _pre_expand_multiply_add_valu_to_alu(
-                    machine_insts,
-                    enabled=True,
-                    budget=devectorize_multiply_add_pre_expand_budget,
-                    spread=devectorize_multiply_add_pre_expand_spread,
-                )
-                total_preexpanded_multiply_add_ops += expanded
             terminator = lir_block.terminator
 
             bundles, stats = _schedule_block(
@@ -896,6 +910,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 devectorize_vbroadcast_to_alu=devectorize_vbroadcast_to_alu,
                 devectorize_multiply_add_to_alu=devectorize_multiply_add_to_alu,
                 prioritize_load_unblock=prioritize_load_unblock,
+                register_pressure_limit=register_pressure_limit,
             )
 
             for engine in slot_limits:
@@ -955,7 +970,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 "devectorized_valu_ops": total_devectorized_valu_ops,
                 "devectorized_alu_ops": total_devectorized_alu_ops,
                 "devectorized_multiply_add_ops": total_devectorized_multiply_add_ops,
-                "preexpanded_multiply_add_ops": total_preexpanded_multiply_add_ops,
             }
 
             self._add_metric_message(
@@ -1032,11 +1046,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                         f"vector_ops={devectorize_vector_ops_to_alu}, "
                         f"vbroadcast={devectorize_vbroadcast_to_alu}, "
                         f"multiply_add={devectorize_multiply_add_to_alu}, "
-                        f"multiply_add_pre_expand={devectorize_multiply_add_pre_expand}, "
-                        f"multiply_add_pre_expand_budget={devectorize_multiply_add_pre_expand_budget}, "
-                        f"multiply_add_pre_expand_spread={devectorize_multiply_add_pre_expand_spread}, "
-                        f"devectorized_multiply_add={total_devectorized_multiply_add_ops}, "
-                        f"preexpanded_multiply_add={total_preexpanded_multiply_add_ops}"
+                        f"devectorized_multiply_add={total_devectorized_multiply_add_ops}"
                     )
                 self._add_metric_message("\n".join(lines))
 

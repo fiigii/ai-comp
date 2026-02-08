@@ -39,6 +39,8 @@ class TreeLevelCachePass(Pass):
 
         levels = int(config.options.get("levels", 4))
         estimate_ops = bool(config.options.get("estimate_ops", True))
+        # base_levels: preloaded once at start; higher levels get phased preloads
+        base_levels = min(int(config.options.get("base_levels", 3)), levels)
         if levels <= 0:
             self._add_metric_message("levels <= 0, skipping")
             return hir
@@ -63,7 +65,7 @@ class TreeLevelCachePass(Pass):
             return hir
 
         wrap_period = self._infer_wrap_period(hir.body)
-        replacements = self._find_replacements(
+        replacements, round_map = self._find_replacements(
             hir.body, use_def, forest_values_p, batch_size, levels, wrap_period
         )
         if not replacements:
@@ -71,11 +73,48 @@ class TreeLevelCachePass(Pass):
             return hir
 
         self._next_ssa_id = hir.num_ssa_values
-        preload_ops: list[Op] = []
-        node_vals: list[SSAValue] = []
-        if replacements:
-            preload_ops, node_vals = self._emit_preloads(forest_values_p, levels)
-            self._preloads_inserted = len(node_vals)
+
+        # Emit base preloads (levels 0..base_levels-1) once
+        base_preload_ops, base_node_vals = self._emit_preloads(
+            forest_values_p, base_levels
+        )
+        self._preloads_inserted = len(base_node_vals)
+
+        # Group replacements by round to identify where phased preloads are needed
+        # round_idx -> list of (stmt_idx, idx_ssa, level, load_result)
+        round_replacements: dict[int, list[tuple[int, SSAValue, int, SSAValue]]] = {}
+        for stmt_idx, (idx_ssa, level, load_result) in replacements.items():
+            round_idx = round_map[stmt_idx]
+            if round_idx not in round_replacements:
+                round_replacements[round_idx] = []
+            round_replacements[round_idx].append((stmt_idx, idx_ssa, level, load_result))
+
+        # Identify which rounds need higher-level preloads
+        # For each such round, we emit fresh preloads right before the first replacement
+        higher_level_rounds: set[int] = set()
+        for round_idx, repls in round_replacements.items():
+            if any(level >= base_levels for _, _, level, _ in repls):
+                higher_level_rounds.add(round_idx)
+
+        # Build per-round phased node_vals (fresh preloads for each round needing level >= base_levels)
+        # Maps round_idx -> (preload_ops, node_vals covering ALL levels)
+        phased_preloads: dict[int, tuple[list[Op], list[SSAValue]]] = {}
+        for round_idx in higher_level_rounds:
+            # Emit fresh preloads for nodes at indices base_levels..levels
+            extra_ops, extra_vals = self._emit_preloads_range(
+                forest_values_p, base_levels, levels
+            )
+            # Combine with base node vals for a complete set
+            full_vals = list(base_node_vals) + list(extra_vals)
+            phased_preloads[round_idx] = (extra_ops, full_vals)
+            self._preloads_inserted += len(extra_vals)
+
+        # Build set of stmt indices that are first-in-round for higher-level rounds
+        first_in_round: dict[int, int] = {}  # stmt_idx -> round_idx
+        for round_idx in higher_level_rounds:
+            repls = round_replacements[round_idx]
+            first_stmt = min(si for si, _, _, _ in repls)
+            first_in_round[first_stmt] = round_idx
 
         # Replace loads with select trees
         new_body: list[Statement] = []
@@ -83,16 +122,28 @@ class TreeLevelCachePass(Pass):
         for idx, stmt in enumerate(hir.body):
             if isinstance(stmt, Pause) and not inserted_preloads:
                 new_body.append(stmt)
-                new_body.extend(preload_ops)
+                new_body.extend(base_preload_ops)
                 inserted_preloads = True
                 continue
+
+            # Insert phased preloads before first replacement in a higher-level round
+            if idx in first_in_round:
+                round_idx = first_in_round[idx]
+                extra_ops, _ = phased_preloads[round_idx]
+                new_body.extend(extra_ops)
 
             repl = replacements.get(idx)
             if repl is not None:
                 idx_ssa, level, load_result = repl
+                # Pick the right node_vals: phased if this round has higher-level preloads
+                round_idx = round_map[idx]
+                if round_idx in phased_preloads:
+                    _, round_node_vals = phased_preloads[round_idx]
+                else:
+                    round_node_vals = base_node_vals
                 select_ops: list[Op] = []
                 replacement = self._build_select_for_level(
-                    level, idx_ssa, node_vals, select_ops
+                    level, idx_ssa, round_node_vals, select_ops
                 )
                 use_def.replace_all_uses(load_result, replacement, auto_invalidate=False)
                 new_body.extend(select_ops)
@@ -102,16 +153,18 @@ class TreeLevelCachePass(Pass):
             new_body.append(stmt)
 
         if not inserted_preloads:
-            new_body = preload_ops + new_body
+            new_body = base_preload_ops + new_body
 
         if self._metrics:
             metrics = {
                 "levels": levels,
+                "base_levels": base_levels,
                 "batch_size": batch_size,
                 "wrap_period": wrap_period,
                 "node_loads_seen": self._node_loads_seen,
                 "node_loads_replaced": self._node_loads_replaced,
                 "preloads_inserted": self._preloads_inserted,
+                "higher_level_rounds": sorted(higher_level_rounds),
             }
             if estimate_ops:
                 estimated_flow = self._estimate_flow_ops(replacements)
@@ -205,8 +258,9 @@ class TreeLevelCachePass(Pass):
         batch_size: int,
         levels: int,
         wrap_period: Optional[int],
-    ) -> dict[int, tuple[SSAValue, int, SSAValue]]:
+    ) -> tuple[dict[int, tuple[SSAValue, int, SSAValue]], dict[int, int]]:
         replacements: dict[int, tuple[SSAValue, int, SSAValue]] = {}
+        round_map: dict[int, int] = {}
         node_load_idx = 0
         for idx, stmt in enumerate(body):
             if not isinstance(stmt, Op) or stmt.opcode != "load" or stmt.result is None:
@@ -226,7 +280,8 @@ class TreeLevelCachePass(Pass):
                 phase = round_idx % wrap_period
             if phase < levels:
                 replacements[idx] = (idx_ssa, phase, stmt.result)
-        return replacements
+                round_map[idx] = round_idx
+        return replacements, round_map
 
     @staticmethod
     def _match_node_addr(addr: SSAValue, use_def: UseDefContext,
@@ -250,10 +305,22 @@ class TreeLevelCachePass(Pass):
         return v
 
     def _emit_preloads(self, forest_values_p: SSAValue, levels: int) -> tuple[list[Op], list[SSAValue]]:
-        node_count = (1 << levels) - 1
+        """Emit preloads for all nodes in levels 0..levels-1."""
+        return self._emit_preloads_range(forest_values_p, 0, levels)
+
+    def _emit_preloads_range(
+        self, forest_values_p: SSAValue, from_level: int, to_level: int
+    ) -> tuple[list[Op], list[SSAValue]]:
+        """Emit preloads for nodes in levels from_level..to_level-1 only.
+
+        Returns ops and node_vals for nodes at indices
+        (2^from_level - 1) .. (2^to_level - 2).
+        """
+        start_node = (1 << from_level) - 1
+        end_node = (1 << to_level) - 1
         ops: list[Op] = []
         node_vals: list[SSAValue] = []
-        for n in range(node_count):
+        for n in range(start_node, end_node):
             addr = self._new_ssa(f"tree_cache_addr_{n}")
             ops.append(Op("+", addr, [forest_values_p, Const(n)], "alu"))
             val = self._new_ssa(f"tree_cache_val_{n}")
