@@ -116,15 +116,14 @@ class TreeLevelCachePass(Pass):
             first_stmt = min(si for si, _, _, _ in repls)
             first_in_round[first_stmt] = round_idx
 
+        # Place base preloads immediately before their first real use.
+        first_base_use_idx = min(replacements.keys())
+
         # Replace loads with select trees
         new_body: list[Statement] = []
-        inserted_preloads = False
         for idx, stmt in enumerate(hir.body):
-            if isinstance(stmt, Pause) and not inserted_preloads:
-                new_body.append(stmt)
+            if idx == first_base_use_idx:
                 new_body.extend(base_preload_ops)
-                inserted_preloads = True
-                continue
 
             # Insert phased preloads before first replacement in a higher-level round
             if idx in first_in_round:
@@ -151,9 +150,6 @@ class TreeLevelCachePass(Pass):
                 continue
 
             new_body.append(stmt)
-
-        if not inserted_preloads:
-            new_body = base_preload_ops + new_body
 
         if self._metrics:
             metrics = {
