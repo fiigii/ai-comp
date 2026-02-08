@@ -45,12 +45,14 @@ def add_compiler_flags(parser: argparse.ArgumentParser) -> None:
                         help="Print DDGs after each compilation pass")
     parser.add_argument("--trace", action="store_true",
                         help="Enable VM execution trace")
+    parser.add_argument("--profile-reg-pressure", action="store_true",
+                        help="Profile register pressure and write HTML chart")
 
 
 # The set of flag names added by add_compiler_flags, for has_custom_flag checks.
 COMPILER_FLAGS = {
     '--print-vliw', '--print-after-all', '--print-metrics',
-    '--print-ddg-after-all', '--trace',
+    '--print-ddg-after-all', '--trace', '--profile-reg-pressure',
 }
 
 
@@ -60,6 +62,7 @@ def compiler_kwargs(args: argparse.Namespace) -> dict:
         'print_after_all': args.print_after_all,
         'print_metrics': args.print_metrics,
         'print_ddg_after_all': args.print_ddg_after_all,
+        'profile_reg_pressure': args.profile_reg_pressure,
     }
 
 

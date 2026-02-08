@@ -15,7 +15,8 @@ from .passes import (
     SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass,
     SLPVectorizationPass, MADSynthesisPass, LoadElimPass, DSEPass,
     TreeLevelCachePass,
-    LIRToMIRPass, InstSchedulingPass, MIRRegisterAllocationPass, MIRToVLIWPass
+    LIRToMIRPass, InstSchedulingPass, MIRRegPressureProfilerPass,
+    MIRRegisterAllocationPass, MIRToVLIWPass
 )
 
 
@@ -23,7 +24,8 @@ def compile_hir_to_vliw(
     hir: HIRFunction,
     print_after_all: bool = False,
     print_metrics: bool = False,
-    print_ddg_after_all: bool = False
+    print_ddg_after_all: bool = False,
+    profile_reg_pressure: bool = False,
 ) -> list[dict]:
     """
     Full compilation from HIR to VLIW with optional debug printing.
@@ -33,6 +35,7 @@ def compile_hir_to_vliw(
         print_after_all: If True, print IR after each compilation phase
         print_metrics: If True, print pass metrics and diagnostics
         print_ddg_after_all: If True, print DDGs after each compilation pass
+        profile_reg_pressure: If True, run register pressure profiler and emit HTML chart
 
     Returns:
         List of VLIW instruction bundles
@@ -83,6 +86,8 @@ def compile_hir_to_vliw(
         pipeline.add_pass(InstSchedulingPass())
     else:
         pipeline.add_pass(LIRToMIRPass())
+    if profile_reg_pressure:
+        pipeline.add_pass(MIRRegPressureProfilerPass())  # MIR -> MIR (analysis only)
     pipeline.add_pass(MIRRegisterAllocationPass())  # MIR -> MIR
     pipeline.add_pass(MIRToVLIWPass())       # MIR -> VLIW
 

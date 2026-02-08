@@ -25,6 +25,7 @@ from .dse import DSEPass
 from .tree_level_cache import TreeLevelCachePass
 from .lir_to_mir import LIRToMIRPass
 from .inst_scheduling import InstSchedulingPass
+from .mir_reg_pressure_profiler import MIRRegPressureProfilerPass
 from .mir_register_allocation import MIRRegisterAllocationPass
 from .mir_codegen import MIRToVLIWPass
 
@@ -45,6 +46,7 @@ __all__ = [
     'TreeLevelCachePass',
     'LIRToMIRPass',
     'InstSchedulingPass',
+    'MIRRegPressureProfilerPass',
     'MIRRegisterAllocationPass',
     'MIRToVLIWPass',
 ]

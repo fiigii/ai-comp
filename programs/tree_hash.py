@@ -203,6 +203,7 @@ def do_kernel_test(
     print_after_all: bool = False,
     print_metrics: bool = False,
     print_ddg_after_all: bool = False,
+    profile_reg_pressure: bool = False,
 ):
     import random
 
@@ -215,7 +216,8 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
                     print_after_all=print_after_all, print_metrics=print_metrics,
-                    print_ddg_after_all=print_ddg_after_all)
+                    print_ddg_after_all=print_ddg_after_all,
+                    profile_reg_pressure=profile_reg_pressure)
 
     if print_vliw:
         from programs import print_vliw as _print_vliw

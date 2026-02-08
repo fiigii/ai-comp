@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Register Pressure Profile</title>
+<style>
+  body { margin: 0; background: #1a1a2e; color: #e0e0e0; font-family: monospace; }
+  #header { padding: 12px 20px; background: #16213e; border-bottom: 1px solid #333; }
+  #header h1 { margin: 0; font-size: 18px; color: #e94560; }
+  #stats { padding: 8px 20px; font-size: 13px; color: #aaa; }
+  #stats span { color: #0f3460; background: #e0e0e0; padding: 2px 6px; border-radius: 3px; margin-right: 12px; }
+  #chart-container { position: relative; padding: 20px; }
+  canvas { display: block; background: #0f3460; border-radius: 4px; }
+  #tooltip { position: absolute; display: none; background: rgba(0,0,0,0.85); color: #fff;
+              padding: 6px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="header"><h1>Register Pressure Profile</h1></div>
+<div id="stats">
+  <span>Peak: $peak_pressure</span>
+  <span>Peak Bundle: $peak_bundle</span>
+  <span>Avg: $avg_pressure</span>
+  <span>Scratch Limit: $scratch_size</span>
+  <span>Bundles: $total_bundles</span>
+</div>
+<div id="chart-container">
+  <canvas id="chart"></canvas>
+  <div id="tooltip"></div>
+</div>
+<script>
+(function() {
+  const bundles = $bundles_json;
+  const scalars = $scalars_json;
+  const vectors = $vectors_json;
+  const LIMIT = $scratch_size;
+  const VLEN = $vlen;
+
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  const container = document.getElementById('chart-container');
+  const tooltip = document.getElementById('tooltip');
+
+  function resize() {
+    canvas.width = container.clientWidth - 40;
+    canvas.height = Math.min(500, Math.max(300, window.innerHeight - 140));
+    draw();
+  }
+
+  function draw() {
+    const W = canvas.width, H = canvas.height;
+    const pad = { top: 30, right: 60, bottom: 40, left: 60 };
+    const cw = W - pad.left - pad.right;
+    const ch = H - pad.top - pad.bottom;
+
+    ctx.clearRect(0, 0, W, H);
+
+    if (bundles.length === 0) return;
+
+    // Compute max Y
+    let maxY = LIMIT;
+    for (let i = 0; i < bundles.length; i++) {
+      maxY = Math.max(maxY, scalars[i] + vectors[i]);
+    }
+    maxY = Math.ceil(maxY * 1.1);
+
+    // X/Y scale
+    const xScale = cw / Math.max(bundles.length - 1, 1);
+    const yScale = ch / maxY;
+
+    function toX(i) { return pad.left + i * xScale; }
+    function toY(v) { return pad.top + ch - v * yScale; }
+
+    // Grid lines
+    ctx.strokeStyle = '#1a3a6a';
+    ctx.lineWidth = 0.5;
+    const yTicks = 5;
+    for (let i = 0; i <= yTicks; i++) {
+      const v = Math.round(maxY * i / yTicks);
+      const y = toY(v);
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+      ctx.fillStyle = '#888'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+      ctx.fillText(v.toString(), pad.left - 6, y + 3);
+    }
+
+    // X axis labels
+    ctx.fillStyle = '#888'; ctx.textAlign = 'center';
+    const xLabelCount = Math.min(10, bundles.length);
+    for (let i = 0; i < xLabelCount; i++) {
+      const idx = Math.round(i * (bundles.length - 1) / Math.max(xLabelCount - 1, 1));
+      ctx.fillText(bundles[idx].toString(), toX(idx), H - pad.bottom + 16);
+    }
+
+    // Vector area (top, stacked on scalar)
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(0));
+    for (let i = 0; i < bundles.length; i++) {
+      ctx.lineTo(toX(i), toY(scalars[i] + vectors[i]));
+    }
+    ctx.lineTo(toX(bundles.length - 1), toY(0));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(233, 69, 96, 0.5)';
+    ctx.fill();
+
+    // Scalar area (bottom)
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(0));
+    for (let i = 0; i < bundles.length; i++) {
+      ctx.lineTo(toX(i), toY(scalars[i]));
+    }
+    ctx.lineTo(toX(bundles.length - 1), toY(0));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(15, 52, 96, 0.7)';
+    ctx.fill();
+
+    // Vector line
+    ctx.beginPath();
+    for (let i = 0; i < bundles.length; i++) {
+      const x = toX(i), y = toY(scalars[i] + vectors[i]);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = '#e94560'; ctx.lineWidth = 1.2; ctx.stroke();
+
+    // Scalar line
+    ctx.beginPath();
+    for (let i = 0; i < bundles.length; i++) {
+      const x = toX(i), y = toY(scalars[i]);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = '#5dade2'; ctx.lineWidth = 1.2; ctx.stroke();
+
+    // Scratch limit line
+    const limitY = toY(LIMIT);
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(pad.left, limitY); ctx.lineTo(W - pad.right, limitY);
+    ctx.strokeStyle = '#f39c12'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#f39c12'; ctx.textAlign = 'left'; ctx.font = '11px monospace';
+    ctx.fillText('SCRATCH_SIZE=' + LIMIT, W - pad.right + 4, limitY + 4);
+
+    // Peak annotation
+    let peakIdx = 0, peakVal = 0;
+    for (let i = 0; i < bundles.length; i++) {
+      const total = scalars[i] + vectors[i];
+      if (total > peakVal) { peakVal = total; peakIdx = i; }
+    }
+    const px = toX(peakIdx), py = toY(peakVal);
+    ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI * 2); ctx.fillStyle = '#e94560'; ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = '11px monospace';
+    ctx.fillText('peak=' + peakVal + ' @' + bundles[peakIdx], px, py - 10);
+
+    // Legend
+    ctx.font = '11px monospace'; ctx.textAlign = 'left';
+    const lx = pad.left + 10, ly = pad.top + 14;
+    ctx.fillStyle = 'rgba(15, 52, 96, 0.7)'; ctx.fillRect(lx, ly - 8, 12, 12);
+    ctx.fillStyle = '#ccc'; ctx.fillText('Scalar', lx + 16, ly + 2);
+    ctx.fillStyle = 'rgba(233, 69, 96, 0.5)'; ctx.fillRect(lx + 80, ly - 8, 12, 12);
+    ctx.fillStyle = '#ccc'; ctx.fillText('Vector (x' + VLEN + ')', lx + 96, ly + 2);
+
+    // Axis labels
+    ctx.fillStyle = '#aaa'; ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Bundle Index', W / 2, H - 4);
+    ctx.save(); ctx.translate(14, H / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('Pressure (scratch words)', 0, 0); ctx.restore();
+  }
+
+  // Tooltip on hover
+  canvas.addEventListener('mousemove', function(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const pad_l = 60, pad_r = 60;
+    const cw = canvas.width - pad_l - pad_r;
+    const idx = Math.round((mx - pad_l) / cw * (bundles.length - 1));
+    if (idx >= 0 && idx < bundles.length) {
+      const total = scalars[idx] + vectors[idx];
+      tooltip.style.display = 'block';
+      tooltip.style.left = (e.clientX - container.getBoundingClientRect().left + 12) + 'px';
+      tooltip.style.top = (e.clientY - container.getBoundingClientRect().top - 30) + 'px';
+      tooltip.innerHTML = 'Bundle ' + bundles[idx] + '<br>Scalar: ' + scalars[idx] +
+        '<br>Vector: ' + vectors[idx] + '<br>Total: ' + total;
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+  canvas.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+
+  window.addEventListener('resize', resize);
+  resize();
+})();
+</script>
+</body>
+</html>
