@@ -140,6 +140,51 @@ class TestInstructionScheduling(unittest.TestCase):
             "Expected devectorized scalar ALU instructions",
         )
 
+    def test_devectorize_can_spill_second_vector_across_bundles(self):
+        def vec(base):
+            return [base + i for i in range(8)]
+
+        instructions = [
+            LIRInst(LIROpcode.VADD, vec(100 + i * 8), [vec(1000), vec(2000)], "valu")
+            for i in range(8)
+        ]
+
+        bundles_without_spill = _schedule_single_block(
+            instructions,
+            devectorize_valu_to_alu=True,
+        )
+        bundles_with_spill = _schedule_single_block(
+            instructions,
+            devectorize_valu_to_alu=True,
+            devectorize_partial_alu_fill=True,
+        )
+
+        non_term_without = bundles_without_spill[:-1]
+        non_term_with = bundles_with_spill[:-1]
+        self.assertEqual(len(non_term_without), 2)
+        self.assertEqual(len(non_term_with), 2)
+
+        # Without partial spill, only one vector gets devectorized in first bundle.
+        first_without = non_term_without[0]
+        second_without = non_term_without[1]
+        self.assertEqual(sum(1 for inst in first_without.instructions if inst.engine == "valu"), 6)
+        self.assertEqual(sum(1 for inst in first_without.instructions if inst.engine == "alu"), 8)
+        self.assertEqual(sum(1 for inst in second_without.instructions if inst.engine == "valu"), 1)
+
+        # With partial spill, second vector starts devectorizing in bundle 1 and
+        # remaining lanes spill to bundle 2.
+        first_bundle = non_term_with[0]
+        second_bundle = non_term_with[1]
+        first_valu = sum(1 for inst in first_bundle.instructions if inst.engine == "valu")
+        first_alu = sum(1 for inst in first_bundle.instructions if inst.engine == "alu")
+        second_valu = sum(1 for inst in second_bundle.instructions if inst.engine == "valu")
+        second_alu = sum(1 for inst in second_bundle.instructions if inst.engine == "alu")
+
+        self.assertEqual(first_valu, 6)
+        self.assertEqual(first_alu, 12, "Expected ALU bundle to be fully filled")
+        self.assertEqual(second_valu, 0, "Second vector op should be continued as scalar lanes")
+        self.assertEqual(second_alu, 4, "Expected remaining 4 scalar lanes in next bundle")
+
     def test_devectorize_valu_to_alu_skips_multiply_add(self):
         def vec(base):
             return [base + i for i in range(8)]

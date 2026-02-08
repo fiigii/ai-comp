@@ -527,6 +527,7 @@ def _schedule_block(
     devectorize_vector_ops_to_alu: bool = True,
     devectorize_vbroadcast_to_alu: bool = True,
     devectorize_multiply_add_to_alu: bool = False,
+    devectorize_partial_alu_fill: bool = False,
     prioritize_load_unblock: bool = False,
     register_pressure_limit: int = 0,
 ) -> tuple[list[MBundle], dict[str, dict[str, int]]]:
@@ -619,6 +620,10 @@ def _schedule_block(
     devectorized_valu_ops = 0
     devectorized_alu_ops = 0
     devectorized_multiply_add_ops = 0
+    # Node idx -> (expanded scalar insts, next scalar idx to emit)
+    pending_devectorized: dict[int, tuple[list[MachineInst], int]] = {}
+    # Preserve deterministic emission order for partially emitted expansions
+    pending_devectorized_order: list[int] = []
 
     def refresh_ready() -> None:
         for i in range(n):
@@ -663,6 +668,8 @@ def _schedule_block(
             high_pressure = pressure_aware and live_reg_count > register_pressure_limit
 
             for idx in sorted(ready):
+                if idx in pending_devectorized:
+                    continue
                 inst = nodes[idx].inst
                 if only_engine is not None and inst.engine != only_engine:
                     continue
@@ -738,25 +745,61 @@ def _schedule_block(
             nonlocal devectorized_valu_ops, devectorized_alu_ops, devectorized_multiply_add_ops
             if not devectorize_valu_to_alu:
                 return False
-            if available_slots("valu") > 0:
-                return False
             if available_slots("alu") <= 0:
+                return False
+
+            def emit_pending(idx: int) -> bool:
+                nonlocal devectorized_alu_ops
+                scalar_insts, next_pos = pending_devectorized[idx]
+                emitted = 0
+                while next_pos < len(scalar_insts) and available_slots("alu") > 0:
+                    scalar_inst = scalar_insts[next_pos]
+                    if not bundle.add_instruction(scalar_inst):
+                        raise RuntimeError("unexpected ALU slot exhaustion during devectorization")
+                    used_in_bundle_by_engine["alu"] += 1
+                    next_pos += 1
+                    emitted += 1
+                pending_devectorized[idx] = (scalar_insts, next_pos)
+                devectorized_alu_ops += emitted
+                if next_pos >= len(scalar_insts):
+                    pending_devectorized.pop(idx, None)
+                    pending_devectorized_order.remove(idx)
+                    mark_node_scheduled(idx)
+                return emitted > 0
+
+            # First, drain any previously-started expansion(s).
+            if devectorize_partial_alu_fill and pending_devectorized_order:
+                for idx in list(pending_devectorized_order):
+                    if available_slots("alu") <= 0:
+                        break
+                    if emit_pending(idx):
+                        return True
+
+            # Only start a new expansion when the VALU engine is saturated.
+            if available_slots("valu") > 0:
                 return False
 
             best_idx = None
             best_key = None
             best_scalar_insts: Optional[list[MachineInst]] = None
             for idx in sorted(ready):
+                if idx in pending_devectorized:
+                    continue
                 inst = nodes[idx].inst
                 if inst.engine != "valu":
+                    continue
+                # Keep multiply_add on VALU in bundle-time devectorization.
+                if inst.opcode == LIROpcode.MULTIPLY_ADD:
                     continue
                 scalar_insts = _devectorize_valu_to_alu_with_knobs(
                     inst,
                     devectorize_vector_ops_to_alu=devectorize_vector_ops_to_alu,
                     devectorize_vbroadcast_to_alu=devectorize_vbroadcast_to_alu,
-                    devectorize_multiply_add_to_alu=devectorize_multiply_add_to_alu,
+                    devectorize_multiply_add_to_alu=False,
                 )
-                if scalar_insts is None or len(scalar_insts) > available_slots("alu"):
+                if scalar_insts is None:
+                    continue
+                if not devectorize_partial_alu_fill and len(scalar_insts) > available_slots("alu"):
                     continue
                 key = (heights[idx], -nodes[idx].index)
                 if best_key is None or key > best_key:
@@ -767,17 +810,10 @@ def _schedule_block(
             if best_idx is None or best_scalar_insts is None:
                 return False
 
-            for scalar_inst in best_scalar_insts:
-                if not bundle.add_instruction(scalar_inst):
-                    raise RuntimeError("unexpected ALU slot exhaustion during devectorization")
-                used_in_bundle_by_engine["alu"] += 1
-
+            pending_devectorized[best_idx] = (best_scalar_insts, 0)
+            pending_devectorized_order.append(best_idx)
             devectorized_valu_ops += 1
-            devectorized_alu_ops += len(best_scalar_insts)
-            if nodes[best_idx].inst.opcode == LIROpcode.MULTIPLY_ADD:
-                devectorized_multiply_add_ops += 1
-            mark_node_scheduled(best_idx)
-            return True
+            return emit_pending(best_idx)
 
         while True:
             best_idx = None
@@ -874,6 +910,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         devectorize_vector_ops_to_alu = bool(config.options.get("devectorize_vector_ops_to_alu", True))
         devectorize_vbroadcast_to_alu = bool(config.options.get("devectorize_vbroadcast_to_alu", True))
         devectorize_multiply_add_to_alu = bool(config.options.get("devectorize_multiply_add_to_alu", False))
+        devectorize_partial_alu_fill = bool(config.options.get("devectorize_partial_alu_fill", False))
         prioritize_load_unblock = bool(config.options.get("prioritize_load_unblock", False))
         register_pressure_limit = int(config.options.get("register_pressure_limit", 0))
 
@@ -909,6 +946,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 devectorize_vector_ops_to_alu=devectorize_vector_ops_to_alu,
                 devectorize_vbroadcast_to_alu=devectorize_vbroadcast_to_alu,
                 devectorize_multiply_add_to_alu=devectorize_multiply_add_to_alu,
+                devectorize_partial_alu_fill=devectorize_partial_alu_fill,
                 prioritize_load_unblock=prioritize_load_unblock,
                 register_pressure_limit=register_pressure_limit,
             )
@@ -1046,6 +1084,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                         f"vector_ops={devectorize_vector_ops_to_alu}, "
                         f"vbroadcast={devectorize_vbroadcast_to_alu}, "
                         f"multiply_add={devectorize_multiply_add_to_alu}, "
+                        f"partial_alu_fill={devectorize_partial_alu_fill}, "
                         f"devectorized_multiply_add={total_devectorized_multiply_add_ops}"
                     )
                 self._add_metric_message("\n".join(lines))
