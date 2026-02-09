@@ -48,6 +48,7 @@ def compile_hir_to_vliw(
     print_metrics: bool = False,
     print_ddg_after_all: bool = False,
     profile_reg_pressure: bool = False,
+    pass_config: str | None = None,
 ) -> list[dict]:
     """
     Full compilation from HIR to VLIW with optional debug printing.
@@ -58,12 +59,16 @@ def compile_hir_to_vliw(
         print_metrics: If True, print pass metrics and diagnostics
         print_ddg_after_all: If True, print DDGs after each compilation pass
         profile_reg_pressure: If True, run register pressure profiler and emit HTML chart
+        pass_config: Path to pass_config.json (default: compiler/pass_config.json)
 
     Returns:
         List of VLIW instruction bundles
     """
-    # Load config from compiler/pass_config.json
-    config_path = os.path.join(os.path.dirname(__file__), "pass_config.json")
+    # Load config from pass_config.json
+    if pass_config is None:
+        config_path = os.path.join(os.path.dirname(__file__), "pass_config.json")
+    else:
+        config_path = pass_config
     with open(config_path) as f:
         config_data = json.load(f)
 

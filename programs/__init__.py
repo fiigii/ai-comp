@@ -47,12 +47,15 @@ def add_compiler_flags(parser: argparse.ArgumentParser) -> None:
                         help="Enable VM execution trace")
     parser.add_argument("--profile-reg-pressure", action="store_true",
                         help="Profile register pressure and write HTML chart")
+    parser.add_argument("--pass-config", type=str, default=None,
+                        help="Path to pass_config.json (default: compiler/pass_config.json)")
 
 
 # The set of flag names added by add_compiler_flags, for has_custom_flag checks.
 COMPILER_FLAGS = {
     '--print-vliw', '--print-after-all', '--print-metrics',
     '--print-ddg-after-all', '--trace', '--profile-reg-pressure',
+    '--pass-config',
 }
 
 
@@ -63,6 +66,7 @@ def compiler_kwargs(args: argparse.Namespace) -> dict:
         'print_metrics': args.print_metrics,
         'print_ddg_after_all': args.print_ddg_after_all,
         'profile_reg_pressure': args.profile_reg_pressure,
+        'pass_config': args.pass_config,
     }
 
 
