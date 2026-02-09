@@ -19,6 +19,28 @@ from .passes import (
     MIRRegisterAllocationPass, MIRToVLIWPass
 )
 
+PASS_REGISTRY = {
+    "dce": DCEPass,
+    "loop-unroll": LoopUnrollPass,
+    "simplify": SimplifyPass,
+    "cse": CSEPass,
+    "load-elim": LoadElimPass,
+    "dse": DSEPass,
+    "tree-level-cache": TreeLevelCachePass,
+    "slp-vectorization": SLPVectorizationPass,
+    "mad-synthesis": MADSynthesisPass,
+    "hir-to-lir": HIRToLIRPass,
+    "copy-propagation": CopyPropagationPass,
+    "lir-dce": LIRDCEPass,
+    "simplify-cfg": SimplifyCFGPass,
+    "phi-elimination": PhiEliminationPass,
+    "inst-scheduling": InstSchedulingPass,
+    "lir-to-mir": LIRToMIRPass,
+    "mir-reg-pressure-profiler": MIRRegPressureProfilerPass,
+    "mir-register-allocation": MIRRegisterAllocationPass,
+    "mir-to-vliw": MIRToVLIWPass,
+}
+
 
 def compile_hir_to_vliw(
     hir: HIRFunction,
@@ -52,6 +74,10 @@ def compile_hir_to_vliw(
     passes_cfg.setdefault("lir-to-mir", {})
     passes_cfg["lir-to-mir"]["enabled"] = not inst_sched_enabled
 
+    # Control mir-reg-pressure-profiler via the profile_reg_pressure flag
+    passes_cfg.setdefault("mir-reg-pressure-profiler", {})
+    passes_cfg["mir-reg-pressure-profiler"]["enabled"] = profile_reg_pressure
+
     # Create pipeline with all passes in order
     pipeline = CompilerPipeline(
         print_after_all=print_after_all,
@@ -60,36 +86,19 @@ def compile_hir_to_vliw(
     )
     pipeline.set_config(config_data)
 
-    # Register all passes in pipeline order
-    pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-unroll cleanup)
-    pipeline.add_pass(LoopUnrollPass())      # HIR -> HIR
-    pipeline.add_pass(SimplifyPass())        # HIR -> HIR (constant fold & identities)
-    pipeline.add_pass(DCEPass())             # HIR -> HIR (post-peephole cleanup)
-    pipeline.add_pass(CSEPass())             # HIR -> HIR
-    pipeline.add_pass(LoadElimPass())        # HIR -> HIR (store-to-load forwarding)
-    pipeline.add_pass(DSEPass())             # HIR -> HIR (dead store elimination)
-    pipeline.add_pass(TreeLevelCachePass())  # HIR -> HIR (tree top-level cache)
-    pipeline.add_pass(SimplifyPass())        # HIR -> HIR (post tree-level-cache simplify)
-    pipeline.add_pass(DCEPass())             # HIR -> HIR (clean dead ops from add-mul fold)
-    pipeline.add_pass(SLPVectorizationPass())  # HIR -> HIR (vectorization)
-    pipeline.add_pass(DCEPass())             # HIR -> HIR
-    pipeline.add_pass(CSEPass())             # HIR -> HIR (deduplicate SLP-generated broadcasts)
-    pipeline.add_pass(MADSynthesisPass())    # HIR -> HIR (fuse v* + v+ into multiply_add)
-    pipeline.add_pass(DCEPass())             # HIR -> HIR (pre-lowering cleanup)
-    pipeline.add_pass(HIRToLIRPass())        # HIR -> LIR
-    pipeline.add_pass(CopyPropagationPass()) # LIR -> LIR (propagate COPY sources)
-    pipeline.add_pass(LIRDCEPass())          # LIR -> LIR (remove dead COPYs)
-    pipeline.add_pass(SimplifyCFGPass())     # LIR -> LIR (CFG cleanup after DCE)
-    pipeline.add_pass(PhiEliminationPass())  # LIR -> LIR
-    # LIR -> MIR (choose exactly one lowering pass)
-    if inst_sched_enabled:
-        pipeline.add_pass(InstSchedulingPass())
-    else:
-        pipeline.add_pass(LIRToMIRPass())
-    if profile_reg_pressure:
-        pipeline.add_pass(MIRRegPressureProfilerPass())  # MIR -> MIR (analysis only)
-    pipeline.add_pass(MIRRegisterAllocationPass())  # MIR -> MIR
-    pipeline.add_pass(MIRToVLIWPass())       # MIR -> VLIW
+    # Build pipeline from config-driven pass list
+    pipeline_order = config_data.get("pipeline")
+    if pipeline_order is None:
+        raise ValueError("pass_config.json missing required 'pipeline' key")
+
+    for pass_name in pipeline_order:
+        pass_cls = PASS_REGISTRY.get(pass_name)
+        if pass_cls is None:
+            raise ValueError(
+                f"Unknown pass '{pass_name}' in pipeline config. "
+                f"Known passes: {', '.join(sorted(PASS_REGISTRY))}"
+            )
+        pipeline.add_pass(pass_cls())
 
     # Run the full pipeline
     return pipeline.run(hir)

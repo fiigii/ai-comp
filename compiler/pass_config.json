@@ -1,4 +1,31 @@
 {
+  "pipeline": [
+    "dce",
+    "loop-unroll",
+    "simplify",
+    "dce",
+    "cse",
+    "load-elim",
+    "dse",
+    "tree-level-cache",
+    "simplify",
+    "dce",
+    "slp-vectorization",
+    "dce",
+    "cse",
+    "mad-synthesis",
+    "dce",
+    "hir-to-lir",
+    "copy-propagation",
+    "lir-dce",
+    "simplify-cfg",
+    "phi-elimination",
+    "inst-scheduling",
+    "lir-to-mir",
+    "mir-reg-pressure-profiler",
+    "mir-register-allocation",
+    "mir-to-vliw"
+  ],
   "passes": {
     "dce": {
       "enabled": true,
@@ -78,6 +105,10 @@
       }
     },
     "lir-to-mir": {
+      "enabled": false,
+      "options": {}
+    },
+    "mir-reg-pressure-profiler": {
       "enabled": false,
       "options": {}
     },
