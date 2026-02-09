@@ -468,49 +468,14 @@ def _devectorize_valu_to_alu(inst: MachineInst) -> Optional[list[MachineInst]]:
     return scalar_insts
 
 
-def _expand_multiply_add_to_alu(inst: MachineInst) -> Optional[list[MachineInst]]:
-    """Lower vector multiply_add lanes into scalar MUL+ADD pairs."""
-    if inst.opcode != LIROpcode.MULTIPLY_ADD:
-        return None
-    if not isinstance(inst.dest, list) or len(inst.operands) < 3:
-        return None
-    lhs = inst.operands[0]
-    rhs = inst.operands[1]
-    addend = inst.operands[2]
-    if not isinstance(lhs, list) or not isinstance(rhs, list) or not isinstance(addend, list):
-        return None
-    if len(inst.dest) != len(lhs) or len(inst.dest) != len(rhs) or len(inst.dest) != len(addend):
-        return None
-
-    scalar_insts: list[MachineInst] = []
-    for lane_dest, lane_lhs, lane_rhs, lane_addend in zip(inst.dest, lhs, rhs, addend):
-        if (
-            not isinstance(lane_dest, int)
-            or not isinstance(lane_lhs, int)
-            or not isinstance(lane_rhs, int)
-            or not isinstance(lane_addend, int)
-        ):
-            return None
-        scalar_insts.append(
-            MachineInst(opcode=LIROpcode.MUL, dest=lane_dest, operands=[lane_lhs, lane_rhs], engine="alu")
-        )
-        scalar_insts.append(
-            MachineInst(opcode=LIROpcode.ADD, dest=lane_dest, operands=[lane_dest, lane_addend], engine="alu")
-        )
-    return scalar_insts
-
-
 def _devectorize_valu_to_alu_with_knobs(
     inst: MachineInst,
     *,
     devectorize_vector_ops_to_alu: bool,
     devectorize_vbroadcast_to_alu: bool,
-    devectorize_multiply_add_to_alu: bool,
 ) -> Optional[list[MachineInst]]:
     if inst.opcode == LIROpcode.MULTIPLY_ADD:
-        if not devectorize_multiply_add_to_alu:
-            return None
-        return _expand_multiply_add_to_alu(inst)
+        return None
     if inst.opcode == LIROpcode.VBROADCAST and not devectorize_vbroadcast_to_alu:
         return None
     if inst.opcode != LIROpcode.VBROADCAST and not devectorize_vector_ops_to_alu:
@@ -526,7 +491,6 @@ def _schedule_block(
     devectorize_valu_to_alu: bool = False,
     devectorize_vector_ops_to_alu: bool = True,
     devectorize_vbroadcast_to_alu: bool = True,
-    devectorize_multiply_add_to_alu: bool = False,
     devectorize_partial_alu_fill: bool = False,
     prioritize_load_unblock: bool = False,
     register_pressure_limit: int = 0,
@@ -619,7 +583,6 @@ def _schedule_block(
     slot_limit_bundles = 0
     devectorized_valu_ops = 0
     devectorized_alu_ops = 0
-    devectorized_multiply_add_ops = 0
     # Node idx -> (expanded scalar insts, next scalar idx to emit)
     pending_devectorized: dict[int, tuple[list[MachineInst], int]] = {}
     # Preserve deterministic emission order for partially emitted expansions
@@ -742,7 +705,7 @@ def _schedule_block(
                     ready.add(succ)
 
         def try_schedule_devectorized_valu() -> bool:
-            nonlocal devectorized_valu_ops, devectorized_alu_ops, devectorized_multiply_add_ops
+            nonlocal devectorized_valu_ops, devectorized_alu_ops
             if not devectorize_valu_to_alu:
                 return False
             if available_slots("alu") <= 0:
@@ -788,14 +751,10 @@ def _schedule_block(
                 inst = nodes[idx].inst
                 if inst.engine != "valu":
                     continue
-                # Keep multiply_add on VALU in bundle-time devectorization.
-                if inst.opcode == LIROpcode.MULTIPLY_ADD:
-                    continue
                 scalar_insts = _devectorize_valu_to_alu_with_knobs(
                     inst,
                     devectorize_vector_ops_to_alu=devectorize_vector_ops_to_alu,
                     devectorize_vbroadcast_to_alu=devectorize_vbroadcast_to_alu,
-                    devectorize_multiply_add_to_alu=False,
                 )
                 if scalar_insts is None:
                     continue
@@ -888,7 +847,6 @@ def _schedule_block(
         "slot_limit_bundles": slot_limit_bundles,
         "devectorized_valu_ops": devectorized_valu_ops,
         "devectorized_alu_ops": devectorized_alu_ops,
-        "devectorized_multiply_add_ops": devectorized_multiply_add_ops,
     }
     return bundles, stats
 
@@ -909,7 +867,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         devectorize_valu_to_alu = bool(config.options.get("devectorize_valu_to_alu", False))
         devectorize_vector_ops_to_alu = bool(config.options.get("devectorize_vector_ops_to_alu", True))
         devectorize_vbroadcast_to_alu = bool(config.options.get("devectorize_vbroadcast_to_alu", True))
-        devectorize_multiply_add_to_alu = bool(config.options.get("devectorize_multiply_add_to_alu", False))
         devectorize_partial_alu_fill = bool(config.options.get("devectorize_partial_alu_fill", False))
         prioritize_load_unblock = bool(config.options.get("prioritize_load_unblock", False))
         register_pressure_limit = int(config.options.get("register_pressure_limit", 0))
@@ -930,7 +887,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         slot_limit_bundles = 0
         total_devectorized_valu_ops = 0
         total_devectorized_alu_ops = 0
-        total_devectorized_multiply_add_ops = 0
 
         for block_name in block_order:
             lir_block = lir.blocks[block_name]
@@ -945,7 +901,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 devectorize_valu_to_alu=devectorize_valu_to_alu,
                 devectorize_vector_ops_to_alu=devectorize_vector_ops_to_alu,
                 devectorize_vbroadcast_to_alu=devectorize_vbroadcast_to_alu,
-                devectorize_multiply_add_to_alu=devectorize_multiply_add_to_alu,
                 devectorize_partial_alu_fill=devectorize_partial_alu_fill,
                 prioritize_load_unblock=prioritize_load_unblock,
                 register_pressure_limit=register_pressure_limit,
@@ -967,7 +922,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
             slot_limit_bundles += stats.get("slot_limit_bundles", 0)
             total_devectorized_valu_ops += int(stats.get("devectorized_valu_ops", 0))
             total_devectorized_alu_ops += int(stats.get("devectorized_alu_ops", 0))
-            total_devectorized_multiply_add_ops += int(stats.get("devectorized_multiply_add_ops", 0))
 
             successors = _get_successors(lir_block)
             predecessors: list[str] = []
@@ -1007,7 +961,6 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 "packing_ratio": round(avg_insts_per_bundle, 2),
                 "devectorized_valu_ops": total_devectorized_valu_ops,
                 "devectorized_alu_ops": total_devectorized_alu_ops,
-                "devectorized_multiply_add_ops": total_devectorized_multiply_add_ops,
             }
 
             self._add_metric_message(
@@ -1083,9 +1036,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                         "Devectorize knobs: "
                         f"vector_ops={devectorize_vector_ops_to_alu}, "
                         f"vbroadcast={devectorize_vbroadcast_to_alu}, "
-                        f"multiply_add={devectorize_multiply_add_to_alu}, "
-                        f"partial_alu_fill={devectorize_partial_alu_fill}, "
-                        f"devectorized_multiply_add={total_devectorized_multiply_add_ops}"
+                        f"partial_alu_fill={devectorize_partial_alu_fill}"
                     )
                 self._add_metric_message("\n".join(lines))
 

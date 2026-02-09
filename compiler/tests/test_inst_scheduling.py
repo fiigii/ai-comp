@@ -247,67 +247,6 @@ class TestInstructionScheduling(unittest.TestCase):
             0,
         )
 
-    def test_devectorize_multiply_add_pre_expand_knob(self):
-        def vec(base):
-            return [base + i for i in range(8)]
-
-        instructions = [
-            LIRInst(LIROpcode.VADD, vec(100 + i * 8), [vec(1000), vec(2000)], "valu")
-            for i in range(6)
-        ]
-        instructions.append(
-            LIRInst(LIROpcode.MULTIPLY_ADD, vec(400), [vec(500), vec(600), vec(700)], "valu")
-        )
-
-        bundles = _schedule_single_block(
-            instructions,
-            devectorize_valu_to_alu=True,
-            devectorize_vector_ops_to_alu=False,
-            devectorize_vbroadcast_to_alu=False,
-            devectorize_multiply_add_to_alu=True,
-            devectorize_multiply_add_pre_expand=True,
-        )
-
-        non_term = bundles[:-1]
-        self.assertFalse(
-            any(inst.opcode == LIROpcode.MULTIPLY_ADD for b in non_term for inst in b.instructions),
-            "multiply_add should be pre-expanded to scalar ALU ops",
-        )
-        self.assertTrue(
-            any(inst.opcode == LIROpcode.MUL and inst.engine == "alu" for b in non_term for inst in b.instructions)
-        )
-        self.assertTrue(
-            any(inst.opcode == LIROpcode.ADD and inst.engine == "alu" for b in non_term for inst in b.instructions)
-        )
-
-    def test_devectorize_multiply_add_pre_expand_budget(self):
-        def vec(base):
-            return [base + i for i in range(8)]
-
-        instructions = [
-            LIRInst(LIROpcode.MULTIPLY_ADD, vec(100 + i * 8), [vec(1000), vec(2000), vec(3000)], "valu")
-            for i in range(4)
-        ]
-
-        bundles = _schedule_single_block(
-            instructions,
-            devectorize_valu_to_alu=True,
-            devectorize_vector_ops_to_alu=False,
-            devectorize_vbroadcast_to_alu=False,
-            devectorize_multiply_add_to_alu=True,
-            devectorize_multiply_add_pre_expand=True,
-            devectorize_multiply_add_pre_expand_budget=2,
-            devectorize_multiply_add_pre_expand_spread=False,
-        )
-
-        non_term = bundles[:-1]
-        mad_count = sum(
-            1 for b in non_term for inst in b.instructions if inst.opcode == LIROpcode.MULTIPLY_ADD
-        )
-        self.assertEqual(mad_count, 2, "Budget should keep two multiply_add ops unexpanded")
-        self.assertTrue(
-            any(inst.opcode == LIROpcode.MUL and inst.engine == "alu" for b in non_term for inst in b.instructions)
-        )
 
 
 if __name__ == "__main__":
