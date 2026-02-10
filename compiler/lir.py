@@ -93,6 +93,62 @@ class LIRInst:
             return f"s{self.dest} = {self.opcode.value}({ops_str}) [{self.engine}]"
         return f"{self.opcode.value}({ops_str}) [{self.engine}]"
 
+    def get_defs(self) -> set[int]:
+        """Get all scratch addresses defined by this instruction."""
+        if self.dest is None:
+            return set()
+
+        # LOAD_OFFSET writes to dest + lane_offset.
+        if self.opcode == LIROpcode.LOAD_OFFSET:
+            offset = self.operands[1] if len(self.operands) > 1 else 0
+            if isinstance(offset, int) and isinstance(self.dest, int):
+                return {self.dest + offset}
+            if isinstance(self.dest, int):
+                return {self.dest}
+            return set()
+
+        if isinstance(self.dest, list):
+            return set(self.dest)
+        return {self.dest}
+
+    def get_uses(self) -> set[int]:
+        """Get all scratch addresses used by this instruction."""
+        uses: set[int] = set()
+
+        # CONST operands are immediate values.
+        if self.opcode == LIROpcode.CONST:
+            return uses
+
+        # LOAD_OFFSET reads lane address from addr_base + lane_offset.
+        if self.opcode == LIROpcode.LOAD_OFFSET and len(self.operands) == 2:
+            addr = self.operands[0]
+            offset = self.operands[1]
+            if isinstance(addr, int) and isinstance(offset, int):
+                uses.add(addr + offset)
+            elif isinstance(addr, int):
+                uses.add(addr)
+            return uses
+
+        # JUMP operands are labels, not scratch values.
+        if self.opcode == LIROpcode.JUMP:
+            return uses
+
+        # COND_JUMP: first operand is condition scratch, rest are labels.
+        if self.opcode == LIROpcode.COND_JUMP:
+            cond = self.operands[0]
+            if isinstance(cond, int):
+                uses.add(cond)
+            return uses
+
+        for op in self.operands:
+            if isinstance(op, int):
+                uses.add(op)
+            elif isinstance(op, list):
+                for s in op:
+                    if isinstance(s, int):
+                        uses.add(s)
+        return uses
+
 
 @dataclass
 class Phi:

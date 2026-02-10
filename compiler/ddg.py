@@ -79,10 +79,21 @@ class DDGBuilder(ABC, Generic[T]):
         Returns None if instruction has no result (e.g., store)."""
         pass
 
+    def get_result_ids(self, inst: T) -> list[Any]:
+        """Get all result identifiers defined by an instruction."""
+        result_id = self.get_result_id(inst)
+        if result_id is None:
+            return []
+        return [result_id]
+
     @abstractmethod
     def get_operand_ids(self, inst: T) -> list[Any]:
         """Get the identifiers of values this instruction uses."""
         pass
+
+    def get_used_ids(self, inst: T) -> list[Any]:
+        """Get identifiers considered as uses for unused-result root detection."""
+        return self.get_operand_ids(inst)
 
     @abstractmethod
     def is_side_effect(self, inst: T) -> bool:
@@ -110,8 +121,7 @@ class DDGBuilder(ABC, Generic[T]):
             nodes.append(node)
             inst_map[id(inst)] = node
 
-            result_id = self.get_result_id(inst)
-            if result_id is not None:
+            for result_id in self.get_result_ids(inst):
                 def_map[result_id] = node
 
         # Step 2: Build edges (operand dependencies)
@@ -122,16 +132,29 @@ class DDGBuilder(ABC, Generic[T]):
 
         for node in nodes:
             operand_ids = self.get_operand_ids(node.instruction)
+            if used_results is not None:
+                for used_id in self.get_used_ids(node.instruction):
+                    used_results.add(used_id)
             for op_id in operand_ids:
-                if used_results is not None:
-                    used_results.add(op_id)
-                if op_id in def_map:
-                    dep_node = def_map[op_id]
-                    node.operand_nodes.append(dep_node)
-                    dep_node.user_nodes.append(node)
+                dep_ids: list[Any]
+                # If vector tuple has no direct producer, fall back to lane deps.
+                if (
+                    isinstance(op_id, tuple)
+                    and op_id not in def_map
+                    and all(isinstance(v, int) for v in op_id)
+                ):
+                    dep_ids = list(op_id)
                 else:
-                    # External operand - add None placeholder to maintain position
-                    node.operand_nodes.append(None)
+                    dep_ids = [op_id]
+
+                for dep_id in dep_ids:
+                    if dep_id in def_map:
+                        dep_node = def_map[dep_id]
+                        node.operand_nodes.append(dep_node)
+                        dep_node.user_nodes.append(node)
+                    else:
+                        # External operand - add None placeholder to maintain position
+                        node.operand_nodes.append(None)
 
         if not build_dags:
             return BlockDDGs(dags=[], def_map=def_map, inst_map=inst_map)
@@ -139,9 +162,9 @@ class DDGBuilder(ABC, Generic[T]):
         # Step 3: Identify roots (stores or unused results)
         roots: list[DDGNode[T]] = []
         for node in nodes:
-            result_id = self.get_result_id(node.instruction)
+            result_ids = self.get_result_ids(node.instruction)
             # used_results is non-None when build_dags=True.
-            is_unused = result_id is not None and result_id not in used_results
+            is_unused = bool(result_ids) and all(result_id not in used_results for result_id in result_ids)
             is_side_effect = self.is_side_effect(node.instruction)
 
             if is_side_effect or is_unused:
@@ -200,7 +223,26 @@ class HIRDDGBuilder(DDGBuilder[Op]):
 class LIRDDGBuilder(DDGBuilder[LIRInst]):
     """Builder for LIR basic blocks."""
 
+    def get_result_ids(self, inst: LIRInst) -> list[int | tuple]:
+        result_ids: list[int | tuple] = []
+
+        # Scalar instructions (including LOAD_OFFSET lane defs) expose scalar defs.
+        for d in sorted(inst.get_defs()):
+            result_ids.append(d)
+
+        # Vector instructions also expose tuple result identity so vector operands
+        # can preserve positional dependency correspondence.
+        if isinstance(inst.dest, list):
+            result_ids.append(tuple(inst.dest))
+
+        return result_ids
+
     def get_result_id(self, inst: LIRInst) -> Optional[int | tuple]:
+        result_ids = self.get_result_ids(inst)
+        if not result_ids:
+            return None
+        if len(result_ids) == 1:
+            return result_ids[0]
         if inst.dest is None:
             return None
         if isinstance(inst.dest, list):
@@ -211,26 +253,42 @@ class LIRDDGBuilder(DDGBuilder[LIRInst]):
     def get_operand_ids(self, inst: LIRInst) -> list[int | tuple]:
         # Handle instructions with immediate operands (not scratch dependencies)
         if inst.opcode == LIROpcode.CONST:
-            # CONST has [immediate_value] - no scratch dependencies
             return []
 
-        if inst.opcode == LIROpcode.LOAD_OFFSET:
-            # LOAD_OFFSET has [base_scratch, offset_immediate]
-            # Only base_scratch is a dependency
-            base = inst.operands[0]
-            if isinstance(base, int):
-                return [base]
+        if inst.opcode == LIROpcode.LOAD_OFFSET and len(inst.operands) == 2:
+            addr = inst.operands[0]
+            offset = inst.operands[1]
+            if isinstance(addr, int) and isinstance(offset, int):
+                return [addr + offset]
+            if isinstance(addr, int):
+                return [addr]
             return []
 
-        # Default: all int operands are scratch addresses
-        ids = []
+        if inst.opcode == LIROpcode.JUMP:
+            return []
+
+        if inst.opcode == LIROpcode.COND_JUMP:
+            cond = inst.operands[0]
+            return [cond] if isinstance(cond, int) else []
+
+        ids: list[int | tuple] = []
         for op in inst.operands:
             if isinstance(op, int):
-                ids.append(op)  # Scratch address
+                ids.append(op)
             elif isinstance(op, list):
-                ids.append(tuple(op))  # Vector scratch addresses
-            # Skip strings (labels)
+                ids.append(tuple(op))
         return ids
+
+    def get_used_ids(self, inst: LIRInst) -> list[int | tuple]:
+        used_ids: list[int | tuple] = []
+        for op_id in self.get_operand_ids(inst):
+            used_ids.append(op_id)
+            # If a vector value is consumed as a tuple key, mark each lane as used
+            # too, so lane-defining LOAD_OFFSET producers are not misclassified
+            # as unused roots.
+            if isinstance(op_id, tuple) and all(isinstance(v, int) for v in op_id):
+                used_ids.extend(op_id)
+        return used_ids
 
     def is_side_effect(self, inst: LIRInst) -> bool:
         return inst.opcode in (

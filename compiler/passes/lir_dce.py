@@ -74,15 +74,9 @@ class LIRDCEPass(LIRPass):
                 prev_used_size = len(used)
                 for block in lir.blocks.values():
                     for inst in block.instructions:
-                        if inst.dest is not None:
-                            dest_used = False
-                            if isinstance(inst.dest, list):
-                                dest_used = any(d in used for d in inst.dest)
-                            else:
-                                dest_used = inst.dest in used
-
-                            if dest_used:
-                                self._collect_uses(inst, used)
+                        defs = inst.get_defs()
+                        if defs and defs.intersection(used):
+                            self._collect_uses(inst, used)
 
             # Pass 2: Remove dead instructions
             for block in lir.blocks.values():
@@ -114,33 +108,14 @@ class LIRDCEPass(LIRPass):
         if self._has_side_effects(inst):
             return True
 
-        # No destination means no result to use (but should have side effects)
-        if inst.dest is None:
+        defs = inst.get_defs()
+        if not defs:
             return False
-
-        # Check if any destination is used
-        if isinstance(inst.dest, list):
-            return any(d in used for d in inst.dest)
-        return inst.dest in used
+        return bool(defs.intersection(used))
 
     def _collect_uses(self, inst: LIRInst, used: set[int]) -> None:
         """Collect all scratch addresses used by an instruction.
 
         Note: CONST operands are immediate values, not scratch references.
         """
-        # CONST operands are immediate values, not scratch references
-        if inst.opcode == LIROpcode.CONST:
-            return
-        if inst.opcode == LIROpcode.LOAD_OFFSET and len(inst.operands) == 2:
-            addr = inst.operands[0]
-            if isinstance(addr, int):
-                used.add(addr)
-            return
-
-        for op in inst.operands:
-            if isinstance(op, int):
-                used.add(op)
-            elif isinstance(op, list):
-                for s in op:
-                    if isinstance(s, int):
-                        used.add(s)
+        used.update(inst.get_uses())

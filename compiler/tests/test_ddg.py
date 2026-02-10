@@ -325,34 +325,93 @@ class TestLIRDDG:
         assert const0_node in add_node.operand_nodes
         assert const1_node in add_node.operand_nodes
 
-    def test_load_offset_only_depends_on_base(self):
-        """Test that LOAD_OFFSET only depends on base address, not offset.
-
-        LOAD_OFFSET has [base_scratch, offset_immediate] where the offset
-        is an immediate value, NOT a scratch address.
-        This is a regression test for a bug where the offset was incorrectly
-        treated as a scratch address dependency.
-        """
+    def test_load_offset_depends_on_lane_address(self):
+        """Test that LOAD_OFFSET depends on lane address (base + offset)."""
         insts = [
             LIRInst(LIROpcode.CONST, 0, [1000], "load"),   # scratch[0] = 1000 (base addr)
+            LIRInst(LIROpcode.CONST, 5, [1234], "load"),   # scratch[5] = lane address
             # load_offset: scratch[1] = mem[scratch[0] + 5]
             # operands are [base_scratch=0, offset_immediate=5]
             LIRInst(LIROpcode.LOAD_OFFSET, 1, [0, 5], "load"),
-            LIRInst(LIROpcode.STORE, None, [0, 1], "store"),
+            # load_offset writes to dest+offset => scratch[6]
+            LIRInst(LIROpcode.STORE, None, [0, 6], "store"),
         ]
 
         builder = LIRDDGBuilder()
         ddgs = builder.build(insts)
 
         # Get nodes
-        const_node = ddgs.def_map[0]
-        load_offset_node = ddgs.def_map[1]
+        lane_addr_node = ddgs.def_map[5]
+        load_offset_node = ddgs.def_map[6]
 
-        # LOAD_OFFSET should only depend on base (scratch[0]), not the offset (5)
+        # LOAD_OFFSET should depend on the lane address scratch (base + offset).
         assert len(load_offset_node.operand_nodes) == 1, \
-            f"LOAD_OFFSET should have 1 dependency (base), got {len(load_offset_node.operand_nodes)}"
-        assert load_offset_node.operand_nodes[0] == const_node, \
-            "LOAD_OFFSET should depend on the CONST that defines the base address"
+            f"LOAD_OFFSET should have 1 dependency (lane addr), got {len(load_offset_node.operand_nodes)}"
+        assert load_offset_node.operand_nodes[0] == lane_addr_node, \
+            "LOAD_OFFSET should depend on the CONST that defines the lane address scratch"
+
+    def test_load_offset_not_root_when_vector_consumed(self):
+        """LOAD_OFFSET lane defs should not be roots when a vector op consumes them."""
+        lane_addrs = list(range(100, 108))
+        gather_lanes = list(range(200, 208))
+        out_lanes = list(range(300, 308))
+
+        insts = []
+        for lane in lane_addrs:
+            insts.append(LIRInst(LIROpcode.CONST, lane, [1000 + lane], "load"))
+
+        # Lowered vgather form: each LOAD_OFFSET writes one lane (dest+offset).
+        for i in range(8):
+            insts.append(LIRInst(LIROpcode.LOAD_OFFSET, 200, [100, i], "load"))
+
+        # Consume gathered vector lanes as a tuple operand.
+        insts.append(LIRInst(LIROpcode.VADD, out_lanes, [gather_lanes, gather_lanes], "valu"))
+
+        builder = LIRDDGBuilder()
+        ddgs = builder.build(insts)
+
+        # All gathered lane defs should exist in def_map.
+        for lane in gather_lanes:
+            assert lane in ddgs.def_map
+
+        # LOAD_OFFSET nodes should not be marked as roots (their results are used).
+        roots = [dag.root.instruction.opcode for dag in ddgs.dags]
+        assert LIROpcode.LOAD_OFFSET not in roots
+
+    def test_vector_results_have_tuple_and_lane_keys(self):
+        """Vector defs should be accessible by both tuple key and per-lane keys."""
+        vec = list(range(10, 18))
+        out = list(range(30, 38))
+        insts = [
+            LIRInst(LIROpcode.VBROADCAST, vec, [5], "valu"),
+            LIRInst(LIROpcode.VADD, out, [vec, vec], "valu"),
+        ]
+
+        builder = LIRDDGBuilder()
+        ddgs = builder.build(insts)
+
+        assert tuple(vec) in ddgs.def_map
+        for lane in vec:
+            assert lane in ddgs.def_map
+
+    def test_vector_operand_falls_back_to_lane_dependencies(self):
+        """If vector tuple producer is missing, DDG should connect per-lane defs."""
+        gather_lanes = list(range(200, 208))
+        out_lanes = list(range(300, 308))
+        insts = []
+
+        for lane in range(100, 108):
+            insts.append(LIRInst(LIROpcode.CONST, lane, [1000 + lane], "load"))
+        for i in range(8):
+            insts.append(LIRInst(LIROpcode.LOAD_OFFSET, 200, [100, i], "load"))
+        insts.append(LIRInst(LIROpcode.VADD, out_lanes, [gather_lanes, gather_lanes], "valu"))
+
+        ddgs = LIRDDGBuilder().build(insts)
+        vadd_node = ddgs.def_map[tuple(out_lanes)]
+
+        # Two vector operands, each should fall back to 8 lane dependencies.
+        lane_dep_nodes = [n for n in vadd_node.operand_nodes if n is not None and n.instruction.opcode == LIROpcode.LOAD_OFFSET]
+        assert len(lane_dep_nodes) == 16
 
 
 class TestDAGUtilities:

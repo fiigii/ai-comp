@@ -281,6 +281,26 @@ class TestLIRDCEPass(unittest.TestCase):
         self.assertEqual(metrics.custom["instructions_before"], 3)
         self.assertEqual(metrics.custom["instructions_removed"], 3)
 
+    def test_load_offset_lane_liveness(self):
+        """LOAD_OFFSET liveness should be tracked on dest+offset lane scratch."""
+        entry = BasicBlock(
+            name="entry",
+            instructions=[
+                LIRInst(LIROpcode.CONST, 0, [1000], "load"),  # base for lane-address vector
+                LIRInst(LIROpcode.CONST, 5, [200], "load"),   # lane addr scratch[5]
+                LIRInst(LIROpcode.LOAD_OFFSET, 1, [0, 5], "load"),  # defines scratch[6]
+                LIRInst(LIROpcode.CONST, 10, [500], "load"),
+                LIRInst(LIROpcode.STORE, None, [10, 6], "store"),
+            ],
+            terminator=LIRInst(LIROpcode.HALT, None, [], "flow"),
+        )
+        lir = LIRFunction(entry="entry", blocks={"entry": entry})
+        out, metrics = self._run(lir)
+
+        # scratch[0] is dead; scratch[5] -> load_offset -> store chain remains live.
+        self.assertEqual(len(out.blocks["entry"].instructions), 4)
+        self.assertEqual(metrics.custom["instructions_removed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
