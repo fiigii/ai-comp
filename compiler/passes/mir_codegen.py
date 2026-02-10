@@ -119,7 +119,7 @@ class MIRToVLIWPass(MIRCodegenPass):
 
     @property
     def name(self) -> str:
-        return "mir-codegen"
+        return "mir-to-vliw"
 
     def run(self, mir: MachineFunction, config: PassConfig) -> list[dict]:
         """Generate VLIW bundles from MIR."""

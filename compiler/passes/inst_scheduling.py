@@ -11,48 +11,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..pass_manager import LIRToMIRLoweringPass, PassConfig
-from ..lir import LIRFunction, LIROpcode, LIRInst, BasicBlock
+from ..lir import LIRFunction, LIROpcode, LIRInst
 from ..mir import MachineInst, MBundle, MachineBasicBlock, MachineFunction
-
-
-def _lir_inst_to_machine_inst(inst: LIRInst) -> MachineInst:
-    """Convert a LIRInst to a MachineInst."""
-    return MachineInst(
-        opcode=inst.opcode,
-        dest=inst.dest,
-        operands=list(inst.operands),
-        engine=inst.engine,
-    )
-
-
-def _get_successors(block: BasicBlock) -> list[str]:
-    """Get successor block names from a LIR basic block."""
-    if block.terminator is None:
-        return []
-    if block.terminator.opcode == LIROpcode.JUMP:
-        return [block.terminator.operands[0]]
-    if block.terminator.opcode == LIROpcode.COND_JUMP:
-        return [block.terminator.operands[1], block.terminator.operands[2]]
-    return []
-
-
-def _get_block_order(lir: LIRFunction) -> list[str]:
-    """Get blocks in reverse postorder for scheduling."""
-    visited: set[str] = set()
-    postorder: list[str] = []
-
-    def dfs(name: str):
-        if name in visited:
-            return
-        visited.add(name)
-        block = lir.blocks.get(name)
-        if block:
-            for succ_name in _get_successors(block):
-                dfs(succ_name)
-            postorder.append(name)
-
-    dfs(lir.entry)
-    return list(reversed(postorder))
+from .mir_lowering_utils import lir_inst_to_machine_inst, get_successors, get_block_order
 
 
 @dataclass
@@ -497,7 +458,17 @@ def _schedule_block(
         bundle-end reason counts.
     """
     if not instructions and terminator is None:
-        return []
+        return [], {
+            "engine_used_slots": {},
+            "engine_idle_no_ready": {},
+            "bundle_end_reasons": {"deps": 0, "slot_limit": 0},
+            "engine_bundle_hist": {},
+            "slot_limit_blocked_bundles_by_engine": {},
+            "slot_limit_ready_left_by_engine": {},
+            "slot_limit_bundles": 0,
+            "devectorized_valu_ops": 0,
+            "devectorized_alu_ops": 0,
+        }
 
     slot_limits = MBundle.SLOT_LIMITS
     nodes = _build_dep_graph(instructions)
@@ -831,7 +802,7 @@ def _schedule_block(
             current_bundle += 1
 
     if terminator is not None:
-        term_inst = _lir_inst_to_machine_inst(terminator)
+        term_inst = lir_inst_to_machine_inst(terminator)
         term_bundle = MBundle()
         term_bundle.add_instruction(term_inst)
         bundles.append(term_bundle)
@@ -872,7 +843,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
 
         mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used)
 
-        block_order = _get_block_order(lir)
+        block_order = get_block_order(lir)
         # Global diagnostics aggregation
         slot_limits = MBundle.SLOT_LIMITS
         engine_used_slots = {engine: 0 for engine in slot_limits}
@@ -890,7 +861,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         for block_name in block_order:
             lir_block = lir.blocks[block_name]
 
-            machine_insts = [_lir_inst_to_machine_inst(inst) for inst in lir_block.instructions]
+            machine_insts = [lir_inst_to_machine_inst(inst) for inst in lir_block.instructions]
             terminator = lir_block.terminator
 
             bundles, stats = _schedule_block(
@@ -922,10 +893,10 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
             total_devectorized_valu_ops += int(stats.get("devectorized_valu_ops", 0))
             total_devectorized_alu_ops += int(stats.get("devectorized_alu_ops", 0))
 
-            successors = _get_successors(lir_block)
+            successors = get_successors(lir_block)
             predecessors: list[str] = []
             for other_name, other_block in lir.blocks.items():
-                if block_name in _get_successors(other_block):
+                if block_name in get_successors(other_block):
                     predecessors.append(other_name)
 
             mbb = MachineBasicBlock(

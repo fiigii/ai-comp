@@ -20,7 +20,7 @@ class HIRToLIRPass(LoweringPass):
 
     @property
     def name(self) -> str:
-        return "lowering"
+        return "hir-to-lir"
 
     def run(self, hir: HIRFunction, config: PassConfig) -> LIRFunction:
         """Lower HIR to LIR."""

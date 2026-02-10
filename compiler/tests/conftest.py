@@ -48,7 +48,7 @@ def compile_to_vliw(lir: LIRFunction) -> list[dict]:
     """
     mir = InstSchedulingPass().run(lir, _cfg('inst-scheduling'))
     mir = MIRRegisterAllocationPass().run(mir, _cfg('mir-regalloc'))
-    bundles = MIRToVLIWPass().run(mir, _cfg('mir-codegen'))
+    bundles = MIRToVLIWPass().run(mir, _cfg('mir-to-vliw'))
     return bundles
 
 

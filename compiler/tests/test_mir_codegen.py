@@ -16,7 +16,7 @@ def compile_lir_to_vliw_via_mir(lir: LIRFunction) -> list[dict]:
     """Compile LIR to VLIW through the MIR path."""
     mir = InstSchedulingPass().run(lir, cfg('inst-scheduling'))
     mir = MIRRegisterAllocationPass().run(mir, cfg('mir-regalloc'))
-    bundles = MIRToVLIWPass().run(mir, cfg('mir-codegen'))
+    bundles = MIRToVLIWPass().run(mir, cfg('mir-to-vliw'))
     return bundles
 
 

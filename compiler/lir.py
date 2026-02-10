@@ -68,30 +68,12 @@ class LIROpcode(Enum):
     VSELECT = "vselect"
 
 
-@dataclass
-class LIRInst:
-    """A single LIR instruction.
+class InstructionDefUseMixin:
+    """Mixin providing get_defs()/get_uses() for LIRInst and MachineInst.
 
-    For scalar ops:
-      - dest: int (single scratch address)
-      - operands: list of int (scratch addresses) or immediates/labels
-
-    For vector ops:
-      - dest: list[int] (8 consecutive scratch addresses)
-      - operands: mix of list[int] (vector) and int (scalar)
+    Both classes share identical def/use logic. This mixin expects the host
+    dataclass to have `opcode: LIROpcode`, `dest`, and `operands` fields.
     """
-    opcode: LIROpcode
-    dest: Optional[int | list[int]]   # Scratch address(es) for result
-    operands: list                    # Scratch addresses, immediates, or labels
-    engine: str
-
-    def __repr__(self):
-        ops_str = ", ".join(str(o) for o in self.operands)
-        if self.dest is not None:
-            if isinstance(self.dest, list):
-                return f"s{self.dest[0]}..s{self.dest[-1]} = {self.opcode.value}({ops_str}) [{self.engine}]"
-            return f"s{self.dest} = {self.opcode.value}({ops_str}) [{self.engine}]"
-        return f"{self.opcode.value}({ops_str}) [{self.engine}]"
 
     def get_defs(self) -> set[int]:
         """Get all scratch addresses defined by this instruction."""
@@ -148,6 +130,32 @@ class LIRInst:
                     if isinstance(s, int):
                         uses.add(s)
         return uses
+
+
+@dataclass
+class LIRInst(InstructionDefUseMixin):
+    """A single LIR instruction.
+
+    For scalar ops:
+      - dest: int (single scratch address)
+      - operands: list of int (scratch addresses) or immediates/labels
+
+    For vector ops:
+      - dest: list[int] (8 consecutive scratch addresses)
+      - operands: mix of list[int] (vector) and int (scalar)
+    """
+    opcode: LIROpcode
+    dest: Optional[int | list[int]]   # Scratch address(es) for result
+    operands: list                    # Scratch addresses, immediates, or labels
+    engine: str
+
+    def __repr__(self):
+        ops_str = ", ".join(str(o) for o in self.operands)
+        if self.dest is not None:
+            if isinstance(self.dest, list):
+                return f"s{self.dest[0]}..s{self.dest[-1]} = {self.opcode.value}({ops_str}) [{self.engine}]"
+            return f"s{self.dest} = {self.opcode.value}({ops_str}) [{self.engine}]"
+        return f"{self.opcode.value}({ops_str}) [{self.engine}]"
 
 
 @dataclass
