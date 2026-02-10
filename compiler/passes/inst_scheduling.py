@@ -203,11 +203,7 @@ def _update_value_info(inst: MachineInst,
                        const_val: dict[int, int],
                        addr_expr: dict[int, AddrExpr]) -> None:
     """Update constant/address information for instruction defs."""
-    dests = []
-    if isinstance(inst.dest, int):
-        dests = [inst.dest]
-    elif isinstance(inst.dest, list):
-        dests = list(inst.dest)
+    dests = sorted(inst.get_defs())
 
     if not dests:
         return
@@ -290,10 +286,9 @@ def _memory_key(inst: MachineInst,
                 addr_expr: dict[int, AddrExpr]) -> Optional[AddrExpr]:
     """Compute a conservative alias key for a memory instruction."""
     if inst.opcode == LIROpcode.LOAD_OFFSET:
-        addr_base = inst.operands[0]
-        offset = inst.operands[1] if len(inst.operands) > 1 else None
-        if isinstance(addr_base, int) and isinstance(offset, int):
-            lane_addr = addr_base + offset
+        uses = inst.get_uses()
+        if len(uses) == 1:
+            lane_addr = next(iter(uses))
             return addr_expr.get(lane_addr)
         return None
 
@@ -760,7 +755,11 @@ def _schedule_block(
                     continue
                 if not devectorize_partial_alu_fill and len(scalar_insts) > available_slots("alu"):
                     continue
-                key = (heights[idx], -nodes[idx].index)
+                key = (
+                    load_unblock_scores[idx],
+                    heights[idx],
+                    -nodes[idx].index,
+                )
                 if best_key is None or key > best_key:
                     best_key = key
                     best_idx = idx
