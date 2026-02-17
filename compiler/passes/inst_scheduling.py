@@ -242,6 +242,23 @@ def _update_value_info(inst: MachineInst,
         _clear_value_info(d, const_val, addr_expr)
 
 
+def _compute_exit_value_state(
+    instructions: list[MachineInst],
+    initial_const_val: dict[int, int] | None = None,
+    initial_addr_expr: dict[int, AddrExpr] | None = None,
+) -> tuple[dict[int, int], dict[int, AddrExpr]]:
+    """Simulate _update_value_info for all instructions, returning final state.
+
+    Used during inter-block propagation to compute exit state for each block
+    without building the full dependency graph.
+    """
+    const_val: dict[int, int] = dict(initial_const_val) if initial_const_val else {}
+    addr_expr: dict[int, AddrExpr] = dict(initial_addr_expr) if initial_addr_expr else {}
+    for inst in instructions:
+        _update_value_info(inst, const_val, addr_expr)
+    return const_val, addr_expr
+
+
 def _memory_key(inst: MachineInst,
                 const_val: dict[int, int],
                 addr_expr: dict[int, AddrExpr]) -> Optional[AddrExpr]:
@@ -265,7 +282,11 @@ def _memory_key(inst: MachineInst,
     return None
 
 
-def _build_dep_graph(instructions: list[MachineInst]) -> list[ScheduleNode]:
+def _build_dep_graph(
+    instructions: list[MachineInst],
+    initial_const_val: dict[int, int] | None = None,
+    initial_addr_expr: dict[int, AddrExpr] | None = None,
+) -> list[ScheduleNode]:
     """Build a dependency graph with delay-annotated edges."""
     nodes = [ScheduleNode(inst=inst, index=i) for i, inst in enumerate(instructions)]
 
@@ -273,8 +294,8 @@ def _build_dep_graph(instructions: list[MachineInst]) -> list[ScheduleNode]:
     last_barrier: Optional[int] = None
 
     # Conservative constant/address tracking for simple alias analysis
-    const_val: dict[int, int] = {}
-    addr_expr: dict[int, AddrExpr] = {}
+    const_val: dict[int, int] = dict(initial_const_val) if initial_const_val else {}
+    addr_expr: dict[int, AddrExpr] = dict(initial_addr_expr) if initial_addr_expr else {}
 
     # Track memory ops by alias key
     last_store_by_key: dict[Optional[AddrExpr], int] = {}
@@ -450,6 +471,8 @@ def _schedule_block(
     devectorize_partial_alu_fill: bool = False,
     prioritize_load_unblock: bool = False,
     register_pressure_limit: int = 0,
+    initial_const_val: dict[int, int] | None = None,
+    initial_addr_expr: dict[int, AddrExpr] | None = None,
 ) -> tuple[list[MBundle], dict[str, dict[str, int]]]:
     """Schedule a block's instructions into MIR bundles.
 
@@ -471,7 +494,7 @@ def _schedule_block(
         }
 
     slot_limits = MBundle.SLOT_LIMITS
-    nodes = _build_dep_graph(instructions)
+    nodes = _build_dep_graph(instructions, initial_const_val, initial_addr_expr)
     heights = _compute_critical_path_heights(nodes)
     load_unblock_scores = _compute_load_unblock_scores(nodes) if prioritize_load_unblock else [0] * len(nodes)
     load_distance = _compute_distance_to_load(nodes) if prioritize_load_unblock else [10**9] * len(nodes)
@@ -844,6 +867,60 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used)
 
         block_order = get_block_order(lir)
+
+        # --- Pre-compute predecessors and MachineInsts for all blocks ---
+        block_predecessors: dict[str, list[str]] = {name: [] for name in lir.blocks}
+        for name, block in lir.blocks.items():
+            for succ in get_successors(block):
+                if succ in block_predecessors:
+                    block_predecessors[succ].append(name)
+
+        block_machine_insts: dict[str, list[MachineInst]] = {}
+        for name in block_order:
+            block_machine_insts[name] = [
+                lir_inst_to_machine_inst(inst) for inst in lir.blocks[name].instructions
+            ]
+
+        # --- Forward propagation of const_val/addr_expr in RPO ---
+        processed: set[str] = set()
+        block_entry_const: dict[str, dict[int, int]] = {}
+        block_entry_addr: dict[str, dict[int, AddrExpr]] = {}
+        block_exit_const: dict[str, dict[int, int]] = {}
+        block_exit_addr: dict[str, dict[int, AddrExpr]] = {}
+
+        for block_name in block_order:
+            preds = block_predecessors[block_name]
+            # Merge predecessor exit states (intersection of processed preds)
+            processed_preds = [p for p in preds if p in processed]
+            if not processed_preds:
+                entry_const: dict[int, int] = {}
+                entry_addr: dict[int, AddrExpr] = {}
+            elif len(processed_preds) == 1:
+                entry_const = dict(block_exit_const[processed_preds[0]])
+                entry_addr = dict(block_exit_addr[processed_preds[0]])
+            else:
+                # Intersect: keep only keys present in ALL processed preds with same value
+                first = processed_preds[0]
+                entry_const = {}
+                for k, v in block_exit_const[first].items():
+                    if all(block_exit_const[p].get(k) == v for p in processed_preds[1:]):
+                        entry_const[k] = v
+                entry_addr = {}
+                for k, v in block_exit_addr[first].items():
+                    if all(block_exit_addr[p].get(k) == v for p in processed_preds[1:]):
+                        entry_addr[k] = v
+
+            block_entry_const[block_name] = entry_const
+            block_entry_addr[block_name] = entry_addr
+
+            exit_const, exit_addr = _compute_exit_value_state(
+                block_machine_insts[block_name], entry_const, entry_addr
+            )
+            block_exit_const[block_name] = exit_const
+            block_exit_addr[block_name] = exit_addr
+            processed.add(block_name)
+
+        # --- Main scheduling loop ---
         # Global diagnostics aggregation
         slot_limits = MBundle.SLOT_LIMITS
         engine_used_slots = {engine: 0 for engine in slot_limits}
@@ -860,8 +937,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
 
         for block_name in block_order:
             lir_block = lir.blocks[block_name]
-
-            machine_insts = [lir_inst_to_machine_inst(inst) for inst in lir_block.instructions]
+            machine_insts = block_machine_insts[block_name]
             terminator = lir_block.terminator
 
             bundles, stats = _schedule_block(
@@ -874,6 +950,8 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                 devectorize_partial_alu_fill=devectorize_partial_alu_fill,
                 prioritize_load_unblock=prioritize_load_unblock,
                 register_pressure_limit=register_pressure_limit,
+                initial_const_val=block_entry_const[block_name],
+                initial_addr_expr=block_entry_addr[block_name],
             )
 
             for engine in slot_limits:
@@ -894,10 +972,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
             total_devectorized_alu_ops += int(stats.get("devectorized_alu_ops", 0))
 
             successors = get_successors(lir_block)
-            predecessors: list[str] = []
-            for other_name, other_block in lir.blocks.items():
-                if block_name in get_successors(other_block):
-                    predecessors.append(other_name)
+            predecessors = block_predecessors[block_name]
 
             mbb = MachineBasicBlock(
                 name=block_name,
