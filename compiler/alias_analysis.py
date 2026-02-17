@@ -87,6 +87,23 @@ class AliasAnalysis:
                     key = AddrKey(other_key.base, other_key.offset + const_val)
                     self._norm_cache[ssa] = key
                     return key
+            # Handle ssa + ssa: normalize both sides and create composite base.
+            # This is needed for partial loop unrolling where addresses are
+            # ptr + (scaled + j) — both operands are SSA values but one
+            # carries a constant offset that SLP needs to see.
+            a, b = stmt.operands
+            if isinstance(a, SSAValue) and isinstance(b, SSAValue):
+                a_key = self._normalize_ssa(a)
+                b_key = self._normalize_ssa(b)
+                if a_key is not None and b_key is not None:
+                    # Sort bases for commutativity (a+b == b+a)
+                    bases = (a_key.base, b_key.base)
+                    if repr(bases[0]) > repr(bases[1]):
+                        bases = (bases[1], bases[0])
+                    key = AddrKey(("add", bases[0], bases[1]),
+                                 a_key.offset + b_key.offset)
+                    self._norm_cache[ssa] = key
+                    return key
         return key
 
     def _canonical_base(self, ssa: SSAValue) -> object:
