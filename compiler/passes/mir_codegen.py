@@ -123,6 +123,11 @@ class MIRToVLIWPass(MIRCodegenPass):
 
     def run(self, mir: MachineFunction, config: PassConfig) -> list[dict]:
         """Generate VLIW bundles from MIR."""
+        if not mir.phi_eliminated:
+            raise RuntimeError(
+                "mir-to-vliw: MIR was produced without phi-elimination. "
+                "Run phi-elimination before lir-to-mir lowering."
+            )
         self._init_metrics()
 
         # Find zero constant for COPY expansion

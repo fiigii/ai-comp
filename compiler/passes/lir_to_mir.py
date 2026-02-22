@@ -51,9 +51,11 @@ class LIRToMIRPass(LIRToMIRLoweringPass):
 
     def run(self, lir: LIRFunction, config: PassConfig) -> MachineFunction:
         """Lower LIR to MIR without instruction scheduling."""
+        self._check_no_remaining_phis(lir)
         self._init_metrics()
 
-        mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used)
+        mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used,
+                                phi_eliminated=True)
 
         # Process blocks in order
         block_order = get_block_order(lir)

@@ -855,6 +855,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
 
     def run(self, lir: LIRFunction, config: PassConfig) -> MachineFunction:
         """Lower LIR to MIR using the scheduling algorithm."""
+        self._check_no_remaining_phis(lir)
         self._init_metrics()
         prefer_load_fill = bool(config.options.get("prefer_load_fill", False))
         devectorize_valu_to_alu = bool(config.options.get("devectorize_valu_to_alu", False))
@@ -864,7 +865,8 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
         prioritize_load_unblock = bool(config.options.get("prioritize_load_unblock", False))
         register_pressure_limit = int(config.options.get("register_pressure_limit", 0))
 
-        mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used)
+        mfunc = MachineFunction(entry=lir.entry, max_scratch_used=lir.max_scratch_used,
+                                phi_eliminated=True)
 
         block_order = get_block_order(lir)
 

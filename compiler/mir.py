@@ -123,6 +123,7 @@ class MachineFunction:
     entry: str
     blocks: dict[str, MachineBasicBlock] = field(default_factory=dict)
     max_scratch_used: int = -1
+    phi_eliminated: bool = False
 
     def get_block_order(self) -> list[str]:
         """Get blocks in reverse postorder for analysis."""

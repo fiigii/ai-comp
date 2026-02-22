@@ -188,6 +188,16 @@ class LIRToMIRLoweringPass(CompilerPass):
     def output_type(self) -> str:
         return "mir"
 
+    def _check_no_remaining_phis(self, lir: LIRFunction) -> None:
+        """Verify phi-elimination has run. Raises if any phis remain."""
+        for block_name, block in lir.blocks.items():
+            if block.phis:
+                phi_strs = ", ".join(str(p) for p in block.phis)
+                raise RuntimeError(
+                    f"{self.name}: block '{block_name}' still has phi nodes "
+                    f"({phi_strs}). Run phi-elimination before {self.name}."
+                )
+
     @abstractmethod
     def run(self, lir: LIRFunction, config: PassConfig) -> "MachineFunction":
         """Lower LIR to MIR with instruction scheduling."""
