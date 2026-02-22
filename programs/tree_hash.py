@@ -39,6 +39,8 @@ def build_tree_hash_kernel(
     n_nodes: int,
     batch_size: int,
     rounds: int,
+    inner_unroll: int = 0,
+    outer_unroll: int = 0,
 ) -> 'HIRFunction':
     """
     Build HIR for the tree hash kernel.
@@ -152,7 +154,7 @@ def build_tree_hash_kernel(
             end=batch_const,
             iter_args=[],
             body_fn=batch_body,
-            pragma_unroll=0
+            pragma_unroll=inner_unroll
         )
         return []  # No loop-carried values
 
@@ -162,7 +164,7 @@ def build_tree_hash_kernel(
         end=rounds_const,
         iter_args=[],
         body_fn=round_body,
-        pragma_unroll=0
+        pragma_unroll=outer_unroll
     )
 
     # Final pause (sync with reference_kernel2 second yield)
@@ -183,9 +185,11 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        inner_unroll: int = 0, outer_unroll: int = 0,
         **compile_kwargs
     ):
-        hir = build_tree_hash_kernel(forest_height, n_nodes, batch_size, rounds)
+        hir = build_tree_hash_kernel(forest_height, n_nodes, batch_size, rounds,
+                                     inner_unroll=inner_unroll, outer_unroll=outer_unroll)
         self.instrs = compiler.compile(hir, **compile_kwargs)
 
 
@@ -205,6 +209,8 @@ def do_kernel_test(
     print_ddg_after_all: bool = False,
     profile_reg_pressure: bool = False,
     pass_config: str | None = None,
+    inner_unroll: int = 0,
+    outer_unroll: int = 0,
 ):
     import random
 
@@ -216,6 +222,7 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
+                    inner_unroll=inner_unroll, outer_unroll=outer_unroll,
                     print_after_all=print_after_all, print_metrics=print_metrics,
                     print_ddg_after_all=print_ddg_after_all,
                     profile_reg_pressure=profile_reg_pressure,
@@ -259,7 +266,8 @@ if __name__ == "__main__":
     import argparse
     from programs import add_compiler_flags, COMPILER_FLAGS, compiler_kwargs
 
-    program_flags = {'--forest-height', '--rounds', '--batch-size'}
+    program_flags = {'--forest-height', '--rounds', '--batch-size',
+                      '--inner-unroll', '--outer-unroll'}
     all_flags = COMPILER_FLAGS | program_flags
     has_flag = any(arg.split('=')[0] in all_flags for arg in sys.argv[1:])
 
@@ -272,6 +280,10 @@ if __name__ == "__main__":
                             help="Number of rounds (default: 16)")
         parser.add_argument("--batch-size", type=int, default=256,
                             help="Batch size (default: 256)")
+        parser.add_argument("--inner-unroll", type=int, default=0,
+                            help="Pragma unroll factor for the inner (batch) loop (default: 0)")
+        parser.add_argument("--outer-unroll", type=int, default=0,
+                            help="Pragma unroll factor for the outer (round) loop (default: 0)")
         args = parser.parse_args()
 
         do_kernel_test(
@@ -280,5 +292,7 @@ if __name__ == "__main__":
             args.batch_size,
             trace=args.trace,
             print_vliw=args.print_vliw,
+            inner_unroll=args.inner_unroll,
+            outer_unroll=args.outer_unroll,
             **compiler_kwargs(args),
         )
