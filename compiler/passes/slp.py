@@ -184,6 +184,9 @@ class SLPVectorizationPass(Pass):
         self._entry_broadcasts = []
         self._entry_broadcast_cache = {}
         self._alias = AliasAnalysis(UseDefContext(hir), restrict_ptr=config.options.get("restrict_ptr", False))
+        self._vectorize_memory = config.options.get("vectorize_memory", True)
+        self._gather = config.options.get("gather", True)
+        self._vectorize_alu = config.options.get("vectorize_alu", True)
 
         if not config.enabled:
             return hir
@@ -350,6 +353,10 @@ class SLPVectorizationPass(Pass):
 
         # Phase 3: Check legality
         legal_packs = [p for p in ctx.packs if self._is_legal_pack(p, ctx)]
+
+        # Phase 3b: Filter packs by config knobs
+        if not self._vectorize_memory:
+            legal_packs = [p for p in legal_packs if p.opcode not in ("store", "load")]
 
         if not legal_packs:
             return None
@@ -554,6 +561,14 @@ class SLPVectorizationPass(Pass):
         if opcode not in VECTORIZABLE_ALU_OPS and opcode not in ("select", "load"):
             return False
 
+        # Gate load packing on vectorize_memory knob
+        if opcode == "load" and not self._vectorize_memory:
+            return False
+
+        # Gate ALU packing on vectorize_alu knob (select is unaffected)
+        if opcode in VECTORIZABLE_ALU_OPS and not self._vectorize_alu:
+            return False
+
         # Not already packed
         if any(id(op) in ctx.packed_ops for op in ops):
             return False
@@ -736,8 +751,8 @@ class SLPVectorizationPass(Pass):
                         self._ops_vectorized += VLEN
                         emitted_packs.add(pack_hash)
 
-                        # Emit vextracts for scalar uses
-                        if pack.opcode in ("load",) + tuple(VECTORIZABLE_ALU_OPS):
+                        # Emit vextracts for scalar uses (all packs except store, which has no result)
+                        if pack.opcode != "store":
                             for lane, pack_op in enumerate(pack.elements):
                                 if pack_op.result:
                                     has_scalar_use = self._has_scalar_use(pack_op, pack_elements, ctx)
@@ -1065,7 +1080,7 @@ class SLPVectorizationPass(Pass):
             return ctx.broadcast_cache[cache_key]
 
         # Try vgather pattern (loads with indexed addresses)
-        gather_result = self._try_generate_vgather(scalars, ctx)
+        gather_result = self._try_generate_vgather(scalars, ctx) if self._gather else None
         if gather_result is not None:
             ctx.broadcast_cache[cache_key] = gather_result
             return gather_result

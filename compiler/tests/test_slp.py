@@ -19,7 +19,7 @@ from compiler import (
 )
 from compiler.passes import SLPVectorizationPass, LoopUnrollPass, DCEPass, CSEPass
 from compiler.passes import LIRToMIRPass, MIRRegisterAllocationPass, MIRToVLIWPass
-from compiler.passes.slp import VLEN
+from compiler.passes.slp import VLEN, VECTORIZABLE_ALU_OPS
 
 
 class TestSLPPass(unittest.TestCase):
@@ -949,6 +949,221 @@ class TestSLPPass(unittest.TestCase):
             1 for bundle in instrs for slot in bundle.get("flow", []) if slot[0] == "pause"
         )
         self.assertEqual(vliw_pause_count, 2, "Expected two pause instructions in VLIW output")
+
+
+    # --- Config Knob Tests ---
+
+    def test_slp_vectorize_memory_disabled(self):
+        """Test that vectorize_memory=False disables load/store vectorization."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base_in = b.const(0)
+        base_out = b.const(100)
+
+        for i in range(VLEN):
+            addr_in = b.add(base_in, b.const(i), f"addr_in_{i}")
+            val = b.load(addr_in, f"val_{i}")
+            addr_out = b.add(base_out, b.const(i), f"addr_out_{i}")
+            b.store(addr_out, val)
+
+        hir = b.build()
+
+        # With vectorize_memory disabled
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        pm.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            options={"vectorize_memory": False},
+        )
+        transformed = pm.run(hir)
+
+        # Should have no vload or vstore
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                self.assertNotIn(stmt.opcode, ("vload", "vstore"),
+                    "vectorize_memory=False should prevent vload/vstore")
+
+        # Correctness check
+        instrs = self._compile_hir_via_mir_only(transformed)
+        mem = list(range(VLEN)) + [0] * 200
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], i)
+
+    def test_slp_gather_disabled(self):
+        """Test that gather=False disables vgather generation."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base_in = b.const(0)
+        base_out = b.const(100)
+        increment = b.const(1)
+
+        # Pattern that triggers gather: load from base + computed offset
+        for i in range(VLEN):
+            addr_in = b.add(base_in, b.const(i), f"addr_in_{i}")
+            val = b.load(addr_in, f"val_{i}")
+            result = b.add(val, increment, f"result_{i}")
+            addr_out = b.add(base_out, b.const(i), f"addr_out_{i}")
+            b.store(addr_out, result)
+
+        hir = b.build()
+
+        # With gather disabled
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        pm.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            options={"gather": False},
+        )
+        transformed = pm.run(hir)
+
+        # Should have no vgather
+        def check_no_vgather(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, Op):
+                    self.assertNotEqual(stmt.opcode, "vgather",
+                        "gather=False should prevent vgather")
+
+        check_no_vgather(transformed.body)
+
+        # Correctness check
+        instrs = self._compile_hir_via_mir_only(transformed)
+        mem = list(range(VLEN)) + [0] * 200
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], i + 1)
+
+    def test_slp_vectorize_alu_disabled(self):
+        """Test that vectorize_alu=False disables ALU vectorization but keeps memory and select."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base_in = b.const(0)
+        base_out = b.const(100)
+        increment = b.const(1)
+
+        for i in range(VLEN):
+            addr_in = b.add(base_in, b.const(i), f"addr_in_{i}")
+            val = b.load(addr_in, f"val_{i}")
+            result = b.add(val, increment, f"result_{i}")
+            addr_out = b.add(base_out, b.const(i), f"addr_out_{i}")
+            b.store(addr_out, result)
+
+        hir = b.build()
+
+        # With vectorize_alu disabled
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        pm.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            options={"vectorize_alu": False},
+        )
+        transformed = pm.run(hir)
+
+        # Should have no vector ALU ops (v+, v-, v*, etc.)
+        vector_alu_opcodes = {f"v{op}" for op in VECTORIZABLE_ALU_OPS}
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                self.assertNotIn(stmt.opcode, vector_alu_opcodes,
+                    f"vectorize_alu=False should prevent {stmt.opcode}")
+
+        # Correctness check
+        instrs = self._compile_hir_via_mir_only(transformed)
+        mem = list(range(VLEN)) + [0] * 200
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], i + 1)
+
+    def test_slp_knobs_independent(self):
+        """Test that disabling one knob doesn't affect the others."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base_in = b.const(0)
+        base_out = b.const(100)
+
+        # Simple load-store pattern (no ALU, no gather)
+        for i in range(VLEN):
+            addr_in = b.add(base_in, b.const(i), f"addr_in_{i}")
+            val = b.load(addr_in, f"val_{i}")
+            addr_out = b.add(base_out, b.const(i), f"addr_out_{i}")
+            b.store(addr_out, val)
+
+        hir = b.build()
+
+        # Disable ALU and gather, but keep memory enabled
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        pm.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            options={"vectorize_alu": False, "gather": False, "vectorize_memory": True},
+        )
+        transformed = pm.run(hir)
+
+        # Should still have vload/vstore since vectorize_memory is enabled
+        has_vstore = False
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                if stmt.opcode == "vstore":
+                    has_vstore = True
+
+        self.assertTrue(has_vstore, "vectorize_memory=True should still produce vstore")
+
+        # Correctness check
+        instrs = self._compile_hir_via_mir_only(transformed)
+        mem = list(range(VLEN)) + [0] * 200
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], i)
+
+    def test_slp_memory_disabled_alu_still_vectorizes(self):
+        """Test that vectorize_memory=False still allows ALU vectorization."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        base_in = b.const(0)
+        base_out = b.const(100)
+        increment = b.const(1)
+
+        # load → add → store pattern
+        for i in range(VLEN):
+            addr_in = b.add(base_in, b.const(i), f"addr_in_{i}")
+            val = b.load(addr_in, f"val_{i}")
+            result = b.add(val, increment, f"result_{i}")
+            addr_out = b.add(base_out, b.const(i), f"addr_out_{i}")
+            b.store(addr_out, result)
+
+        hir = b.build()
+
+        # Disable memory vectorization only
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        pm.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            options={"vectorize_memory": False, "vectorize_alu": True, "gather": True},
+        )
+        transformed = pm.run(hir)
+
+        # Should have vector ALU ops (v+) but no vload/vstore
+        has_valu = False
+        for stmt in transformed.body:
+            if isinstance(stmt, Op):
+                self.assertNotIn(stmt.opcode, ("vload", "vstore"),
+                    "vectorize_memory=False should prevent vload/vstore")
+                if stmt.opcode == "v+":
+                    has_valu = True
+
+        self.assertTrue(has_valu,
+            "vectorize_memory=False should still allow ALU vectorization")
+
+        # Correctness check
+        instrs = self._compile_hir_via_mir_only(transformed)
+        mem = list(range(VLEN)) + [0] * 200
+        machine = self._run_program(instrs, mem)
+        for i in range(VLEN):
+            self.assertEqual(machine.mem[100 + i], i + 1)
 
 
 if __name__ == "__main__":
