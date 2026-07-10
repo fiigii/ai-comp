@@ -8,6 +8,7 @@ from ..hir import (
     SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
+from ..range_analysis import RangeAnalysis
 from ..ssa_context import SSARenumberContext
 
 
@@ -50,6 +51,12 @@ class LoopUnrollPass(Pass):
         # If scratch space is exhausted, use pragma_unroll on individual loops
         max_trip_count = config.options.get("max_trip_count", 10000000)
 
+        # Interval analysis proves bounds static even when they are computed
+        # values rather than literal Consts (unroll runs before simplify).
+        # Built lazily: only loops with non-Const bounds pay for the scan.
+        self._hir = hir
+        self._ranges = None
+
         # Create SSA renumber context starting from current max
         max_vec_id = self._max_vector_id(hir.body)
         ctx = SSARenumberContext(hir.num_ssa_values, max_vec_id + 1)
@@ -72,6 +79,16 @@ class LoopUnrollPass(Pass):
             num_ssa_values=ctx.next_id,
             num_vec_ssa_values=ctx.next_vec_id
         )
+
+    def _static_bound(self, value: Value) -> "int | None":
+        """Constant loop bound: a literal Const or a range-proven point."""
+        if isinstance(value, Const):
+            return value.value & 0xFFFFFFFF
+        if isinstance(value, SSAValue):
+            if self._ranges is None:
+                self._ranges = RangeAnalysis(self._hir)
+            return self._ranges.try_const(value)
+        return None
 
     def _max_vector_id(self, body: list[Statement]) -> int:
         """Find the maximum VectorSSAValue id defined in the body."""
@@ -212,16 +229,34 @@ class LoopUnrollPass(Pass):
             self._add_metric_message(f"Loop skipped: pragma_unroll=1")
             return [transformed_loop]
 
-        # Check if loop has static bounds
-        if not isinstance(loop.start, Const) or not isinstance(loop.end, Const):
+        # Check if loop has static bounds. Interval analysis extends this
+        # beyond literal Consts to bounds that are provably constant
+        # computed values (unroll runs before any folding pass).
+        start_val = self._static_bound(loop.start)
+        end_val = self._static_bound(loop.end)
+        if start_val is None or end_val is None:
             # Dynamic bounds - can't unroll, return with transformed body
             self._loops_skipped += 1
-            start_str = loop.start.value if isinstance(loop.start, Const) else "dynamic"
-            end_str = loop.end.value if isinstance(loop.end, Const) else "dynamic"
+            start_str = "dynamic" if start_val is None else start_val
+            end_str = "dynamic" if end_val is None else end_val
             self._add_metric_message(f"Loop skipped: dynamic bounds (start={start_str}, end={end_str})")
             return [transformed_loop]
+        if not isinstance(loop.start, Const) or not isinstance(loop.end, Const):
+            # Substitute the proven bounds so the unroll helpers below see
+            # ordinary Const-bounded loops.
+            transformed_loop = ForLoop(
+                counter=transformed_loop.counter,
+                start=Const(start_val),
+                end=Const(end_val),
+                iter_args=transformed_loop.iter_args,
+                body_params=transformed_loop.body_params,
+                body=transformed_loop.body,
+                yields=transformed_loop.yields,
+                results=transformed_loop.results,
+                pragma_unroll=transformed_loop.pragma_unroll,
+            )
 
-        trip_count = loop.end.value - loop.start.value
+        trip_count = end_val - start_val
 
         if trip_count <= 0:
             # Empty loop - just bind results to iter_args

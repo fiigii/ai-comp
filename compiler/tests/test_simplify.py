@@ -934,6 +934,26 @@ class TestStructuredRangeConsumption(SimplifyOptionTestBase):
         # collapses via const-cond folding (counted separately).
         self.assertGreaterEqual(p.get_metrics().custom["ranges_folded"], 1)
 
+    def test_select_to_mul_via_range_proven_boolean(self):
+        # The loop result is boolean only via the loop fixpoint ([0, 1]);
+        # the syntactic tracker (<, ==, & 1 ops) cannot see it.
+        b = HIRBuilder()
+        n = b.load(b.const(0), "n")
+        x = b.load(b.const(1), "x")
+
+        def body(i, params):
+            return [b.and_(b.add(params[0], i, "mix"), b.const(1), "bit")]
+
+        flag = b.for_loop(b.const(0), n, [b.const(0)], body)[0]
+        y = b.and_(x, b.const(15), "y")
+        sel = b.select(flag, y, b.const(0), "sel")
+        b.store(b.const(2), sel)
+        out, _ = self._run_simplify(b.build(), range_fold=True,
+                                    select_to_mul=True)
+        self.assertEqual(_count_opcode(out.body, "select"), 0,
+                         "select(range-proven-bool, y, 0) must become a mul")
+        self.assertGreaterEqual(_count_opcode(out.body, "*"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

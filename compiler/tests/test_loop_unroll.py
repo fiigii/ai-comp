@@ -631,5 +631,71 @@ class TestPragmaUnroll(unittest.TestCase):
         print("pragma_unroll non-divisible skipped test passed!")
 
 
+
+class TestRangeProvenBounds(unittest.TestCase):
+    """Loop bounds that are provably constant computed values unroll."""
+
+    def _run_unroll(self, hir):
+        pm = PassManager()
+        p = LoopUnrollPass()
+        pm.add_pass(p)
+        pm.config["loop-unroll"] = PassConfig(
+            name="loop-unroll", enabled=True, options={})
+        return pm.run(hir), p
+
+    def test_computed_constant_bound_unrolls(self):
+        b = HIRBuilder()
+        end = b.mul(b.const(2), b.const(3), "end")  # provably 6
+
+        def body(i, params):
+            return [b.add(params[0], i, "acc")]
+
+        res = b.for_loop(b.const(0), end, [b.const(0)], body)[0]
+        b.store(b.const(0), res)
+        out, p = self._run_unroll(b.build())
+
+        self.assertFalse(any(isinstance(s, ForLoop) for s in out.body))
+        self.assertEqual(p.get_metrics().custom["fully_unrolled"], 1)
+
+    def test_dynamic_bound_still_skipped(self):
+        b = HIRBuilder()
+        end = b.load(b.const(0), "end")
+
+        def body(i, params):
+            return [b.add(params[0], i, "acc")]
+
+        res = b.for_loop(b.const(0), end, [b.const(0)], body)[0]
+        b.store(b.const(0), res)
+        out, p = self._run_unroll(b.build())
+
+        self.assertTrue(any(isinstance(s, ForLoop) for s in out.body))
+        self.assertEqual(p.get_metrics().custom["skipped"], 1)
+
+
+class TestRangeProvenBoundsEndToEnd(unittest.TestCase):
+    def test_computed_bound_unroll_executes_correctly(self):
+        # sum(0..5) with end = 2 * 3: the range-proven bound unrolls and the
+        # compiled program must produce the same value the loop semantics
+        # dictate.
+        b = HIRBuilder()
+        end = b.mul(b.const(2), b.const(3), "end")
+
+        def body(i, params):
+            return [b.add(params[0], i, "acc")]
+
+        res = b.for_loop(b.const(0), end, [b.const(0)], body)[0]
+        b.store(b.const(0), res)
+        hir = b.build()
+
+        instrs = compile_hir_to_vliw(hir)
+        mem = [0] * 16
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}),
+                          n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        self.assertEqual(machine.mem[0], 15)
+
+
 if __name__ == "__main__":
     unittest.main()

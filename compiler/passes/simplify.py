@@ -253,7 +253,11 @@ class SimplifyPass(Pass):
         if isinstance(operand, Const):
             return operand.value in (0, 1)
         if isinstance(operand, SSAValue):
-            return operand in self._boolean_values
+            if operand in self._boolean_values:
+                return True
+            # Interval analysis proves booleans the syntactic tracker
+            # misses (e.g. x >> 31, If results, loop-carried bits).
+            return self._range is not None and self._range.is_boolean(operand)
         return False
 
     def _try_constant_fold(self, opcode: str, left: Value, right: Value) -> Optional[int]:
