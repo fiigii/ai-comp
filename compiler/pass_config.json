@@ -12,6 +12,7 @@
     "dse",
     "tree-level-cache",
     "simplify",
+    "slsr",
     "dce",
     "slp-vectorization",
     "dce",
@@ -108,6 +109,12 @@
         "enable_spilling": false,
         "spill_infra_size": 35,
         "debug_spills": false
+      }
+    },
+    "slsr": {
+      "enabled": true,
+      "options": {
+        "min_savings": 1
       }
     }
   }

@@ -25,6 +25,7 @@ from .dse import DSEPass
 from .tree_level_cache import TreeLevelCachePass
 from .local_mem2reg import LocalMem2RegPass
 from .strip_assume import StripAssumePass
+from .slsr import SLSRPass
 from .lir_to_mir import LIRToMIRPass
 from .inst_scheduling import InstSchedulingPass
 from .mir_reg_pressure_profiler import MIRRegPressureProfilerPass
@@ -48,6 +49,7 @@ __all__ = [
     'TreeLevelCachePass',
     'LocalMem2RegPass',
     'StripAssumePass',
+    'SLSRPass',
     'LIRToMIRPass',
     'InstSchedulingPass',
     'MIRRegPressureProfilerPass',
