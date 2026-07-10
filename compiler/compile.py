@@ -14,7 +14,7 @@ from .passes import (
     DCEPass, LoopUnrollPass, CSEPass, SimplifyPass, HIRToLIRPass,
     SimplifyCFGPass, CopyPropagationPass, LIRDCEPass, PhiEliminationPass,
     SLPVectorizationPass, MADSynthesisPass, LoadElimPass, DSEPass,
-    TreeLevelCachePass,
+    TreeLevelCachePass, LocalMem2RegPass, StripAssumePass,
     LIRToMIRPass, InstSchedulingPass, MIRRegPressureProfilerPass,
     MIRRegisterAllocationPass, MIRToVLIWPass
 )
@@ -27,6 +27,8 @@ PASS_REGISTRY = {
     "load-elim": LoadElimPass,
     "dse": DSEPass,
     "tree-level-cache": TreeLevelCachePass,
+    "local-mem2reg": LocalMem2RegPass,
+    "strip-assume": StripAssumePass,
     "slp-vectorization": SLPVectorizationPass,
     "mad-synthesis": MADSynthesisPass,
     "hir-to-lir": HIRToLIRPass,

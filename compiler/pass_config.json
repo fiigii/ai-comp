@@ -5,6 +5,9 @@
     "simplify",
     "dce",
     "cse",
+    "local-mem2reg",
+    "strip-assume",
+    "dce",
     "load-elim",
     "dse",
     "tree-level-cache",
@@ -56,6 +59,14 @@
         "levels": 3,
         "estimate_ops": true
       }
+    },
+    "local-mem2reg": {
+      "enabled": true,
+      "options": {}
+    },
+    "strip-assume": {
+      "enabled": true,
+      "options": {}
     },
     "slp-vectorization": {
       "enabled": true,

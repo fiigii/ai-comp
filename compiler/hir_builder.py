@@ -9,6 +9,7 @@ from typing import Optional, Callable
 from .hir import (
     SSAValue, VectorSSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
+from .local_memory import LOCAL_MEMORY_OPCODE
 
 
 class HIRBuilder:
@@ -96,6 +97,19 @@ class HIRBuilder:
     def store(self, addr: Value, value: Value):
         """Store value to memory at address."""
         self._emit(Op("store", None, [addr, value], "store"))
+
+    def assume_local_memory(self, addr: Value, length: Value) -> None:
+        """Declare a private, zero-initialized, non-observable memory region.
+
+        ``length`` is measured in 32-bit words. Until function exit, all
+        accesses must use ``addr`` or a derived address, the pointer cannot
+        escape, and contents cannot be observed at pause/debug boundaries or
+        on return. The annotation emits no target instruction: violating the
+        contract is undefined behavior, while optimizers may ignore it.
+        The current promotion pass requires a scalar SSA address and a positive
+        compile-time constant length; other forms remain valid but unoptimized.
+        """
+        self._emit(Op(LOCAL_MEMORY_OPCODE, None, [addr, length], "meta"))
 
     # === Flow operations ===
 

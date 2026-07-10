@@ -12,6 +12,7 @@ from vm import SCRATCH_SIZE
 from .hir import (
     SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
+from .local_memory import LOCAL_MEMORY_OPCODE
 
 # Vector length (must match VM's VLEN)
 VLEN = 8
@@ -210,6 +211,11 @@ def _lower_statement(stmt: Statement, ctx: LoweringContext):
 
 def _lower_op(op: Op, ctx: LoweringContext):
     """Lower an Op to LIR instructions."""
+    # Optimization contract only. Ignoring an assumption is always valid,
+    # so lowering must work when promotion is disabled or declines a region.
+    if op.opcode == LOCAL_MEMORY_OPCODE:
+        return
+
     # Check for vector operations first
     if _is_vector_op(op.opcode):
         _lower_vector_op(op, ctx)
