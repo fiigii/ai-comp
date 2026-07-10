@@ -1,5 +1,10 @@
 # Tree Level Cache (HIR) Design and Implementation Plan
 
+> Historical design note. This document describes the original
+> header-slot/index-memory implementation and is not the current algorithm.
+> See `docs/local_memory_promotion.md` and `docs/optimization_summary.md` for
+> the current zero-root SSA recurrence and tree-cache integration.
+
 ## Goal
 
 Reduce remaining `load(forest_values_p + idx)` instructions by caching the top tree levels and replacing node loads with select trees in early rounds. This exploits a property of the benchmark input: initial indices are all zero.

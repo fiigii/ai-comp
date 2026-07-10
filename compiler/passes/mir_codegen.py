@@ -37,6 +37,8 @@ def _inst_to_slot(inst: MachineInst, zero_scratch: int) -> Optional[tuple]:
         # Flow operations
         case LIROpcode.SELECT:
             return ("select", inst.dest, inst.operands[0], inst.operands[1], inst.operands[2])
+        case LIROpcode.ADD_IMM:
+            return ("add_imm", inst.dest, inst.operands[0], inst.operands[1])
         case LIROpcode.JUMP:
             return ("jump", inst.operands[0])
         case LIROpcode.COND_JUMP:

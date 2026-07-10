@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from ..alias_analysis import AliasAnalysis, AliasResult, AddrKey
+from ..alias_analysis import AliasAnalysis, AliasResult, AddrKey, base_roots
 from ..hir import Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 from ..pass_manager import Pass, PassConfig
 from ..use_def import UseDefContext
@@ -27,18 +27,36 @@ class PendingStore:
 
 
 class DSEState:
-    def __init__(self, alias: AliasAnalysis):
+    def __init__(self, alias: AliasAnalysis, restrict_ptr: bool):
         self._alias = alias
+        self.restrict_ptr = restrict_ptr
         self.pending: list[PendingStore] = []
         self.pending_by_key: dict[tuple[AddrKey, int, str], PendingStore] = {}
-        self.pending_by_base: dict[object, list[PendingStore]] = {}
+        self.pending_by_root: dict[object, list[PendingStore]] = {}
         self.unknown_load_epoch: int = 0
 
     def reset(self) -> None:
         self.pending.clear()
         self.pending_by_key.clear()
-        self.pending_by_base.clear()
+        self.pending_by_root.clear()
         self.unknown_load_epoch = 0
+
+    def load_candidates(self, addr_key: AddrKey) -> list[PendingStore]:
+        """Return pending stores that may need an alias query for a load."""
+        if not self.restrict_ptr:
+            # Without restrict semantics, disjoint symbolic roots may still
+            # resolve to the same runtime address.
+            return self.pending
+
+        candidates: list[PendingStore] = []
+        seen: set[int] = set()
+        for root in base_roots(addr_key.base):
+            for pending in self.pending_by_root.get(root, []):
+                pending_id = id(pending)
+                if pending_id not in seen:
+                    seen.add(pending_id)
+                    candidates.append(pending)
+        return candidates
 
 
 class DSEPass(Pass):
@@ -69,7 +87,7 @@ class DSEPass(Pass):
         restrict_ptr = config.options.get("restrict_ptr", False)
         self._alias = AliasAnalysis(self._use_def_ctx, restrict_ptr=restrict_ptr)
 
-        state = DSEState(self._alias)
+        state = DSEState(self._alias, restrict_ptr)
         new_body = self._transform_statements(hir.body, state)
 
         if self._metrics:
@@ -101,6 +119,10 @@ class DSEPass(Pass):
             elif isinstance(stmt, If):
                 result.append(self._transform_if(stmt, state))
             else:
+                # A store before Pause/Halt is observable before any store
+                # after that boundary and therefore cannot be superseded by
+                # it during this forward scan.
+                state.reset()
                 result.append(stmt)
 
         return [s for s in result if s is not None]
@@ -132,15 +154,10 @@ class DSEPass(Pass):
             state.unknown_load_epoch += 1
             return
 
-        if width == 1:
-            pending = state.pending_by_key.get((addr_key, 1, "store"))
-            if pending is not None:
-                pending.used_by_load = True
-            return
-
-        # Vector load: check overlapping ranges within the same base only.
-        base_list = state.pending_by_base.get(addr_key.base, [])
-        for pending in base_list:
+        # A different symbolic address can resolve to the same runtime address
+        # (for example base+i and base+j when i == j). Check every candidate
+        # store sharing provenance roots, including scalar/vector overlaps.
+        for pending in state.load_candidates(addr_key):
             alias = self._alias.alias_keys(addr_key, width, pending.addr_key, pending.width)
             if alias != AliasResult.NO_ALIAS:
                 pending.used_by_load = True
@@ -156,13 +173,14 @@ class DSEPass(Pass):
                 if not used:
                     result[pending.stmt_index] = None
                     self._stores_eliminated += 1
-                # Remove from base list
-                base_list = state.pending_by_base.get(addr_key.base)
-                if base_list is not None:
-                    try:
-                        base_list.remove(pending)
-                    except ValueError:
-                        pass
+                assert pending.addr_key is not None
+                for root in base_roots(pending.addr_key.base):
+                    root_list = state.pending_by_root.get(root)
+                    if root_list is not None:
+                        try:
+                            root_list.remove(pending)
+                        except ValueError:
+                            pass
                 state.pending_by_key.pop(key, None)
                 # Also remove from pending list (used for fallback only)
                 try:
@@ -174,10 +192,11 @@ class DSEPass(Pass):
         state.pending.append(new_pending)
         if addr_key is not None:
             state.pending_by_key[(addr_key, width, opcode)] = new_pending
-            state.pending_by_base.setdefault(addr_key.base, []).append(new_pending)
+            for root in base_roots(addr_key.base):
+                state.pending_by_root.setdefault(root, []).append(new_pending)
 
     def _transform_for_loop(self, loop: ForLoop, state: DSEState) -> ForLoop:
-        loop_state = DSEState(self._alias)
+        loop_state = DSEState(self._alias, state.restrict_ptr)
         new_body = self._transform_statements(loop.body, loop_state)
 
         # Conservative: do not eliminate across loops
@@ -196,8 +215,8 @@ class DSEPass(Pass):
         )
 
     def _transform_if(self, if_stmt: If, state: DSEState) -> If:
-        then_state = DSEState(self._alias)
-        else_state = DSEState(self._alias)
+        then_state = DSEState(self._alias, state.restrict_ptr)
+        else_state = DSEState(self._alias, state.restrict_ptr)
 
         new_then_body = self._transform_statements(if_stmt.then_body, then_state)
         new_else_body = self._transform_statements(if_stmt.else_body, else_state)

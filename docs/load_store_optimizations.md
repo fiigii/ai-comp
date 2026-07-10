@@ -1,5 +1,10 @@
 # Load/Store Optimizations for tree_hash Kernel
 
+> Historical analysis. Its claims about unavoidable tree loads and missing
+> store-to-load forwarding predate local-memory promotion and the current
+> tree-level cache. See `docs/local_memory_promotion.md` and
+> `docs/optimization_summary.md` for the implemented pipeline.
+
 This document analyzes the memory operation patterns in the tree_hash kernel and identifies optimization opportunities to reduce the load instruction count.
 
 ## Current Memory Operation Breakdown

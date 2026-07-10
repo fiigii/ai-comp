@@ -299,7 +299,16 @@ def _build_live_intervals(mfunc: MachineFunction, liveness: dict[str, LivenessIn
                     if d in vector_addrs:
                         if d in vector_bases:
                             update_interval(d, def_point(idx), True)
-                        # Skip non-base vector elements
+                        else:
+                            # Lane def (e.g. devectorized lane write or
+                            # LOAD_OFFSET). The vector's storage is occupied
+                            # from the first lane def onward, so extend the
+                            # base interval; otherwise a scalar could be
+                            # allocated inside the vector's 8-register range
+                            # while a lane is already live and clobber it.
+                            base = addr_to_base.get(d)
+                            if base is not None:
+                                update_interval(base, def_point(idx), True)
                     else:
                         update_interval(d, def_point(idx), False)
 
@@ -442,6 +451,22 @@ def _linear_scan_with_spill(
     return allocation, max_preg_used, spills
 
 
+def _operand_is_immediate(inst: MachineInst, op_idx: int) -> bool:
+    """True when an integer operand is an immediate/label, not a scratch
+    address, and therefore must never be rewritten by register renaming."""
+    if inst.opcode == LIROpcode.CONST:
+        return True
+    if inst.opcode == LIROpcode.LOAD_OFFSET and op_idx == 1:
+        return True
+    if inst.opcode == LIROpcode.ADD_IMM and op_idx == 1:
+        return True
+    if inst.opcode == LIROpcode.JUMP:
+        return True
+    if inst.opcode == LIROpcode.COND_JUMP and op_idx > 0:
+        return True
+    return False
+
+
 def _add_free_range(free_ranges: list[tuple[int, int]], start: int, end: int) -> None:
     """Add a free range and merge overlaps/adjacent ranges."""
     if start > end:
@@ -531,14 +556,7 @@ def _rewrite_mir(mfunc: MachineFunction, allocation: dict[int, int],
                             for elem in op]
             return op
         elif isinstance(op, int):
-            # Check context for immediates
-            if inst.opcode == LIROpcode.CONST:
-                return op
-            if inst.opcode == LIROpcode.LOAD_OFFSET and op_idx == 1:
-                return op
-            if inst.opcode in (LIROpcode.JUMP, LIROpcode.COND_JUMP):
-                if inst.opcode == LIROpcode.COND_JUMP and op_idx == 0:
-                    return rewrite_scratch(op)
+            if _operand_is_immediate(inst, op_idx):
                 return op
             return rewrite_scratch(op)
         else:
@@ -709,9 +727,12 @@ def _split_live_ranges(
         new_bundles: list[MBundle] = []
 
         for bundle in block.bundles:
-            # Identify spilled vregs used/defined by this bundle
+            # Identify spilled vregs used/defined by this bundle. For vector
+            # spills, track WHICH lanes the bundle defines: devectorized
+            # scalar ops write single lanes, and saving the whole vector
+            # after a partial write would store not-yet-defined lanes.
             bundle_uses: set[int] = set()
-            bundle_defs: set[int] = set()
+            bundle_def_lanes: dict[int, set[Optional[int]]] = {}
 
             for inst in bundle.instructions:
                 for u in inst.get_uses():
@@ -726,7 +747,8 @@ def _split_live_ranges(
                     if d in vector_addrs and d not in vector_bases:
                         vreg = addr_to_base.get(d, d)
                     if vreg in spilled_vregs:
-                        bundle_defs.add(vreg)
+                        lane = d - vreg if spilled_vregs[vreg].is_vector else None
+                        bundle_def_lanes.setdefault(vreg, set()).add(lane)
 
             # For each spilled vreg used: allocate fresh vreg, reload into it,
             # and rewrite the using instruction's operands.
@@ -770,14 +792,16 @@ def _split_live_ranges(
                     )
                 new_bundles.extend([addr_b1, addr_b2, load_b])
 
-            # Rewrite the using instructions' operands
+            # Rewrite the using instructions' operands (immediates/labels
+            # are never scratch addresses and must not be renamed)
             if rewrite_map:
                 for inst in bundle.instructions:
                     new_operands = []
-                    for op in inst.operands:
+                    for op_idx, op in enumerate(inst.operands):
                         if isinstance(op, list):
                             new_operands.append([rewrite_map.get(x, x) if isinstance(x, int) else x for x in op])
-                        elif isinstance(op, int) and op in rewrite_map:
+                        elif (isinstance(op, int) and op in rewrite_map
+                                and not _operand_is_immediate(inst, op_idx)):
                             new_operands.append(rewrite_map[op])
                         else:
                             new_operands.append(op)
@@ -785,9 +809,31 @@ def _split_live_ranges(
 
             new_bundles.append(bundle)
 
-            # Insert store after bundle for each spilled vreg defined
-            for vreg in bundle_defs:
+            # Insert store(s) after the bundle for each spilled vreg it
+            # defines. A fully-defined vector is saved with one vstore; a
+            # partially-defined vector saves exactly the written lanes with
+            # scalar stores (saving all 8 would store undefined lanes).
+            for vreg, lanes in bundle_def_lanes.items():
                 sp = spilled_vregs[vreg]
+                if sp.is_vector and lanes != set(range(VLEN)):
+                    for lane in sorted(lanes):
+                        addr_b1 = MBundle()
+                        addr_b1.add_instruction(
+                            MachineInst(LIROpcode.CONST, spill_addr_vreg,
+                                        [sp.mem_offset + lane], "load")
+                        )
+                        addr_b2 = MBundle()
+                        addr_b2.add_instruction(
+                            MachineInst(LIROpcode.ADD, spill_addr_vreg,
+                                        [spill_base_vreg, spill_addr_vreg], "alu")
+                        )
+                        store_b = MBundle()
+                        store_b.add_instruction(
+                            MachineInst(LIROpcode.STORE, None,
+                                        [spill_addr_vreg, vreg + lane], "store")
+                        )
+                        new_bundles.extend([addr_b1, addr_b2, store_b])
+                    continue
                 addr_b1 = MBundle()
                 addr_b1.add_instruction(
                     MachineInst(LIROpcode.CONST, spill_addr_vreg, [sp.mem_offset], "load")

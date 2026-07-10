@@ -27,9 +27,9 @@ PASS_REGISTRY = {
     "load-elim": LoadElimPass,
     "dse": DSEPass,
     "tree-level-cache": TreeLevelCachePass,
-    "slsr": SLSRPass,
     "local-mem2reg": LocalMem2RegPass,
     "strip-assume": StripAssumePass,
+    "slsr": SLSRPass,
     "slp-vectorization": SLPVectorizationPass,
     "mad-synthesis": MADSynthesisPass,
     "hir-to-lir": HIRToLIRPass,
@@ -75,7 +75,7 @@ def compile_hir_to_vliw(
     with open(config_path) as f:
         config_data = json.load(f)
 
-    passes_cfg = config_data.get("passes", {})
+    passes_cfg = config_data.setdefault("passes", {})
     inst_sched_enabled = passes_cfg.get("inst-scheduling", {}).get("enabled", False)
 
     # Enforce mutual exclusion: exactly one LIR -> MIR lowering pass enabled
@@ -86,18 +86,20 @@ def compile_hir_to_vliw(
     passes_cfg.setdefault("mir-reg-pressure-profiler", {})
     passes_cfg["mir-reg-pressure-profiler"]["enabled"] = profile_reg_pressure
 
-    # Create pipeline with all passes in order
-    pipeline = CompilerPipeline(
-        print_after_all=print_after_all,
-        print_metrics=print_metrics,
-        print_ddg_after_all=print_ddg_after_all
-    )
-    pipeline.set_config(config_data)
-
     # Build pipeline from config-driven pass list
     pipeline_order = config_data.get("pipeline")
     if pipeline_order is None:
         raise ValueError("pass_config.json missing required 'pipeline' key")
+
+    # Create the pipeline after applying the ordinary driver-controlled config
+    # overrides above. Assumptions are also erased defensively by lowering, so
+    # strip-assume remains an optional early-cleanup optimization.
+    pipeline = CompilerPipeline(
+        print_after_all=print_after_all,
+        print_metrics=print_metrics,
+        print_ddg_after_all=print_ddg_after_all,
+    )
+    pipeline.set_config(config_data)
 
     for pass_name in pipeline_order:
         pass_cls = PASS_REGISTRY.get(pass_name)

@@ -54,6 +54,10 @@ def build_tree_hash_kernel(
        - Wrap index if out of bounds
        - Store updated values back
 
+    The kernel ABI treats ``inp_indices`` as internal traversal state: every
+    entry must be zero at the first pause, and its contents are not observable
+    afterward. Only ``inp_values`` is an output array.
+
     Args:
         forest_height: Height of the forest tree
         n_nodes: Number of nodes in the forest
@@ -101,6 +105,11 @@ def build_tree_hash_kernel(
 
     # First pause (sync with reference_kernel2 first yield)
     b.pause()
+
+    # The kernel ABI asserts that index state is private, already zero here,
+    # and never observed afterward. Generic SROA + Mem2Reg can therefore carry
+    # its slots as SSA values instead of relying on tree-specific rewrites.
+    b.assume_local_memory(inp_indices_p, batch_const)
 
     # Outer loop: rounds
     def round_body(round_i, round_params):
@@ -252,11 +261,6 @@ def do_kernel_test(
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
         ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle

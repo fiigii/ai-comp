@@ -85,6 +85,26 @@ class TestLocalMem2RegPass(unittest.TestCase):
 
         self.assertEqual(machine.mem[0], 17)
 
+    def test_default_pipeline_preserves_dynamic_address_fallback(self):
+        b = HIRBuilder()
+        base = b.load(b.const(10), "base")
+        store_index = b.load(b.const(1), "store_index")
+        load_index = b.load(b.const(2), "load_index")
+        b.assume_local_memory(base, b.const(8))
+        store_address = b.add(base, store_index, "store_address")
+        b.store(store_address, b.const(42))
+        loaded = b.load(b.add(base, load_index), "loaded")
+        b.store(b.const(0), loaded)
+        b.store(store_address, b.const(99))
+
+        memory = [0] * 128
+        memory[1] = 3
+        memory[2] = 3
+        memory[10] = 64
+        machine = _execute(b.build(), memory)
+
+        self.assertEqual(machine.mem[0], 42)
+
     def test_default_pipeline_preserves_retained_if_fallback(self):
         b = HIRBuilder()
         condition = b.load(b.const(1), "condition")

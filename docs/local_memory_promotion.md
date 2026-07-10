@@ -41,10 +41,34 @@ arithmetic; statically out-of-range accesses are preserved likewise.
 
 The pass runs after full unrolling, Simplify, and CSE, but before generic
 LoadElim/DSE. Promoting the complete local region first avoids making those
-memory passes rediscover the same forwarding chains. A default-pipeline
+memory passes rediscover the same forwarding chains. A mandatory
 `strip-assume` pass then removes any marker left behind when promotion is
-disabled, followed immediately by DCE. This placement is a pipeline heuristic
-for the current kernel; the promotion legality rules are program-independent.
+disabled, followed immediately by DCE. TreeLevelCache consumes the resulting
+SSA recurrence. This placement is a pipeline heuristic for the current kernel;
+the promotion legality rules are program-independent.
 If this cleanup pass is disabled or omitted by a custom pipeline, lowering
 still erases the assumption marker defensively; the difference is only that
 dead HIR may survive longer.
+
+## Tree Hash
+
+The tree-hash program declares its index state with:
+
+```python
+b.assume_local_memory(inp_indices_p, b.const(batch_size))
+```
+
+This is also a kernel ABI declaration: every input index must be zero at the
+first pause, and the index array is internal traversal state whose later
+contents are not an output. Only the value array is externally observable.
+
+This replaces two former benchmark-specific actions:
+
+- TreeLevelCache no longer substitutes initial index loads with zero.
+- Default DSE no longer discards the final index stores by header slot.
+
+TreeLevelCache still remains a tree-hash-specific optimization. It does not
+read the local-memory contract or inspect index memory: the general pass first
+exposes a zero-root SSA recurrence, and TreeLevelCache matches that recurrence.
+Its forest preloads are separately guarded by ordinary alias analysis so a
+store through a reloaded forest pointer disables caching.

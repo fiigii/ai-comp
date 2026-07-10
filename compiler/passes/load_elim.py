@@ -130,7 +130,10 @@ class LoadElimPass(Pass):
             elif isinstance(stmt, If):
                 result.append(self._transform_if(stmt, state))
             else:
-                # Halt, Pause
+                # Pause may expose or mutate memory, and Halt terminates the
+                # current observable execution. Neither permits forwarding
+                # memory facts across the boundary.
+                state.reset()
                 result.append(stmt)
 
         return result

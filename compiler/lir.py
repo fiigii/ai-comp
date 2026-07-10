@@ -36,6 +36,7 @@ class LIROpcode(Enum):
 
     # Flow
     SELECT = "select"
+    ADD_IMM = "add_imm"
     JUMP = "jump"
     COND_JUMP = "cond_jump"
     HALT = "halt"
@@ -113,6 +114,13 @@ class InstructionDefUseMixin:
 
         # JUMP operands are labels, not scratch values.
         if self.opcode == LIROpcode.JUMP:
+            return uses
+
+        # ADD_IMM: first operand is a scratch source, second is an immediate.
+        if self.opcode == LIROpcode.ADD_IMM:
+            src = self.operands[0]
+            if isinstance(src, int):
+                uses.add(src)
             return uses
 
         # COND_JUMP: first operand is condition scratch, rest are labels.

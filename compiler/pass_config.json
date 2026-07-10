@@ -39,7 +39,10 @@
         "select_to_mul": true,
         "select_to_alu_mux": false,
         "parity_pattern": true,
-        "add_mul_fold": true
+        "add_mul_fold": true,
+        "range_fold": true,
+        "assoc_fold": true,
+        "mul_dist": true
       }
     },
     "load-elim": {
@@ -57,8 +60,9 @@
     "tree-level-cache": {
       "enabled": true,
       "options": {
-        "levels": 3,
-        "estimate_ops": true
+        "levels": 4,
+        "estimate_ops": true,
+        "post_wrap_levels": 4
       }
     },
     "local-mem2reg": {
@@ -90,13 +94,19 @@
     "inst-scheduling": {
       "enabled": true,
       "options": {
+        "restrict_ptr": true,
         "prefer_load_fill": false,
         "devectorize_valu_to_alu": true,
         "devectorize_vector_ops_to_alu": true,
         "devectorize_vbroadcast_to_alu": true,
         "devectorize_partial_alu_fill": true,
         "prioritize_load_unblock": true,
-        "register_pressure_limit": 0
+        "register_pressure_limit": 0,
+        "stream_stagger": 4,
+        "stream_stagger_bidirectional": true,
+        "static_devectorize_pct": 8,
+        "const_via_flow": true,
+        "const_via_flow_skip": 35
       }
     },
     "mir-reg-pressure-profiler": {

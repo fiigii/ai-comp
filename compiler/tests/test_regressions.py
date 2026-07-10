@@ -538,5 +538,69 @@ class TestCompilerRegressions(unittest.TestCase):
         print("DDG with external operands test passed!")
 
 
+
+
+class TestRegisterAllocatorVectorLanes(unittest.TestCase):
+    """Regression tests for the register allocator vector-lane clobber bug."""
+
+    def _run_program(self, instrs, mem):
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    def test_scalar_not_allocated_inside_live_vector(self):
+        """A vector whose lanes are written by devectorized scalar ops must
+        occupy its full 8-register range from the first lane def onward.
+        Previously only whole-vector defs extended the base interval, so an
+        unrelated scalar temp could be allocated into a live lane and
+        clobber it (observed with stream_stagger schedules on array copy).
+        """
+        import json
+        import os
+        import tempfile
+
+        N = 32
+        base_src, base_dst = 0, 32
+        src_vals = [i * 11 + 1 for i in range(N)]
+
+        b = HIRBuilder()
+        bs = b.const(base_src)
+        bd = b.const(base_dst)
+
+        def body(i, params):
+            as_ = b.add(bs, i, "as")
+            ad = b.add(bd, i, "ad")
+            v = b.load(as_, "v")
+            b.store(ad, v)
+            return []
+
+        from compiler.hir import Const
+        b.for_loop(start=Const(0), end=Const(N), iter_args=[],
+                   body_fn=body, pragma_unroll=0)
+        hir = b.build()
+
+        # Force a staggered schedule (the trigger for the original bug)
+        config_path = os.path.join(os.path.dirname(__file__), "..",
+                                   "pass_config.json")
+        with open(config_path) as f:
+            cfg = json.load(f)
+        cfg["passes"]["inst-scheduling"]["options"]["stream_stagger"] = 6
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as tf:
+            json.dump(cfg, tf)
+            tmp_path = tf.name
+        try:
+            instrs = compile_hir_to_vliw(hir, pass_config=tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        mem = [0] * 128
+        mem[base_src:base_src + N] = src_vals
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[base_dst:base_dst + N], src_vals)
+
+
 if __name__ == "__main__":
     unittest.main()
