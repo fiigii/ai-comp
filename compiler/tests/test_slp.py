@@ -1166,5 +1166,288 @@ class TestSLPPass(unittest.TestCase):
             self.assertEqual(machine.mem[100 + i], i + 1)
 
 
+class TestSLPGatherSeeding(unittest.TestCase):
+    """Tests for gather-load seed packs (_find_gather_seeds).
+
+    Gather-shaped loads (address = base + runtime index, both SSA) cannot be
+    reached bottom-up from consecutive-store seeds, so SLP seeds them
+    directly and codegen emits a vgather (which lowers to VLEN load_offset
+    slots). A seed pack is only legal when no may-aliasing store sits
+    between its first and last element in program order.
+    """
+
+    # Memory layout used by all tests in this class:
+    #   mem[0]     = table_p (base of the gathered table)
+    #   mem[1]     = out_p (base of a disjoint output array)
+    #   mem[8..15] = per-lane indices into the table
+    #   mem[32..]  = table values
+    #   mem[64..]  = output slots
+    TABLE_BASE = 32
+    OUT_BASE = 64
+    IDX_BASE = 8
+    INDICES = [3, 1, 4, 7, 5, 0, 2, 6]
+
+    def _run_program(self, instrs, mem):
+        """Helper to run a compiled program."""
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    @staticmethod
+    def _count_load_offset_slots(instrs):
+        """Count load_offset slots in the VLIW output (vgather lowers to
+        VLEN of them; scalar loads and vloads never produce any)."""
+        count = 0
+        for bundle in instrs:
+            for slot in bundle.get("load", []):
+                if slot and slot[0] == "load_offset":
+                    count += 1
+        return count
+
+    def _make_gather_mem(self):
+        mem = [0] * 128
+        mem[0] = self.TABLE_BASE
+        mem[1] = self.OUT_BASE
+        for k, idx in enumerate(self.INDICES):
+            mem[self.IDX_BASE + k] = idx
+        for i in range(16):
+            mem[self.TABLE_BASE + i] = 100 + 7 * i
+        return mem
+
+    def _build_gather_hir(self):
+        """8 independent gather loads table[idx_k] (distinct runtime
+        indices loaded from memory), then 8 stores to consecutive output
+        slots. Fresh HIR every call: passes mutate ops in place."""
+        b = HIRBuilder()
+        table_p = b.load(b.const(0), "table_p")
+        vals = []
+        for k in range(VLEN):
+            idx = b.load(b.const(self.IDX_BASE + k), f"idx_{k}")
+            addr = b.add(table_p, idx, f"gaddr_{k}")
+            vals.append(b.load(addr, f"gval_{k}"))
+        out_base = b.const(self.OUT_BASE)
+        for k in range(VLEN):
+            out_addr = b.add(out_base, b.const(k), f"oaddr_{k}")
+            b.store(out_addr, vals[k])
+        return b.build()
+
+    def test_slp_gather_seed_forms_vgather_and_executes(self):
+        """Gather-shaped loads are seeded directly into a vgather pack.
+
+        The index chain has no other vectorized consumer, so without
+        gather-load seeding no vgather forms at all (the loads fall back
+        to scalars). Assert the vgather both at the HIR level (standalone
+        pass) and in the VLIW output (load_offset slots), and check all 8
+        gathered outputs under the default pipeline.
+        """
+        from compiler.hir import Op
+
+        # Standalone SLP run: a vgather op must appear in the body.
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        transformed = pm.run(self._build_gather_hir())
+        vgathers = [s for s in transformed.body
+                    if isinstance(s, Op) and s.opcode == "vgather"]
+        self.assertGreaterEqual(len(vgathers), 1,
+            "gather-load seeding should form a vgather pack")
+
+        # End-to-end with the default config (fresh HIR: ops are mutated).
+        instrs = compile_hir_to_vliw(self._build_gather_hir())
+        self.assertGreaterEqual(self._count_load_offset_slots(instrs), VLEN,
+            "vgather should lower to load_offset slots in the VLIW output")
+
+        machine = self._run_program(instrs, self._make_gather_mem())
+        for k, idx in enumerate(self.INDICES):
+            self.assertEqual(machine.mem[self.OUT_BASE + k], 100 + 7 * idx)
+
+    def test_slp_gather_seed_rejects_aliasing_store_in_span(self):
+        """Regression: a may-aliasing store inside the pack span must block
+        the gather seed.
+
+        8x unrolled read-modify-write on table[idx_k] where every idx_k is
+        loaded from memory and all equal 5 at runtime. Fusing the loads
+        into a vgather at the last element's position would hoist earlier
+        lane loads past the intervening stores that alias them, so every
+        lane would read the stale value and table[5] would end up 1.
+        Sequential semantics require table[5] == 8. This miscompiled under
+        the default config before the blocking-store legality check.
+        """
+        b = HIRBuilder()
+        table_p = b.load(b.const(0), "table_p")
+        for k in range(VLEN):
+            idx = b.load(b.const(self.IDX_BASE + k), f"idx_{k}")
+            addr = b.add(table_p, idx, f"addr_{k}")
+            v = b.load(addr, f"val_{k}")
+            v1 = b.add(v, b.const(1), f"inc_{k}")
+            b.store(addr, v1)
+        hir = b.build()
+
+        instrs = compile_hir_to_vliw(hir)
+
+        mem = [0] * 128
+        mem[0] = self.TABLE_BASE
+        for k in range(VLEN):
+            mem[self.IDX_BASE + k] = 5
+        machine = self._run_program(instrs, mem)
+
+        self.assertEqual(machine.mem[self.TABLE_BASE + 5], 8,
+            "read-modify-write chain on one location must not be reordered "
+            "by gather packing")
+        # No other table slot may be touched.
+        for i in range(16):
+            if i != 5:
+                self.assertEqual(machine.mem[self.TABLE_BASE + i], 0)
+
+    def test_slp_gather_seed_allows_non_aliasing_interleaved_stores(self):
+        """Stores proven NO_ALIAS must not block a gather seed.
+
+        Same 8 gather loads, but each load is followed by a store to a
+        different array (base loaded from another header slot; the default
+        config sets restrict_ptr so distinct bases cannot alias). The
+        stores sit inside the pack span, yet the pack must still form:
+        load_offset slots appear and the outputs are correct.
+        """
+        b = HIRBuilder()
+        table_p = b.load(b.const(0), "table_p")
+        out_p = b.load(b.const(1), "out_p")
+        for k in range(VLEN):
+            idx = b.load(b.const(self.IDX_BASE + k), f"idx_{k}")
+            addr = b.add(table_p, idx, f"gaddr_{k}")
+            v = b.load(addr, f"gval_{k}")
+            out_addr = b.add(out_p, b.const(k), f"oaddr_{k}")
+            b.store(out_addr, v)
+        hir = b.build()
+
+        instrs = compile_hir_to_vliw(hir)
+        self.assertGreaterEqual(self._count_load_offset_slots(instrs), VLEN,
+            "interleaved NO_ALIAS stores must not block the gather pack")
+
+        machine = self._run_program(instrs, self._make_gather_mem())
+        for k, idx in enumerate(self.INDICES):
+            self.assertEqual(machine.mem[self.OUT_BASE + k], 100 + 7 * idx)
+
+    def test_slp_gather_seed_rejects_pointer_chase_dependency(self):
+        """Regression: a pack whose addresses transitively depend on another
+        element's loaded value (pointer chasing) must be rejected.
+
+        Each iteration loads table[cur] and derives the next cur from the
+        loaded value (cur = v & 15), so lane k's address depends on lane
+        k-1's load through the '&' op -- a transitive dependency that only
+        addr_depends_on_pack's def-chain walk catches (no operand of the
+        address is directly a pack result). Fusing the loads into a vgather
+        would read all lanes with stale indices. Before the fix in
+        _find_gather_seeds, this repro miscompiled (wrong chase sum) and the
+        VLIW output contained load_offset slots from the illegal vgather.
+        """
+        # Deterministic table of 16 values, each in [0, 15].
+        table = [7, 12, 3, 9, 14, 2, 8, 5, 11, 1, 6, 15, 0, 10, 4, 13]
+
+        b = HIRBuilder()
+        base = b.load(b.const(0))  # table base pointer (16)
+        cur = b.load(b.const(1))   # initial index (3)
+        total = None
+        for k in range(8):
+            a = b.add(base, cur)
+            v = b.load(a)
+            total = v if total is None else b.add(total, v)
+            cur = b.alu("&", v, Const(15))
+        b.store(b.const(2), total)
+        hir = b.build()
+
+        instrs = compile_hir_to_vliw(hir)
+
+        # The pack must be rejected: no vgather, hence no load_offset slots.
+        self.assertEqual(self._count_load_offset_slots(instrs), 0,
+            "pointer-chasing loads must not be fused into a vgather")
+
+        mem = [0] * 64
+        mem[0] = 16
+        mem[1] = 3
+        for i, t in enumerate(table):
+            mem[16 + i] = t
+        machine = self._run_program(instrs, mem)
+
+        # Python model of the sequential chase.
+        model_cur = 3
+        expected = 0
+        for _ in range(8):
+            model_v = table[model_cur]
+            expected += model_v
+            model_cur = model_v & 15
+        self.assertEqual(machine.mem[2], expected,
+            "pointer-chase sum must match sequential semantics")
+
+    def test_slp_gather_seed_blocked_by_same_root_dynamic_store(self):
+        """Regression: a store through the same root pointer with a dynamic
+        index must block a gather seed pack.
+
+        The loads read table[idx_k] (addresses tp+idx_k) and a store to
+        tp+widx sits between lane 3 and lane 4. tp+idx_k and tp+widx have
+        different composite bases but share the tp root, so for dynamic
+        idx_k/widx they may alias. Before the base_roots fix in alias_keys,
+        restrict_ptr treated the differing composite bases as NO_ALIAS, the
+        pack formed, and the fused vgather at the last element's position
+        read lane 2 AFTER the store (idx_2 == widx == 2 at runtime): the
+        sum miscompiled to 1096 instead of 108.
+        """
+        b = HIRBuilder()
+        tp = b.load(b.const(0))     # table pointer (32)
+        widx = b.load(b.const(20))  # dynamic write index (2)
+        vals = []
+        for k in range(8):
+            idx = b.load(b.const(8 + k))
+            a = b.add(tp, idx)
+            v = b.load(a)
+            vals.append(v)
+            if k == 3:
+                wa = b.add(tp, widx)
+                b.store(wa, Const(1000))
+        total = vals[0]
+        for k in range(1, 8):
+            total = b.add(total, vals[k])
+        b.store(b.const(2), total)
+        hir = b.build()
+
+        instrs = compile_hir_to_vliw(hir)
+
+        mem = [0] * 64
+        mem[0] = 32
+        for k in range(8):
+            mem[8 + k] = k          # idx_k = k
+        mem[20] = 2                 # widx = 2 (same slot lane 2 reads)
+        for k in range(8):
+            mem[32 + k] = k + 10    # table values
+        machine = self._run_program(instrs, mem)
+
+        # Lane 2 reads table[2] == 12 BEFORE the store overwrites it with
+        # 1000, so the sequential sum is sum(k+10 for k in 0..7) == 108.
+        self.assertEqual(machine.mem[2], sum(k + 10 for k in range(8)),
+            "loads must not be hoisted past a may-aliasing same-root store")
+        # The store itself must still land.
+        self.assertEqual(machine.mem[34], 1000)
+
+
+class TestSLPTreeHashSmallBatch(unittest.TestCase):
+    """Small-batch tree-hash kernel correctness under the default pipeline.
+
+    With batch sizes below VLEN the traversal degenerates into per-round
+    pointer chases (each round's node load feeds the next round's index),
+    exactly the shape gather-load seeding must reject. do_kernel_test
+    asserts the machine memory against the reference kernel every round;
+    batch_size=1 miscompiled on round 1 before the addr_depends_on_pack
+    fix in _find_gather_seeds.
+    """
+
+    def test_tree_hash_batch_1(self):
+        from programs.tree_hash import do_kernel_test
+        do_kernel_test(3, 8, 1)
+
+    def test_tree_hash_batch_4(self):
+        from programs.tree_hash import do_kernel_test
+        do_kernel_test(3, 8, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

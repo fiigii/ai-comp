@@ -17,7 +17,7 @@ from ..hir import (
     SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, ForLoop, If,
     Halt, Pause, Statement, HIRFunction
 )
-from ..alias_analysis import AliasAnalysis
+from ..alias_analysis import AliasAnalysis, AliasResult
 from ..pass_manager import Pass, PassConfig
 from ..ddg import HIRDDGBuilder, BlockDDGs, DDGNode
 from ..use_def import UseDefContext
@@ -74,6 +74,7 @@ class Pack:
     elements: list[Op]  # Exactly VLEN instructions
     opcode: str         # Common opcode
     is_memory: bool     # True for load/store packs
+    is_gather: bool = False  # True for non-consecutive load packs (vgather)
 
     def __post_init__(self):
         assert len(self.elements) == VLEN, f"Pack must have {VLEN} elements"
@@ -116,6 +117,8 @@ class SLPContext:
     result_to_op: dict[tuple, Op] = field(default_factory=dict)
     # Cache for address base/offset analysis (keyed by _make_cache_key(value))
     addr_analysis_cache: dict[tuple, tuple[Optional[tuple], int]] = field(default_factory=dict)
+    # Program-order position of each op in the current block (id(op) -> idx)
+    op_pos: dict[int, int] = field(default_factory=dict)
 
     def get_node(self, op: Op) -> Optional[DDGNode[Op]]:
         """Get DDG node for an op."""
@@ -332,7 +335,8 @@ class SLPVectorizationPass(Pass):
             ddg=ddg,
             next_vec_ssa_id=self._next_vec_ssa_id,
             next_ssa_id=self._next_ssa_id,
-            result_to_op=result_to_op
+            result_to_op=result_to_op,
+            op_pos={id(op): i for i, op in enumerate(ops)}
         )
 
         # Phase 1: Find seeds from DDG store roots
@@ -372,23 +376,167 @@ class SLPVectorizationPass(Pass):
 
     def _find_seeds_from_ddg(self, ops: list[Op], ctx: SLPContext) -> list[Pack]:
         """
-        Find seed packs from DDG roots (stores with no users).
-
-        Only uses stores as seeds to ensure we work backwards from data sinks.
+        Find seed packs from DDG roots (stores with no users) and from
+        gather-load groups.
         """
         seeds = []
 
         # Find all store operations (DDG roots - no users)
         stores = [op for op in ops if op.opcode == "store"]
 
-        if len(stores) < VLEN:
-            return seeds
+        if len(stores) >= VLEN:
+            # Group stores by base address pattern and find consecutive groups
+            store_seeds = self._find_consecutive_ops(stores, ctx)
+            seeds.extend(store_seeds)
 
-        # Group stores by base address pattern and find consecutive groups
-        store_seeds = self._find_consecutive_ops(stores, ctx)
-        seeds.extend(store_seeds)
+        # Gather-load seeds: groups of VLEN loads from the same base with
+        # varying (non-constant) offsets. These cannot be reached bottom-up
+        # from store seeds when the index chain feeding the addresses has no
+        # other vectorized consumer, so seed them directly. The address chain
+        # then vectorizes via normal pack extension and codegen emits vgather.
+        if self._gather and self._vectorize_memory:
+            seeds.extend(self._find_gather_seeds(ops, ctx))
 
         return seeds
+
+    def _find_gather_seeds(self, ops: list[Op], ctx: SLPContext) -> list[Pack]:
+        """Find gather-load seed packs.
+
+        A gather load has address `+(base, offset)` where both operands are
+        SSA values. The base is disambiguated by frequency: the operand that
+        repeats across many loads is the base, the per-lane varying operand
+        is the offset. Loads are grouped VLEN at a time in program order,
+        which matches the lane grouping of batch-order unrolled code.
+
+        Legality: the fused vgather is emitted at the last pack element's
+        position, which moves earlier lane loads past everything in between.
+        A pack is rejected when
+        - its element span contains a store the alias analysis cannot prove
+          disjoint from the loads (a may-aliasing store must not be
+          crossed), or
+        - any element's address depends (transitively) on another element's
+          loaded value (e.g. pointer chasing): the fused gather reads all
+          lanes simultaneously, which would break that dependency.
+        """
+        op_pos: dict[int, int] = {id(op): i for i, op in enumerate(ops)}
+        store_positions = [i for i, op in enumerate(ops)
+                           if op.opcode in ("store", "vstore")]
+
+        def addr_depends_on_pack(pack_ops: list[Op]) -> bool:
+            """True if any element's address chain reaches another element's
+            loaded value. Walks def chains, pruned at ops defined before the
+            pack's first element (those cannot depend on pack results)."""
+            results = {op.result for op in pack_ops if op.result is not None}
+            first_pos = min(op_pos[id(op)] for op in pack_ops)
+            seen: set = set()
+            stack = [op.operands[0] for op in pack_ops]
+            while stack:
+                v = stack.pop()
+                if not isinstance(v, SSAValue) or v in seen:
+                    continue
+                seen.add(v)
+                if v in results:
+                    return True
+                def_node = ctx.get_def_node(v)
+                if def_node is None:
+                    continue
+                d = def_node.instruction
+                pos = op_pos.get(id(d))
+                if pos is None or pos < first_pos:
+                    continue
+                stack.extend(o for o in d.operands if isinstance(o, SSAValue))
+            return False
+
+        def blocking_store_in_span(lo: int, hi: int, pack_ops: list[Op]) -> bool:
+            """True if any store between the pack's elements may alias any
+            of the pack's loads (crossing it would be illegal)."""
+            from bisect import bisect_left, bisect_right
+            load_keys = None
+            for k in range(bisect_right(store_positions, lo),
+                           bisect_left(store_positions, hi)):
+                store = ops[store_positions[k]]
+                store_key = self._alias.normalize(store.operands[0])
+                if store_key is None:
+                    return True
+                store_width = VLEN if store.opcode == "vstore" else 1
+                if load_keys is None:
+                    load_keys = [self._alias.normalize(op.operands[0])
+                                 for op in pack_ops]
+                for load_key in load_keys:
+                    if load_key is None:
+                        return True
+                    if self._alias.alias_keys(load_key, 1, store_key,
+                                              store_width) != AliasResult.NO_ALIAS:
+                        return True
+            return False
+
+        candidates: list[tuple[Op, Op]] = []
+        operand_freq: dict[tuple, int] = {}
+        for op in ops:
+            if op.opcode != "load" or op.result is None:
+                continue
+            if id(op) in ctx.packed_ops:
+                continue
+            addr = op.operands[0]
+            if not isinstance(addr, SSAValue):
+                continue
+            addr_node = ctx.get_def_node(addr)
+            if addr_node is None or addr_node.instruction.opcode != "+":
+                continue
+            addr_op = addr_node.instruction
+            if len(addr_op.operands) != 2:
+                continue
+            a, b = addr_op.operands
+            if not (isinstance(a, SSAValue) and isinstance(b, SSAValue)):
+                # Const offsets are consecutive-load / vload territory
+                continue
+            candidates.append((op, addr_op))
+            for operand in (a, b):
+                key = _make_cache_key(operand)
+                operand_freq[key] = operand_freq.get(key, 0) + 1
+
+        if len(candidates) < VLEN:
+            return []
+
+        # Group loads by their (frequency-chosen) base, in program order.
+        # When neither operand repeats across loads (e.g. strength-reduced
+        # address chains where every operand is per-lane unique), fall back
+        # to grouping consecutive gather-shaped loads in program order,
+        # which matches the lane order of batch-unrolled code.
+        groups: dict[tuple, list[Op]] = {}
+        group_order: list[tuple] = []
+        for op, addr_op in candidates:
+            a, b = addr_op.operands
+            fa = operand_freq[_make_cache_key(a)]
+            fb = operand_freq[_make_cache_key(b)]
+            if fa != fb and operand_freq[_make_cache_key(a if fa > fb else b)] >= VLEN:
+                key = _make_cache_key(a if fa > fb else b)
+            else:
+                key = ("__seq__",)
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(op)
+
+        packs: list[Pack] = []
+        for key in group_order:
+            group = groups[key]
+            for start in range(0, len(group) - VLEN + 1, VLEN):
+                pack_ops = group[start:start + VLEN]
+                if any(id(op) in ctx.packed_ops for op in pack_ops):
+                    continue
+                positions = [op_pos[id(op)] for op in pack_ops]
+                if blocking_store_in_span(min(positions), max(positions), pack_ops):
+                    continue
+                if addr_depends_on_pack(pack_ops):
+                    continue
+                pack = Pack(elements=pack_ops, opcode="load",
+                            is_memory=True, is_gather=True)
+                packs.append(pack)
+                ctx.packs.append(pack)
+                for op in pack_ops:
+                    ctx.packed_ops.add(id(op))
+        return packs
 
     def _find_consecutive_ops(
         self,
@@ -510,8 +658,9 @@ class SLPVectorizationPass(Pass):
             num_operands = len(pack.elements[0].operands)
 
             for operand_idx in range(num_operands):
-                # Skip address operand for memory ops
-                if pack.is_memory and operand_idx == 0:
+                # Skip address operand for memory ops (except gathers, whose
+                # per-lane address chain is exactly what we want to vectorize)
+                if pack.is_memory and operand_idx == 0 and not pack.is_gather:
                     continue
 
                 # Collect operand definitions via DDG
@@ -608,6 +757,9 @@ class SLPVectorizationPass(Pass):
         if not self._can_form_pack(ops, ctx):
             return None
 
+        if self._pack_elements_interdependent(ops, ctx):
+            return None
+
         opcode = ops[0].opcode
         pack = Pack(elements=list(ops), opcode=opcode, is_memory=False)
 
@@ -615,6 +767,39 @@ class SLPVectorizationPass(Pass):
             ctx.packed_ops.add(id(op))
 
         return pack
+
+    def _pack_elements_interdependent(self, ops: list[Op], ctx: SLPContext) -> bool:
+        """True if any element depends (transitively) on another element's
+        result. A vector op executes all lanes simultaneously, so such a
+        pack is illegal (e.g. chained recurrences x2 = f(x1) grouped by
+        isomorphism across loop rounds).
+
+        The def-chain walk prunes at ops positioned before the earliest
+        pack element: they cannot depend on any element's result.
+        """
+        results = {op.result for op in ops if op.result is not None}
+        positions = [ctx.op_pos.get(id(op)) for op in ops]
+        if any(p is None for p in positions):
+            return True  # unknown positions: be conservative
+        min_pos = min(positions)
+        seen: set = set()
+        stack = [o for op in ops for o in op.operands if isinstance(o, SSAValue)]
+        while stack:
+            v = stack.pop()
+            if v in seen:
+                continue
+            seen.add(v)
+            if v in results:
+                return True
+            def_node = ctx.get_def_node(v)
+            if def_node is None:
+                continue
+            d = def_node.instruction
+            pos = ctx.op_pos.get(id(d))
+            if pos is None or pos < min_pos:
+                continue
+            stack.extend(o for o in d.operands if isinstance(o, SSAValue))
+        return False
 
     def _is_legal_pack(self, pack: Pack, ctx: SLPContext) -> bool:
         """
@@ -871,6 +1056,8 @@ class SLPVectorizationPass(Pass):
         if opcode == "store":
             return self._generate_vstore(pack, ctx, pack_results, hir)
         elif opcode == "load":
+            if pack.is_gather:
+                return self._generate_vgather_pack(pack, ctx, pack_results, hir)
             return self._generate_vload(pack, ctx, pack_results, hir)
         elif opcode in VECTORIZABLE_ALU_OPS:
             return self._generate_valu_op(pack, ctx, pack_results, hir)
@@ -918,6 +1105,39 @@ class SLPVectorizationPass(Pass):
             opcode="vload",
             result=vec_result,
             operands=[base_addr],
+            engine="load"
+        )
+
+    def _generate_vgather_pack(
+        self,
+        pack: Pack,
+        ctx: SLPContext,
+        pack_results: dict[int, VectorSSAValue],
+        hir: HIRFunction
+    ) -> Optional[Op]:
+        """Generate a vgather for a gather-load pack.
+
+        The per-lane addresses resolve to a vector (usually the result of a
+        vectorized address-add pack; vinsert fallback otherwise), and the
+        gather lowers to VLEN load_offset slots.
+        """
+        vec_addrs = self._get_vector_operand(pack, 0, ctx, pack_results, hir)
+        if vec_addrs is None:
+            return None
+
+        vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vgather_result")
+        ctx.next_vec_ssa_id += 1
+
+        for lane, op in enumerate(pack.elements):
+            if op.result:
+                ctx.scalar_to_vector[op.result] = (vec_result, lane)
+
+        pack_results[hash(pack)] = vec_result
+
+        return Op(
+            opcode="vgather",
+            result=vec_result,
+            operands=[vec_addrs],
             engine="load"
         )
 
