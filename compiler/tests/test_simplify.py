@@ -18,6 +18,14 @@ from compiler import (
 from compiler.hir import Const, Op, ForLoop, If
 
 
+def _find_def(body, ssa):
+    """Find the Op in a flat body that defines the given SSA value."""
+    for stmt in body:
+        if isinstance(stmt, Op) and stmt.result == ssa:
+            return stmt
+    return None
+
+
 def _count_opcode(body, opcode: str) -> int:
     count = 0
     for stmt in body:
@@ -870,8 +878,8 @@ class TestRangeFold(SimplifyOptionTestBase):
 
         self.assertEqual(_count_opcode(out.body, "<"), 0,
                          "range_fold should fold both provable compares")
-        # (Collapsing the selects on the now-constant conditions is a
-        # separate select-folding feature, tested with it.)
+        self.assertEqual(_count_opcode(out.body, "select"), 0,
+                         "selects on folded conditions should collapse")
         metrics = p.get_metrics()
         self.assertGreaterEqual(metrics.custom["ranges_folded"], 2)
 
@@ -889,6 +897,230 @@ class TestRangeFold(SimplifyOptionTestBase):
         hir = self._build()
         out, _ = self._run_simplify(hir, range_fold=False)
         self.assertEqual(_count_opcode(out.body, "<"), 2)
+
+
+class TestAssocFold(SimplifyOptionTestBase):
+    """Tests for the assoc_fold constant-chain option."""
+
+    def test_assoc_fold_add_chain(self):
+        """((x + 5) + 7) folds to a single x + 12."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        t1 = b.add(x, b.const(5), "t1")
+        y = b.add(t1, b.const(7), "y")
+        b.store(b.const(1), y)
+        hir = b.build()
+
+        out, p = self._run_simplify(hir, assoc_fold=True)
+
+        y_def = _find_def(out.body, y)
+        self.assertIsNotNone(y_def)
+        self.assertEqual(y_def.opcode, "+")
+        self.assertEqual(y_def.operands, [x, Const(12)])
+        self.assertGreaterEqual(p.get_metrics().custom["assoc_folds"], 1)
+
+        instrs = compile_hir_to_vliw(out)
+        mem = [0] * 16
+        mem[0] = 30
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], 42)
+
+    def test_assoc_fold_xor_chain(self):
+        """((x ^ 0xF0) ^ 0x0F) folds to a single x ^ 0xFF."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        t1 = b.xor(x, b.const(0xF0), "t1")
+        y = b.xor(t1, b.const(0x0F), "y")
+        b.store(b.const(1), y)
+        hir = b.build()
+
+        out, p = self._run_simplify(hir, assoc_fold=True)
+
+        y_def = _find_def(out.body, y)
+        self.assertIsNotNone(y_def)
+        self.assertEqual(y_def.opcode, "^")
+        self.assertEqual(y_def.operands, [x, Const(0xFF)])
+        self.assertGreaterEqual(p.get_metrics().custom["assoc_folds"], 1)
+
+        instrs = compile_hir_to_vliw(out)
+        mem = [0] * 16
+        mem[0] = 0xAA
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], 0xAA ^ 0xFF)
+
+
+class TestMulDist(SimplifyOptionTestBase):
+    """Tests for the mul_dist distribution option."""
+
+    def _build_hash_stage_shape(self):
+        """(x*33 + 100) << 9, the hash stage 2+3 fusion shape."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        t = b.mul(x, b.const(33), "t")
+        v = b.add(t, b.const(100), "v")
+        z = b.shl(v, b.const(9), "z")
+        b.store(b.const(1), z)
+        return b.build(), x, z
+
+    def test_mul_dist_shift_of_mul_add(self):
+        """(x*33 + 100) << 9 rewrites to x*16896 + (100 << 9)."""
+        hir, x, z = self._build_hash_stage_shape()
+        out, p = self._run_simplify(hir, mul_dist=True, assoc_fold=True)
+
+        z_def = _find_def(out.body, z)
+        self.assertIsNotNone(z_def)
+        self.assertEqual(z_def.opcode, "+")
+        temp, addend = z_def.operands
+        self.assertEqual(addend, Const(100 << 9))
+        temp_def = _find_def(out.body, temp)
+        self.assertIsNotNone(temp_def)
+        self.assertEqual(temp_def.opcode, "*")
+        self.assertEqual(temp_def.operands, [x, Const(33 * (1 << 9))])
+        self.assertGreaterEqual(p.get_metrics().custom["mul_dists"], 1)
+
+        # Fresh HIR through the default pipeline (mul_dist enabled there)
+        fresh, _, _ = self._build_hash_stage_shape()
+        instrs = compile_hir_to_vliw(fresh)
+        mem = [0] * 16
+        mem[0] = 7
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], ((7 * 33 + 100) << 9) & 0xFFFFFFFF)
+
+    def _build_const_shifted_by_var(self):
+        """z = Const(2) << (x + 3): shift with constant LEFT operand."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        y = b.add(x, b.const(3), "y")
+        z = b.alu("<<", b.const(2), y, "z")
+        b.store(b.const(1), z)
+        return b.build()
+
+    def test_mul_dist_shift_const_left_operand_regression(self):
+        """Regression: shifts are not commutative. mul_dist must not treat
+        Const(2) << (x + 3) as (x + 3) shifted by 2 (was a miscompile)."""
+        hir = self._build_const_shifted_by_var()
+        out, p = self._run_simplify(hir, mul_dist=True, assoc_fold=True)
+
+        # The shift must survive untouched (constant is the left operand)
+        self.assertEqual(_count_opcode(out.body, "<<"), 1)
+        self.assertEqual(p.get_metrics().custom["mul_dists"], 0)
+
+        instrs = compile_hir_to_vliw(out)
+        mem = [0] * 16
+        mem[0] = 2
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], 64)  # 2 << (2 + 3)
+
+        # Fresh HIR through the default pipeline must also compute 64
+        fresh = self._build_const_shifted_by_var()
+        instrs = compile_hir_to_vliw(fresh)
+        mem = [0] * 16
+        mem[0] = 2
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], 64)
+
+    def _build_multi_use_add(self):
+        """v = x + 100 with two uses: z1 = v << 2 and z2 = v + 1."""
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        v = b.add(x, b.const(100), "v")
+        z1 = b.shl(v, b.const(2), "z1")
+        z2 = b.add(v, b.const(1), "z2")
+        b.store(b.const(1), z1)
+        b.store(b.const(2), z2)
+        return b.build()
+
+    def test_mul_dist_multi_use_no_duplication(self):
+        """mul_dist must not fire when the inner add has multiple uses,
+        which would duplicate the computation."""
+        hir = self._build_multi_use_add()
+        ops_before = len([s for s in hir.body if isinstance(s, Op)])
+
+        out, p = self._run_simplify(hir, mul_dist=True, assoc_fold=True)
+
+        # z1 is processed while v still has 2 uses, so mul_dist must skip
+        self.assertEqual(p.get_metrics().custom["mul_dists"], 0)
+        # No rewrite in this program adds ops; duplication would add one
+        ops_after = len([s for s in out.body if isinstance(s, Op)])
+        self.assertLessEqual(ops_after, ops_before)
+
+        # Fresh HIR through the default pipeline: both results correct
+        fresh = self._build_multi_use_add()
+        instrs = compile_hir_to_vliw(fresh)
+        mem = [0] * 16
+        mem[0] = 5
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], (5 + 100) << 2)
+        self.assertEqual(machine.mem[2], (5 + 100) + 1)
+
+
+class TestSelectConstCondFold(SimplifyOptionTestBase):
+    """Tests for folding select with a constant condition."""
+
+    def test_select_const_cond_folds(self):
+        """select(Const(1), a, b) -> a and select(Const(0), a, b) -> b."""
+        b = HIRBuilder()
+        a = b.load(b.const(0), "a")
+        c = b.load(b.const(1), "c")
+        s1 = b.select(b.const(1), a, c, "s1")
+        s2 = b.select(b.const(0), a, c, "s2")
+        b.store(b.const(2), s1)
+        b.store(b.const(3), s2)
+        hir = b.build()
+
+        out, p = self._run_simplify(hir)
+
+        self.assertEqual(_count_opcode(out.body, "select"), 0)
+        stores = [s for s in out.body
+                  if isinstance(s, Op) and s.opcode == "store"]
+        self.assertEqual(len(stores), 2)
+        # Uses of s1/s2 must have been rewired to the chosen operands
+        self.assertEqual(stores[0].operands, [Const(2), a])
+        self.assertEqual(stores[1].operands, [Const(3), c])
+        self.assertEqual(p.get_metrics().custom["selects_const_folded"], 2)
+
+        instrs = compile_hir_to_vliw(out)
+        mem = [0] * 16
+        mem[0] = 42
+        mem[1] = 99
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[2], 42)
+        self.assertEqual(machine.mem[3], 99)
+
+
+
+class TestU32ConstantSemantics(SimplifyOptionTestBase):
+    """Constant reads must match the VM, which reduces every value mod 2**32
+    (const immediates included)."""
+
+    def _store_operand(self, body):
+        stores = [s for s in body if isinstance(s, Op) and s.opcode == "store"]
+        self.assertEqual(len(stores), 1)
+        return stores[0].operands[1]
+
+    def test_select_const_cond_masks_to_u32(self):
+        # Const(2**32) is 0 on the VM: the select must fold to the FALSE arm.
+        b = HIRBuilder()
+        sel = b.select(b.const(1 << 32), b.const(11), b.const(22), "sel")
+        b.store(b.const(3), sel)
+        out, _ = self._run_simplify(b.build())
+        self.assertEqual(self._store_operand(out.body), Const(22))
+
+    def test_compare_folding_masks_to_u32(self):
+        # 2**32 < 1 folds as 0 < 1 == 1 under VM semantics.
+        b = HIRBuilder()
+        c = b.lt(b.const(1 << 32), b.const(1), "c")
+        b.store(b.const(3), c)
+        out, _ = self._run_simplify(b.build())
+        self.assertEqual(self._store_operand(out.body), Const(1))
+
+    def test_shift_amount_masks_to_u32(self):
+        # (2**32 + 3) as a shift amount behaves like 3 on the VM.
+        b = HIRBuilder()
+        r = b.shr(b.const(64), b.const((1 << 32) + 3), "r")
+        b.store(b.const(3), r)
+        out, _ = self._run_simplify(b.build())
+        self.assertEqual(self._store_operand(out.body), Const(8))
 
 
 class TestStructuredRangeConsumption(SimplifyOptionTestBase):
@@ -928,8 +1160,9 @@ class TestStructuredRangeConsumption(SimplifyOptionTestBase):
 
         loops = [s for s in out.body if isinstance(s, ForLoop)]
         self.assertEqual(len(loops), 1)
-        self.assertEqual(_count_opcode(loops[0].body, "<"), 0,
-                         "provably-true guard must fold inside the loop")
+        self.assertEqual(_count_opcode(loops[0].body, "select"), 0,
+                         "provably-true guard select must fold inside the loop")
+        self.assertEqual(_count_opcode(loops[0].body, "<"), 0)
         # The provably-true compare folds via ranges; the select then
         # collapses via const-cond folding (counted separately).
         self.assertGreaterEqual(p.get_metrics().custom["ranges_folded"], 1)

@@ -58,8 +58,18 @@ class SimplifyPass(Pass):
         self._parity_patterns = 0
         self._add_mul_folds = 0
         self._ranges_folded = 0
+        self._selects_const_folded = 0
+        self._assoc_folds = 0
+        self._mul_dists = 0
         # Value ranges computed by RangeAnalysis (range_fold option)
         self._range: Optional[RangeAnalysis] = None
+        # Defs emitted so far in this run (fresher than the use-def context,
+        # which is built once at run start). Any def, stale or fresh, is
+        # semantically valid to pattern-match against because rewrites
+        # preserve value; the fresh map just exposes more patterns.
+        self._local_defs: dict[SSAValue, Op] = {}
+        # Per-run adjustments to use counts for uses removed by rewrites
+        self._use_adjust: dict[SSAValue, int] = {}
         # SSA values known to be boolean (0 or 1) - from comparisons or & 1
         self._boolean_values: set[SSAValue] = set()
         # Maps SSA value -> the SSA value it's negated from (for ==(x, 0) where x is boolean)
@@ -86,7 +96,12 @@ class SimplifyPass(Pass):
         self._parity_patterns = 0
         self._add_mul_folds = 0
         self._ranges_folded = 0
+        self._selects_const_folded = 0
+        self._assoc_folds = 0
+        self._mul_dists = 0
         self._range = None
+        self._local_defs = {}
+        self._use_adjust = {}
         self._boolean_values = set()
         self._negated_boolean = {}
 
@@ -100,6 +115,8 @@ class SimplifyPass(Pass):
             "parity_pattern": config.options.get("parity_pattern", True),
             "add_mul_fold": config.options.get("add_mul_fold", True),
             "range_fold": config.options.get("range_fold", False),
+            "assoc_fold": config.options.get("assoc_fold", False),
+            "mul_dist": config.options.get("mul_dist", False),
         }
 
         # Check if pass is enabled
@@ -129,6 +146,9 @@ class SimplifyPass(Pass):
                 "parity_patterns": self._parity_patterns,
                 "add_mul_folds": self._add_mul_folds,
                 "ranges_folded": self._ranges_folded,
+                "selects_const_folded": self._selects_const_folded,
+                "assoc_folds": self._assoc_folds,
+                "mul_dists": self._mul_dists,
             }
 
         return HIRFunction(
@@ -149,8 +169,13 @@ class SimplifyPass(Pass):
                     continue
                 if isinstance(transformed, list):
                     result.extend(transformed)
+                    for t in transformed:
+                        if isinstance(t, Op) and t.result is not None:
+                            self._local_defs[t.result] = t
                 else:
                     result.append(transformed)
+                    if transformed.result is not None:
+                        self._local_defs[transformed.result] = transformed
             elif isinstance(stmt, ForLoop):
                 result.append(self._transform_for_loop(stmt))
             elif isinstance(stmt, If):
@@ -196,6 +221,23 @@ class SimplifyPass(Pass):
                 self._constants_folded += 1
                 self._use_def_ctx.replace_all_uses(op.result, Const(folded), auto_invalidate=False)
                 return None
+
+        # Associative constant chain fold: op(op(x, C1), C2) -> op(x, C1?C2)
+        if self._opts.get("assoc_fold", False):
+            folded_op = self._try_assoc_fold(op)
+            if folded_op is not None:
+                self._assoc_folds += 1
+                return folded_op
+
+        # Multiply distribution over add-const: (x + C1) * K -> x*K + C1*K.
+        # Also matches << by constant (shift = multiply by power of two).
+        # This exposes multiply_add fusion across hash stages and shortens
+        # the dependency chain.
+        if self._opts.get("mul_dist", False):
+            dist_ops = self._try_mul_dist(op)
+            if dist_ops is not None:
+                self._mul_dists += 1
+                return dist_ops
 
         # Try algebraic identity simplifications (returns op, metric_type)
         simplified, metric_type = self._try_simplify_identity(op.opcode, left, right, op.result)
@@ -245,13 +287,15 @@ class SimplifyPass(Pass):
     def _get_const_value(self, operand: Value) -> Optional[int]:
         """Get constant value if operand is a known constant."""
         if isinstance(operand, Const):
-            return operand.value
+            # The VM reduces every value mod 2**32 (const immediates
+            # included), so folding must read constants the same way.
+            return operand.value & 0xFFFFFFFF
         return None
 
     def _is_boolean(self, operand: Value) -> bool:
         """Check if operand is known to be boolean (0 or 1)."""
         if isinstance(operand, Const):
-            return operand.value in (0, 1)
+            return (operand.value & 0xFFFFFFFF) in (0, 1)
         if isinstance(operand, SSAValue):
             if operand in self._boolean_values:
                 return True
@@ -368,6 +412,121 @@ class SimplifyPass(Pass):
 
         return None, None
 
+    _ASSOC_COMBINE = {
+        "+": lambda a, b: (a + b) & 0xFFFFFFFF,
+        "*": lambda a, b: (a * b) & 0xFFFFFFFF,
+        "^": lambda a, b: a ^ b,
+        "&": lambda a, b: a & b,
+        "|": lambda a, b: a | b,
+    }
+
+    def _lookup_def(self, ssa: Value) -> Optional[Op]:
+        """Find the defining op of an SSA value.
+
+        Prefers defs (re)emitted earlier in this run; falls back to the
+        use-def context built at run start. Stale defs are semantically
+        equivalent (rewrites preserve value), so either source is sound.
+        """
+        if not isinstance(ssa, SSAValue):
+            return None
+        local = self._local_defs.get(ssa)
+        if local is not None:
+            return local
+        def_loc = self._use_def_ctx.get_def(ssa)
+        if def_loc is not None and isinstance(def_loc.statement, Op):
+            return def_loc.statement
+        return None
+
+    def _effective_use_count(self, ssa: SSAValue) -> int:
+        """Use count adjusted for uses removed by rewrites in this run.
+
+        The use-def context is built once at run start; rewrites like
+        assoc_fold rewire a user away from a value without updating it.
+        """
+        return self._use_def_ctx.use_count(ssa) + self._use_adjust.get(ssa, 0)
+
+    def _note_use_removed(self, ssa: Value) -> None:
+        if isinstance(ssa, SSAValue):
+            self._use_adjust[ssa] = self._use_adjust.get(ssa, 0) - 1
+
+    def _try_assoc_fold(self, op: Op) -> Optional[Op]:
+        """op(op(x, C1), C2) -> op(x, C1 combined C2) for associative ops."""
+        combine = self._ASSOC_COMBINE.get(op.opcode)
+        if combine is None:
+            return None
+        var, c2 = self._extract_var_const(op)
+        if var is None:
+            return None
+        inner = self._lookup_def(var)
+        if inner is None or inner.opcode != op.opcode:
+            return None
+        x, c1 = self._extract_var_const(inner)
+        if x is None:
+            return None
+        self._note_use_removed(var)
+        return Op(op.opcode, op.result, [x, Const(combine(c1, c2))], op.engine)
+
+    @staticmethod
+    def _shift_var_const(op: Op) -> tuple[Optional[SSAValue], Optional[int]]:
+        """Split a '<<' op into (value, shift amount). Shifts are NOT
+        commutative: the constant must be the right operand."""
+        if len(op.operands) != 2:
+            return None, None
+        val, amt = op.operands
+        if (isinstance(val, SSAValue) and isinstance(amt, Const)
+                and 0 <= (amt.value & 0xFFFFFFFF) < 32):
+            return val, amt.value & 0xFFFFFFFF
+        return None, None
+
+    def _try_mul_dist(self, op: Op) -> Optional[list[Op]]:
+        """(x + C1) * K -> x' * K' + (C1*K), looking through x = a * K2.
+
+        Matches outer '*' by Const or '<<' by Const (as multiply by 2**s).
+        Enables cross-stage multiply_add fusion, e.g. hash stages 2+3:
+        ((a*33 + C2) << 9) becomes a*16896 + (C2<<9).
+
+        Only fires when the inner add has a single (remaining) use, so the
+        rewrite never duplicates the computation.
+        """
+        if op.opcode == "*":
+            v, k = self._extract_var_const(op)
+        elif op.opcode == "<<":
+            v, s = self._shift_var_const(op)
+            k = None if s is None else (1 << s)
+        else:
+            return None
+        if v is None or k is None:
+            return None
+        inner = self._lookup_def(v)
+        if inner is None or inner.opcode != "+":
+            return None
+        if self._effective_use_count(v) > 1:
+            return None
+        x, c1 = self._extract_var_const(inner)
+        if x is None:
+            return None
+
+        # Look through x = a * K2 to fold the two multiplies directly
+        mul_src, mul_k = x, k
+        x_def = self._lookup_def(x)
+        if x_def is not None and x_def.opcode == "*":
+            a, k2 = self._extract_var_const(x_def)
+            if a is not None and k2 is not None:
+                mul_src = a
+                mul_k = (k2 * k) & 0xFFFFFFFF
+        elif x_def is not None and x_def.opcode == "<<":
+            a, s2 = self._shift_var_const(x_def)
+            if a is not None and s2 is not None:
+                mul_src = a
+                mul_k = ((1 << s2) * k) & 0xFFFFFFFF
+
+        self._note_use_removed(v)
+        temp = self._new_temp("mdist")
+        return [
+            Op("*", temp, [mul_src, Const(mul_k)], "alu"),
+            Op("+", op.result, [temp, Const((c1 * k) & 0xFFFFFFFF)], "alu"),
+        ]
+
     def _try_fold_add_mul(self, op: Op) -> Optional[list[Op]]:
         """Try to fold (a + C) + (a * K) -> a * (K+1) + C.
 
@@ -381,16 +540,10 @@ class SimplifyPass(Pass):
         if not isinstance(left, SSAValue) or not isinstance(right, SSAValue):
             return None
 
-        left_def = self._use_def_ctx.get_def(left)
-        right_def = self._use_def_ctx.get_def(right)
+        left_stmt = self._lookup_def(left)
+        right_stmt = self._lookup_def(right)
 
-        if left_def is None or right_def is None:
-            return None
-
-        left_stmt = left_def.statement
-        right_stmt = right_def.statement
-
-        if not isinstance(left_stmt, Op) or not isinstance(right_stmt, Op):
+        if left_stmt is None or right_stmt is None:
             return None
 
         # Try both orderings: (add_side, mul_side)
@@ -449,6 +602,15 @@ class SimplifyPass(Pass):
         """Try to simplify select operations."""
         cond, true_val, false_val = op.operands
         result = op.result
+
+        # select(Const c, a, b) -> a if c != 0 else b
+        if self._opts.get("constant_folding", True):
+            cond_const = self._get_const_value(cond)
+            if cond_const is not None:
+                chosen = true_val if cond_const != 0 else false_val
+                self._selects_const_folded += 1
+                self._use_def_ctx.replace_all_uses(result, chosen, auto_invalidate=False)
+                return []
 
         true_const = self._get_const_value(true_val)
         false_const = self._get_const_value(false_val)
