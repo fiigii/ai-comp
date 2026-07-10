@@ -61,6 +61,7 @@ from .use_def import UseDefContext, DefLocation, UseLocation
 
 # Alias analysis
 from .alias_analysis import AliasAnalysis, AliasResult, AddrKey
+from .range_analysis import RangeAnalysis, FULL_RANGE
 
 # Data Dependency Graph
 from .ddg import (
@@ -129,6 +130,7 @@ __all__ = [
     'UseDefContext', 'DefLocation', 'UseLocation',
     # Alias analysis
     'AliasAnalysis', 'AliasResult', 'AddrKey',
+    'RangeAnalysis', 'FULL_RANGE',
     # Data Dependency Graph
     'DDGNode', 'DataDependencyDAG', 'BlockDDGs', 'DDGBuilder',
     'HIRDDGBuilder', 'LIRDDGBuilder',

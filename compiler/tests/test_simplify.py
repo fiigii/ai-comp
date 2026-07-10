@@ -15,7 +15,7 @@ from compiler import (
     SimplifyPass,
     count_statements,
 )
-from compiler.hir import Op, ForLoop, If
+from compiler.hir import Const, Op, ForLoop, If
 
 
 def _count_opcode(body, opcode: str) -> int:
@@ -821,6 +821,118 @@ class TestSimplifyPass(unittest.TestCase):
         self.assertGreater(metrics.custom["add_mul_folds"], 0)
         print(f"Add-mul fold metrics: {metrics.custom}")
         print("Add-mul fold metrics test passed!")
+
+
+class SimplifyOptionTestBase(unittest.TestCase):
+    """Shared helpers for tests of individual SimplifyPass options."""
+
+    def _run_program(self, instrs, mem):
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    def _run_simplify(self, hir, **options):
+        """Run SimplifyPass standalone with the given options.
+
+        Returns (transformed_hir, pass_instance). Note: the pass mutates
+        ops of the input HIR in place; callers that also want to compile
+        end-to-end must rebuild the HIR with a fresh builder.
+        """
+        p = SimplifyPass()
+        cfg = PassConfig(name="simplify", enabled=True, options=options)
+        return p.run(hir, cfg), p
+
+
+class TestRangeFold(SimplifyOptionTestBase):
+    """Tests for the range_fold interval-analysis option."""
+
+    def _build(self):
+        b = HIRBuilder()
+        addr_in = b.const(0)
+        addr_out = b.const(1)
+        x = b.load(addr_in, "x")
+        m = b.mod(x, b.const(4), "m")                # range [0, 3]
+        lt_true = b.lt(m, b.const(10), "lt_true")    # provably 1
+        sel = b.select(lt_true, m, b.const(99), "sel")
+        big = b.add(m, b.const(100), "big")          # range [100, 103]
+        lt_false = b.lt(big, b.const(50), "lt_false")  # provably 0
+        sel2 = b.select(lt_false, b.const(77), sel, "sel2")
+        b.store(addr_out, sel2)
+        return b.build()
+
+    def test_range_fold_lt_and_select(self):
+        """Provable compares fold to constants and dependent selects
+        collapse; the compiled program must still produce correct values."""
+        hir = self._build()
+        out, p = self._run_simplify(hir, range_fold=True)
+
+        self.assertEqual(_count_opcode(out.body, "<"), 0,
+                         "range_fold should fold both provable compares")
+        # (Collapsing the selects on the now-constant conditions is a
+        # separate select-folding feature, tested with it.)
+        metrics = p.get_metrics()
+        self.assertGreaterEqual(metrics.custom["ranges_folded"], 2)
+
+        # Rebuild fresh (the standalone pass run mutated the ops of the
+        # first HIR in place) and compile end-to-end with default config.
+        fresh = self._build()
+        instrs = compile_hir_to_vliw(fresh)
+        mem = [0] * 16
+        mem[0] = 7  # x = 7 -> m = 3 -> sel = 3 -> sel2 = 3
+        machine = self._run_program(instrs, mem)
+        self.assertEqual(machine.mem[1], 3)
+
+    def test_range_fold_disabled_keeps_compares(self):
+        """Without range_fold, provable compares are left in place."""
+        hir = self._build()
+        out, _ = self._run_simplify(hir, range_fold=False)
+        self.assertEqual(_count_opcode(out.body, "<"), 2)
+
+
+class TestStructuredRangeConsumption(SimplifyOptionTestBase):
+    """Simplify must consume structured (loop/If) analysis results, not just
+    straight-line intervals."""
+
+    def test_select_with_singleton_range_folds(self):
+        # select(c, 7, 7) has interval (7, 7) regardless of c; the range
+        # fold must see selects (regression: the select-specific handling
+        # used to return before the range fold ran).
+        b = HIRBuilder()
+        x = b.load(b.const(0), "x")
+        cond = b.lt(x, b.const(5), "cond")
+        sel = b.select(cond, b.const(7), b.const(7), "sel")
+        b.store(b.const(1), sel)
+        out, p = self._run_simplify(b.build(), range_fold=True)
+        stores = [s for s in out.body if isinstance(s, Op) and s.opcode == "store"]
+        self.assertEqual(stores[0].operands[1], Const(7))
+        self.assertGreaterEqual(p.get_metrics().custom["ranges_folded"], 1)
+
+    def test_guard_folds_inside_retained_loop(self):
+        # A dynamic bound keeps the loop alive; the guard is provably true
+        # only via the loop fixpoint (params in [0, 7]).
+        b = HIRBuilder()
+        n = b.load(b.const(0), "n")
+
+        def body(i, params):
+            step = b.and_(b.add(params[0], b.const(1), "inc"),
+                          b.const(7), "step")
+            guard = b.lt(step, b.const(16), "guard")
+            safe = b.select(guard, step, b.const(99), "safe")
+            return [safe]
+
+        res = b.for_loop(b.const(0), n, [b.const(0)], body)[0]
+        b.store(b.const(1), res)
+        out, p = self._run_simplify(b.build(), range_fold=True)
+
+        loops = [s for s in out.body if isinstance(s, ForLoop)]
+        self.assertEqual(len(loops), 1)
+        self.assertEqual(_count_opcode(loops[0].body, "<"), 0,
+                         "provably-true guard must fold inside the loop")
+        # The provably-true compare folds via ranges; the select then
+        # collapses via const-cond folding (counted separately).
+        self.assertGreaterEqual(p.get_metrics().custom["ranges_folded"], 1)
 
 
 if __name__ == "__main__":

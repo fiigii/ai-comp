@@ -10,6 +10,7 @@ from ..hir import (
     SSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
 )
 from ..pass_manager import Pass, PassConfig
+from ..range_analysis import RangeAnalysis
 from ..use_def import UseDefContext
 
 
@@ -42,6 +43,9 @@ class SimplifyPass(Pass):
     - Select-to-mul: select(cond, x, 0) -> *(x, cond) when cond is boolean
     - Select-to-ALU mux: select(cond, a, b) -> b + cond * (a - b) when cond is boolean
     - Parity pattern: ==(x & 1, 0) followed by select(cond, 1, 2) -> (x & 1) + 1
+    - Range fold: structured interval analysis (loops and ifs included); ops
+      whose result range is a single point become Const (folds provable wrap
+      checks like lt(x, C), inside retained loops too)
     """
 
     def __init__(self):
@@ -53,6 +57,9 @@ class SimplifyPass(Pass):
         self._select_to_alu_mux = 0
         self._parity_patterns = 0
         self._add_mul_folds = 0
+        self._ranges_folded = 0
+        # Value ranges computed by RangeAnalysis (range_fold option)
+        self._range: Optional[RangeAnalysis] = None
         # SSA values known to be boolean (0 or 1) - from comparisons or & 1
         self._boolean_values: set[SSAValue] = set()
         # Maps SSA value -> the SSA value it's negated from (for ==(x, 0) where x is boolean)
@@ -78,6 +85,8 @@ class SimplifyPass(Pass):
         self._select_to_alu_mux = 0
         self._parity_patterns = 0
         self._add_mul_folds = 0
+        self._ranges_folded = 0
+        self._range = None
         self._boolean_values = set()
         self._negated_boolean = {}
 
@@ -90,6 +99,7 @@ class SimplifyPass(Pass):
             "select_to_alu_mux": config.options.get("select_to_alu_mux", False),
             "parity_pattern": config.options.get("parity_pattern", True),
             "add_mul_fold": config.options.get("add_mul_fold", True),
+            "range_fold": config.options.get("range_fold", False),
         }
 
         # Check if pass is enabled
@@ -99,6 +109,11 @@ class SimplifyPass(Pass):
         # Create use-def context for efficient value replacement
         self._use_def_ctx = UseDefContext(hir)
         self._next_ssa_id = hir.num_ssa_values
+
+        # Structured interval analysis: control flow is handled inside
+        # RangeAnalysis via joins, loop fixpoints, and widening
+        if self._opts["range_fold"]:
+            self._range = RangeAnalysis(hir)
 
         # Transform body
         new_body = self._transform_statements(hir.body)
@@ -113,6 +128,7 @@ class SimplifyPass(Pass):
                 "select_to_alu_mux": self._select_to_alu_mux,
                 "parity_patterns": self._parity_patterns,
                 "add_mul_folds": self._add_mul_folds,
+                "ranges_folded": self._ranges_folded,
             }
 
         return HIRFunction(
@@ -147,6 +163,18 @@ class SimplifyPass(Pass):
 
     def _transform_op(self, op: Op) -> Op | list[Op] | None:
         """Apply simplifications to a single Op."""
+        # Range fold first: it applies to every op with a result (selects
+        # included, e.g. select(c, 7, 7)), so it must run before the
+        # select-specific early return below.
+        if self._range is not None and op.result is not None and op.opcode != "load":
+            point = self._range.try_const(op.result)
+            if point is not None:
+                self._ranges_folded += 1
+                self._use_def_ctx.replace_all_uses(
+                    op.result, Const(point), auto_invalidate=False
+                )
+                return None
+
         # Handle select (3 operands)
         if op.opcode == "select" and op.result is not None and len(op.operands) == 3:
             simplified = self._try_simplify_select(op)
