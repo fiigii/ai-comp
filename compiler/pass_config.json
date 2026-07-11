@@ -99,7 +99,7 @@
         "stream_stagger_auto_direction": "auto",
         "static_devectorize_pct": 8,
         "const_via_flow": true,
-        "const_via_flow_skip": 35
+        "const_via_flow_skip": 40
       }
     },
     "mir-reg-pressure-profiler": {
