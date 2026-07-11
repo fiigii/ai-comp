@@ -221,9 +221,34 @@ schedule_block(insts):
 
 To ensure stable output across runs:
 
-- Never iterate over `set` without sorting.
-- Use a deterministic priority key with the original instruction index as the final tie-breaker.
+- Use a deterministic priority key with the original instruction index as the final, unique tie-breaker. The ready set may therefore be iterated directly without changing the selected node.
 - For same-bundle store ordering (if `delay=0` permits co-issuing stores), preserve original order within the engine’s slot list.
+
+---
+
+## Automatic Stream Staggering
+
+`stream_stagger` accepts either a non-negative integer for a manually selected
+height offset or `"auto"` for candidate search. Auto mode always includes the
+unstaggered schedule. It searches only when the baseline is sufficiently far
+from its resource/critical-path lower bound or approaches the scratch-pressure
+guard, then selects a pressure-safe candidate with the fewest bundles.
+
+The heuristic controls are explicit `inst-scheduling` options in
+`compiler/pass_config.json`:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `stream_stagger_threshold` | `12` | Dependence-graph degree above which a node is treated as shared infrastructure. |
+| `stream_stagger_auto_min_gap_pct` | `25` | Minimum baseline gap above the block lower bound that triggers search. |
+| `stream_stagger_auto_pressure_headroom` | `64` | Scratch words reserved when deciding whether a candidate is pressure-safe. |
+| `stream_stagger_auto_candidate_start` | `1` | First stagger strength to evaluate. |
+| `stream_stagger_auto_candidate_multiplier` | `2` | Geometric multiplier for subsequent strengths. |
+| `stream_stagger_auto_candidate_max` | `null` | Maximum strength; `null` uses the block critical-path height. |
+| `stream_stagger_auto_direction` | `"auto"` | `auto`, `unidirectional`, `bidirectional`, or `both`. |
+
+When `stream_stagger` is an integer, `stream_stagger_bidirectional` retains its
+manual-mode meaning and the `stream_stagger_auto_*` options are ignored.
 
 ---
 
@@ -232,7 +257,7 @@ To ensure stable output across runs:
 Per block:
 
 - Graph building is roughly `O(N * U)` where `U` is number of defs/uses tracked (using maps for last-def and use lists).
-- Scheduling is `O(N log N)` with a heap-based ready queue; simpler implementations can be `O(N^2)` and may still be acceptable, but large unrolled kernels benefit from `log N`.
+- Delayed-ready activation uses a heap. Candidate selection scans the current ready set, so worst-case scheduling remains quadratic in block size.
 
 ---
 

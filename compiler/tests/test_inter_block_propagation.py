@@ -22,10 +22,10 @@ def _mi(opcode, dest, operands, engine):
     return MachineInst(opcode=opcode, dest=dest, operands=list(operands), engine=engine)
 
 
-def _schedule_multi_block(blocks_dict, entry="entry"):
+def _schedule_multi_block(blocks_dict, entry="entry", **options):
     """Schedule a multi-block LIR function and return the MIR MachineFunction."""
     lir = LIRFunction(entry=entry, blocks=blocks_dict)
-    return InstSchedulingPass().run(lir, _cfg("inst-scheduling"))
+    return InstSchedulingPass().run(lir, _cfg("inst-scheduling", **options))
 
 
 class TestComputeExitValueState(unittest.TestCase):
@@ -62,7 +62,7 @@ class TestComputeExitValueState(unittest.TestCase):
         const_val, addr_expr = _compute_exit_value_state(insts)
         self.assertEqual(const_val[0], 4)
         self.assertIn(1, addr_expr)
-        self.assertEqual(addr_expr[1], AddrExpr(base=4, offset=0))
+        self.assertEqual(addr_expr[1], AddrExpr(base=("slot", 4, 1), offset=0))
 
     def test_addr_plus_const(self):
         """addr(base, 0) + const(5) → addr(base, 5)."""
@@ -74,7 +74,7 @@ class TestComputeExitValueState(unittest.TestCase):
         ]
         const_val, addr_expr = _compute_exit_value_state(insts)
         self.assertIn(3, addr_expr)
-        self.assertEqual(addr_expr[3], AddrExpr(base=5, offset=10))
+        self.assertEqual(addr_expr[3], AddrExpr(base=("slot", 5, 1), offset=10))
 
     def test_overwrite_clears_old(self):
         """Redefining a scratch reg clears its old const/addr info."""
@@ -160,8 +160,11 @@ class TestBuildDepGraphWithInitialState(unittest.TestCase):
         nodes_no_init = _build_dep_graph(insts)
         has_dep_no_init = 1 in nodes_no_init[0].succs
 
-        # With initial state: different bases → no alias → no dependency
-        nodes_with_init = _build_dep_graph(insts, None, initial_addr)
+        # With the challenge ABI's explicit restrict contract, different
+        # propagated roots are disjoint and need no dependency.
+        nodes_with_init = _build_dep_graph(
+            insts, None, initial_addr, restrict_ptr=True
+        )
         has_dep_with_init = 1 in nodes_with_init[0].succs
 
         self.assertTrue(has_dep_no_init, "Without init state, stores should alias (key=None)")
@@ -406,8 +409,9 @@ class TestInterBlockPropagation(unittest.TestCase):
         self.assertEqual(store_bundles[0], store_bundles[1],
                          "Stores to different bases should co-issue when values propagate through diamond")
 
-    def test_back_edge_skipped(self):
-        """Back edges (from loop body to header) are skipped — not processed yet in RPO."""
+    def test_loop_invariant_facts_survive_backedge_meet(self):
+        """Fixpoint dataflow: facts NOT redefined in the loop survive the
+        meet over the back edge and still propagate into the body."""
         # for_init → for_body → for_body (back edge to self via loop)
         for_init = BasicBlock(
             name="for_init",
@@ -441,9 +445,9 @@ class TestInterBlockPropagation(unittest.TestCase):
             "exit": exit_block,
         }, entry="for_init")
 
-        # The key test: for_body has two predecessors (for_init and itself via back edge).
-        # The back edge from for_body→for_body is unprocessed in RPO, so only for_init's
-        # exit state is used. This means s1=addr(5,0) propagates correctly.
+        # for_body has two predecessors (for_init and itself via the back
+        # edge). s1 is never redefined in the body, so the fixpoint meet
+        # keeps its fact and the address facts hold in EVERY iteration.
         body_bundles = mir.blocks["for_body"].bundles
         store_bundles = []
         for i, bundle in enumerate(body_bundles):
@@ -453,7 +457,61 @@ class TestInterBlockPropagation(unittest.TestCase):
         self.assertEqual(len(store_bundles), 2)
         # Stores to addr(5,1) and addr(5,2) → different offsets → co-issue
         self.assertEqual(store_bundles[0], store_bundles[1],
-                         "Back edge should be skipped; for_init's state should propagate to for_body")
+                         "loop-invariant address facts should propagate into the body")
+
+    def test_loop_carried_redefinition_kills_facts(self):
+        """A fact redefined along the back edge must NOT propagate: the
+        preheader value only holds in the first iteration (regression:
+        a single-pass RPO ignored the back edge and miscompiled)."""
+        for_init = BasicBlock(
+            name="for_init",
+            instructions=[
+                LIRInst(LIROpcode.CONST, 0, [5], "load"),
+                LIRInst(LIROpcode.LOAD, 1, [0], "load"),   # s1 = addr(slot 5)
+                LIRInst(LIROpcode.CONST, 2, [0], "load"),  # s2 = 0 (loop-carried)
+            ],
+            terminator=LIRInst(LIROpcode.JUMP, None, ["for_body"], "flow"),
+        )
+        for_body = BasicBlock(
+            name="for_body",
+            instructions=[
+                LIRInst(LIROpcode.ADD, 3, [1, 2], "alu"),   # s3 = s1 + s2
+                LIRInst(LIROpcode.STORE, None, [3, 10], "store"),
+                LIRInst(LIROpcode.CONST, 4, [1], "load"),
+                LIRInst(LIROpcode.ADD, 5, [1, 4], "alu"),   # s5 = s1 + 1
+                LIRInst(LIROpcode.LOAD, 7, [5], "load"),    # may read the store
+                LIRInst(LIROpcode.ADD, 2, [2, 4], "alu"),   # s2 += 1 (redefined!)
+                LIRInst(LIROpcode.CONST, 98, [0], "load"),
+            ],
+            terminator=LIRInst(
+                LIROpcode.COND_JUMP, None, [98, "for_body", "exit"], "flow"),
+        )
+        exit_block = BasicBlock(
+            name="exit",
+            instructions=[],
+            terminator=LIRInst(LIROpcode.HALT, None, [], "flow"),
+        )
+        mir = _schedule_multi_block(
+            {"for_init": for_init, "for_body": for_body, "exit": exit_block},
+            entry="for_init",
+        )
+        # The body's entry state must NOT claim s2 == 0 (it only holds in
+        # the first iteration), so s3 = s1 + s2 has an UNKNOWN offset and
+        # the load through s1 + Const(1) must stay ordered after the store
+        # through s3 (with stale facts they were "provably disjoint").
+        body_bundles = mir.blocks["for_body"].bundles
+        store_bundle = load_bundle = None
+        for i, bundle in enumerate(body_bundles):
+            for inst in bundle.instructions:
+                if inst.opcode == LIROpcode.STORE:
+                    store_bundle = i
+                elif inst.opcode == LIROpcode.LOAD and inst.dest == 7:
+                    load_bundle = i
+        self.assertIsNotNone(store_bundle)
+        self.assertIsNotNone(load_bundle)
+        self.assertGreater(load_bundle, store_bundle,
+                           "load must not be reordered across the store on "
+                           "a loop-variant address")
 
     def test_predecessors_computed_correctly(self):
         """Verify predecessors are properly set on MachineBasicBlocks."""
@@ -553,7 +611,11 @@ class TestInterBlockPropagation(unittest.TestCase):
             ],
             terminator=LIRInst(LIROpcode.HALT, None, [], "flow"),
         )
-        mir = _schedule_multi_block({"init": init, "body": body}, entry="init")
+        mir = _schedule_multi_block(
+            {"init": init, "body": body},
+            entry="init",
+            restrict_ptr=True,
+        )
         body_bundles = mir.blocks["body"].bundles
 
         store_idx = None
@@ -593,7 +655,8 @@ class TestComputeExitValueStateVectorOps(unittest.TestCase):
         ]
         const_val, addr_expr = _compute_exit_value_state(insts)
         for lane in range(10, 18):
-            self.assertEqual(addr_expr[lane], AddrExpr(base=5, offset=0))
+            self.assertEqual(addr_expr[lane],
+                             AddrExpr(base=("slot", 5, 1), offset=0))
 
     def test_vadd_const_lanes(self):
         """VADD of known-const lanes produces known-const results."""
@@ -625,7 +688,7 @@ class TestComputeExitValueStateVectorOps(unittest.TestCase):
             _mi(LIROpcode.COPY, 2, [1], "alu"),
         ]
         _, addr_expr = _compute_exit_value_state(insts)
-        self.assertEqual(addr_expr.get(2), AddrExpr(base=5, offset=0))
+        self.assertEqual(addr_expr.get(2), AddrExpr(base=("slot", 5, 1), offset=0))
 
 
 if __name__ == "__main__":
