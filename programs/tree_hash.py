@@ -78,12 +78,17 @@ def build_tree_hash_kernel(
     _n_nodes_loaded = load_header(1, "n_nodes")
     batch_size_val = load_header(2, "batch_size")
     forest_height_val = load_header(3, "forest_height")
-    forest_values_p = load_header(4, "forest_values_p")
+    # The kernel ABI supplies a forest allocation of exactly n_nodes words.
+    # Record that object extent in HIR so speculative window reads have a
+    # real bounds proof rather than a benchmark-specific legality rule.
+    forest_values_p = b.memory_view(
+        load_header(4, "forest_values_p"), n_nodes
+    )
     inp_indices_p = load_header(5, "inp_indices_p")
     inp_values_p = load_header(6, "inp_values_p")
 
     # n_nodes is a compile-time kernel parameter. Materializing it as Const
-    # enables downstream passes (e.g. periodic tree-level-cache round analysis).
+    # enables downstream passes (range analysis proves the wrap periodicity).
     n_nodes_val = Const(n_nodes)
 
     # Constants (as SSAValues for use in computations)
@@ -107,7 +112,7 @@ def build_tree_hash_kernel(
     b.pause()
 
     # The kernel ABI asserts that index state is private, already zero here,
-    # and never observed afterward. Generic SROA + Mem2Reg can therefore carry
+    # and never observed afterward. Generic SROA can therefore carry
     # its slots as SSA values instead of relying on tree-specific rewrites.
     b.assume_local_memory(inp_indices_p, batch_const)
 

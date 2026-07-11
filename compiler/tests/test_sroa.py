@@ -1,4 +1,5 @@
-"""Tests for generic local-memory SROA and mem2reg promotion."""
+"""Tests for the SROA pass: contract-qualified local regions and
+read-only window promotion."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from compiler.compile import compile_hir_to_vliw
 from compiler.local_memory import collect_static_local_memory_regions
 from compiler.lowering import lower_to_lir
 from compiler.pass_manager import PassConfig
-from compiler.passes.local_mem2reg import LocalMem2RegPass
+from compiler.passes.sroa import SROAPass
 from compiler.tests.conftest import DebugInfo, HIRBuilder, Machine, N_CORES
 
 
@@ -45,9 +46,9 @@ def _named_op(hir, name):
 
 
 def _run_pass(hir):
-    promotion = LocalMem2RegPass()
+    promotion = SROAPass()
     result = promotion.run(
-        hir, PassConfig(name="local-mem2reg", enabled=True, options={})
+        hir, PassConfig(name="sroa", enabled=True, options={})
     )
     return result, promotion.get_metrics()
 
@@ -69,7 +70,7 @@ def _execute(hir, memory):
     return _execute_instructions(compile_hir_to_vliw(hir), memory)
 
 
-class TestLocalMem2RegPass(unittest.TestCase):
+class TestSROAPass(unittest.TestCase):
     def test_default_pipeline_executes_promoted_region(self):
         b = HIRBuilder()
         base = b.load(b.const(10), "base")
@@ -615,6 +616,20 @@ class TestLocalMem2RegPass(unittest.TestCase):
         self.assertEqual(metrics.custom["regions_promoted"], 0)
         self.assertEqual(metrics.custom["regions_rejected"], 1)
 
+    def test_result_bearing_marker_is_preserved_for_validation(self):
+        b = HIRBuilder()
+        base = b.load(b.const(21), "base")
+        rogue = b._new_ssa("rogue")
+        b._emit(Op(
+            "assume_local_memory", rogue, [base, b.const(1)], "meta"
+        ))
+        b.store(b.const(62), rogue)
+
+        transformed, _ = _run_pass(b.build())
+        self.assertTrue(_ops(transformed, "assume_local_memory"))
+        with self.assertRaisesRegex(ValueError, "metadata cannot define SSA"):
+            lower_to_lir(transformed)
+
     def test_marker_is_ignored_when_lowering_without_promotion(self):
         b = HIRBuilder()
         base = b.load(b.const(21), "base")
@@ -749,6 +764,405 @@ class TestRangeBoundedDynamicAccessShapes(unittest.TestCase):
         self.assertEqual(machine.mem[30], 141)
         # The promoted store never reaches memory (contract: unobservable).
         self.assertEqual(machine.mem[16:20], [0, 0, 0, 0])
+
+
+def _window_options(**extra):
+    options = {"table_promotion": True, "restrict_ptr": True,
+               "max_window": 8, "share_window": 4, "repreload_gap": 10000}
+    options.update(extra)
+    return options
+
+
+def _run_window_pass(hir, **extra):
+    pass_instance = SROAPass()
+    config = PassConfig(name="sroa", enabled=True,
+                        options=_window_options(**extra))
+    transformed = pass_instance.run(hir, config)
+    return transformed, pass_instance.get_metrics().custom
+
+
+def _execute_full(hir, mem):
+    machine = Machine(list(mem), compile_hir_to_vliw(hir),
+                      DebugInfo(scratch_map={}), n_cores=N_CORES)
+    machine.enable_pause = False
+    machine.enable_debug = False
+    machine.run()
+    return machine
+
+
+class TestReadonlyWindowPromotion(unittest.TestCase):
+    """Table promotion: loads with range-proven small windows over
+    provably read-only memory become preloads + select trees."""
+
+    def test_width_one_window_dedupes_repeated_loads(self):
+        b = HIRBuilder()
+        table = b.load(b.const(4), "table")
+        total = b.const(0)
+        for i in range(4):
+            v = b.load(b.add(table, b.const(0), "a%d" % i), "v%d" % i)
+            total = b.add(total, v, "t%d" % i)
+        b.store(b.const(30), total)
+
+        transformed, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 1)
+        self.assertEqual(stats["window_loads_replaced"], 4)
+        self.assertEqual(stats["window_preloads"], 1)
+        self.assertEqual(stats["window_selects"], 0)
+
+    def test_tree_chain_uses_affine_bits_without_fallback(self):
+        # Three lanes at tree level 1: idx = (raw & 1) + 1 in [1, 2].
+        b = HIRBuilder()
+        table = b.load(b.const(4), "table")
+        b.memory_view(table, 16)
+        for lane in range(3):
+            raw = b.load(b.const(8 + lane), "raw%d" % lane)
+            bit = b.and_(raw, b.const(1), "bit%d" % lane)
+            idx = b.add(bit, b.const(1), "idx%d" % lane)
+            v = b.load(b.add(table, idx, "addr%d" % lane), "v%d" % lane)
+            b.store(b.const(30 + lane), v)
+
+        transformed, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 1)
+        self.assertEqual(stats["window_loads_replaced"], 3)
+        self.assertEqual(stats["window_preloads"], 2)
+        self.assertEqual(stats["window_selects"], 3)
+        self.assertEqual(stats["window_bit_fallbacks"], 0)
+
+    def test_constant_base_memory_view_enables_window(self):
+        b = HIRBuilder()
+        table = b.memory_view(b.const(40), 2)
+        for lane in range(3):
+            raw = b.load(b.const(8 + lane), "raw%d" % lane)
+            idx = b.and_(raw, b.const(1), "idx%d" % lane)
+            value = b.load(b.add(table, idx), "value%d" % lane)
+            b.store(b.const(30 + lane), value)
+
+        _, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 1)
+        self.assertEqual(stats["window_preloads"], 2)
+
+    def test_flow_heavy_lut_is_rejected_by_engine_bound(self):
+        # Nine width-8 lookups would add 63 single-slot flow selects to a
+        # tiny block: a measured regression. The engine-bound cost gate must
+        # decline, and the program still executes correctly unpromoted.
+        def build():
+            b = HIRBuilder()
+            table = b.load(b.const(4), "table")
+            b.memory_view(table, 16)
+            out = b.load(b.const(6), "out")
+            for i in range(9):
+                x = b.load(b.const(8 + i), "x%d" % i)
+                idx = b.and_(x, b.const(7), "idx%d" % i)
+                v = b.load(b.add(table, idx, "addr%d" % i), "v%d" % i)
+                b.store(b.add(out, b.const(i), "o%d" % i), v)
+            return b.build()
+
+        _, stats = _run_window_pass(build())
+        self.assertEqual(stats["windows_promoted"], 0)
+        self.assertEqual(
+            stats["window_rejections"].get("engine_bound", 0), 1)
+
+        mem = [0] * 128
+        mem[4] = 40
+        mem[6] = 60
+        for j in range(8):
+            mem[40 + j] = 700 + j
+        for i in range(9):
+            mem[8 + i] = 12345 * (i + 1)
+        machine = _execute_full(build(), mem)
+        for i in range(9):
+            expected = mem[40 + (mem[8 + i] & 7)]
+            self.assertEqual(machine.mem[60 + i], expected, f"lane {i}")
+
+    def test_masked_index_lut_falls_back_and_stays_correct(self):
+        # A width-2 lookup with a masked (non-affine-decomposable) index:
+        # bits are extracted explicitly. Filler loads keep the block
+        # LOAD-bound, so trading loads for selects/alu is genuinely
+        # profitable and passes the cost gate.
+        def build():
+            b = HIRBuilder()
+            table = b.load(b.const(4), "table")
+            b.memory_view(table, 16)
+            out = b.load(b.const(6), "out")
+            filler = b.const(0)
+            for k in range(60):           # keep the block load-bound
+                filler = b.add(filler, b.load(b.const(64 + k), "f%d" % k))
+            b.store(b.const(31), filler)
+            for i in range(9):
+                x = b.load(b.const(8 + i), "x%d" % i)
+                idx = b.and_(x, b.const(3), "idx%d" % i)
+                v = b.load(b.add(table, idx, "addr%d" % i), "v%d" % i)
+                b.store(b.add(out, b.const(i), "o%d" % i), v)
+            return b.build()
+
+        _, stats = _run_window_pass(build())
+        self.assertEqual(stats["windows_promoted"], 1)
+        self.assertEqual(stats["window_loads_replaced"], 9)
+        self.assertGreater(stats["window_bit_fallbacks"], 0)
+
+        mem = [0] * 128
+        mem[4] = 40
+        mem[6] = 60
+        mem[30] = 3
+        for j in range(8):
+            mem[40 + j] = 700 + j
+        for i in range(9):
+            mem[8 + i] = 12345 * (i + 1)
+        machine = _execute_full(build(), mem)
+        for i in range(9):
+            expected = mem[40 + (mem[8 + i] & 3)]
+            self.assertEqual(machine.mem[60 + i], expected, f"lane {i}")
+
+    def test_cost_gate_requires_net_load_saving(self):
+        # Two uses of a two-wide window: 2 preloads replace 2 loads, a net
+        # zero on the load engine -- must be declined.
+        b = HIRBuilder()
+        table = b.load(b.const(4), "table")
+        b.memory_view(table, 16)
+        for lane in range(2):
+            raw = b.load(b.const(8 + lane), "raw%d" % lane)
+            bit = b.and_(raw, b.const(1), "bit%d" % lane)
+            idx = b.add(bit, b.const(1), "idx%d" % lane)
+            v = b.load(b.add(table, idx, "addr%d" % lane), "v%d" % lane)
+            b.store(b.const(30 + lane), v)
+
+        _, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 0)
+
+    def test_without_restrict_unrefutable_store_blocks_window(self):
+        def build():
+            b = HIRBuilder()
+            table = b.load(b.const(4), "table")
+            other = b.load(b.const(6), "other")
+            first = b.load(b.add(table, b.const(0)), "first")
+            b.store(other, first)      # may hit the window without restrict
+            second = b.load(b.add(table, b.const(0)), "second")
+            b.store(b.const(30), b.add(first, second))
+            return b.build()
+
+        _, stats = _run_window_pass(build(), restrict_ptr=False)
+        self.assertEqual(stats["windows_promoted"], 0)
+
+        _, stats2 = _run_window_pass(build())
+        self.assertEqual(stats2["windows_promoted"], 1)
+
+
+class TestReadonlyWindowAdversarialStores(unittest.TestCase):
+    """Ported from the tree-level-cache suite: stores that reach the window
+    through disguised addresses must disable promotion; each program is also
+    executed end-to-end through the default pipeline (a wrongly promoted
+    window would read the stale pre-store value: 2 + 2 instead of 2 + 99)."""
+
+    def _root_sum_program(self, add_store):
+        b = HIRBuilder()
+        forest_p = b.load(b.const(4), "forest_p")
+        first = b.load(b.add(forest_p, b.const(0)), "first_root")
+        add_store(b, forest_p)
+        second = b.load(b.add(forest_p, b.const(0)), "second_root")
+        b.store(b.const(30), b.add(first, second, "root_sum"))
+        return b.build()
+
+    def _check(self, add_store, mem_setup):
+        hir = self._root_sum_program(add_store)
+        _, stats = _run_window_pass(self._root_sum_program(add_store))
+        self.assertEqual(stats["windows_promoted"], 0,
+                         "store must disable the window")
+
+        mem = [0] * 64
+        mem_setup(mem)
+        machine = _execute_full(hir, mem)
+        self.assertEqual(machine.mem[30], 101)
+
+    def test_selected_base_store_blocks_window(self):
+        def add_store(b, forest_p):
+            other = b.load(b.const(7), "other_p")
+            condition = b.load(b.const(8), "condition")
+            selected = b.select(condition, forest_p, other, "selected")
+            b.vstore(selected, b.vbroadcast(b.const(99), "rep"))
+
+        def mem_setup(mem):
+            mem[4] = 16
+            mem[7] = 32
+            mem[8] = 1
+            mem[16] = 2
+
+        self._check(add_store, mem_setup)
+
+    def test_vector_store_crossing_base_blocks_window(self):
+        def add_store(b, forest_p):
+            before = b.sub(forest_p, b.const(1), "before")
+            b.vstore(before, b.vbroadcast(b.const(99), "rep"))
+
+        def mem_setup(mem):
+            mem[4] = 16
+            mem[16] = 2
+
+        self._check(add_store, mem_setup)
+
+    def test_dynamic_subtracted_store_blocks_window(self):
+        def add_store(b, forest_p):
+            offset = b.load(b.const(8), "dynamic_offset")
+            address = b.sub(forest_p, offset, "dynamic_address")
+            b.vstore(address, b.vbroadcast(b.const(99), "rep"))
+
+        def mem_setup(mem):
+            mem[4] = 16
+            mem[8] = 0
+            mem[16] = 2
+
+        self._check(add_store, mem_setup)
+
+    def test_reloaded_header_store_blocks_window(self):
+        def add_store(b, forest_p):
+            b.store(b.const(40), b.const(1))
+            reloaded = b.load(b.const(4), "reloaded_p")
+            b.vstore(reloaded, b.vbroadcast(b.const(99), "rep"))
+
+        def mem_setup(mem):
+            mem[4] = 16
+            mem[16] = 2
+
+        self._check(add_store, mem_setup)
+
+
+class TestWindowSpeculationSafety(unittest.TestCase):
+    """Review regressions for object bounds, pause epochs, and rewritten SSA."""
+
+    def test_branched_loads_are_never_window_promoted(self):
+        # Even with object bounds, a conditional load cannot be widened into
+        # unconditional preloads. Retained control flow disables the stage.
+        b = HIRBuilder()
+        base = b.load(b.const(4), "base")
+        cond = b.load(b.const(5), "cond")
+        for i in range(3):
+            x = b.load(b.const(8 + i), "x%d" % i)
+            idx = b.and_(x, b.const(1), "idx%d" % i)
+            picked = b.if_stmt(
+                cond,
+                lambda idx=idx: [b.load(b.add(base, idx), "guarded")],
+                lambda: [b.const(0)],
+            )[0]
+            b.store(b.const(30 + i), picked)
+
+        _, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 0)
+
+    def test_wide_window_without_object_extent_is_not_speculated(self):
+        # Every runtime index is zero, so the source only reads the last valid
+        # word. RangeAnalysis still sees [0, 1]; widening to both words would
+        # read one past the VM memory and raise IndexError.
+        def build():
+            b = HIRBuilder()
+            table = b.load(b.const(4), "table")
+            total = b.const(0)
+            for i in range(3):
+                raw = b.load(b.const(i), "raw%d" % i)
+                idx = b.and_(raw, b.const(1), "idx%d" % i)
+                value = b.load(b.add(table, idx), "value%d" % i)
+                total = b.add(total, value)
+            b.store(b.const(3), total)
+            return b.build()
+
+        _, stats = _run_window_pass(build())
+        self.assertEqual(stats["windows_promoted"], 0)
+        self.assertGreater(
+            stats["window_rejections"].get("object_bounds", 0), 0)
+
+        machine = _execute_full(build(), [0, 0, 0, 0, 5, 42])
+        self.assertEqual(machine.mem[3], 126)
+
+    def test_object_extent_must_cover_the_whole_window(self):
+        b = HIRBuilder()
+        table = b.load(b.const(4), "table")
+        b.memory_view(table, 1)
+        for i in range(3):
+            raw = b.load(b.const(8 + i), "raw%d" % i)
+            idx = b.and_(raw, b.const(1), "idx%d" % i)
+            value = b.load(b.add(table, idx), "value%d" % i)
+            b.store(b.const(20 + i), value)
+
+        _, stats = _run_window_pass(b.build())
+        self.assertEqual(stats["windows_promoted"], 0)
+        self.assertGreater(
+            stats["window_rejections"].get("object_bounds", 0), 0)
+
+    def test_snapshot_not_reused_across_pause(self):
+        # The host may rewrite memory while the machine is paused: windows
+        # and their preloads must stay within one pause-delimited epoch.
+        b = HIRBuilder()
+        base = b.load(b.const(0), "base")
+        b.memory_view(base, 2)
+        out = b.load(b.const(1), "out")
+        slot = [0]
+
+        def read(tag):
+            i = slot[0]
+            slot[0] += 1
+            x = b.load(b.const(2 + i), "x%s" % tag)
+            idx = b.and_(x, b.const(1), "i%s" % tag)
+            return b.load(b.add(base, idx), "v%s" % tag)
+
+        for j in range(3):
+            b.store(b.add(out, b.const(j)), read("pre%d" % j))
+        b.pause()
+        for j in range(3):
+            b.store(b.add(out, b.const(3 + j)), read("post%d" % j))
+        hir = b.build()
+
+        machine = Machine([0] * 32, compile_hir_to_vliw(hir),
+                          DebugInfo(scratch_map={}), n_cores=N_CORES)
+        machine.mem[0] = 16
+        machine.mem[1] = 8
+        machine.mem[16] = 7
+        machine.mem[17] = 9
+        machine.enable_pause = True
+        machine.enable_debug = False
+        machine.run()
+        machine.mem[16] = 70          # host write during the pause
+        machine.run()
+        self.assertEqual(machine.mem[8:14], [7, 7, 7, 70, 70, 70])
+
+    def test_if_condition_cannot_launder_local_pointer(self):
+        # if base then 1 else 0 reconstructs the pointer value: the results
+        # must be tainted even when the If precedes the marker.
+        b = HIRBuilder()
+        base = b.load(b.const(5), "base")
+        alias = b.if_stmt(base, lambda: [b.const(1)], lambda: [b.const(0)])[0]
+        b.assume_local_memory(base, b.const(4))
+        b.store(alias, b.const(42))
+        x = b.load(base, "x")
+        b.store(b.const(30), x)
+        hir = b.build()
+
+        mem = [0] * 64
+        mem[5] = 1
+        machine = _execute_full(hir, mem)
+        self.assertEqual(machine.mem[30], 42)
+
+    def test_chained_region_base_resolves_in_emitted_ops(self):
+        # Region B's base is itself a load promoted away by region A: every
+        # op emitted for B's dynamic read must reference resolved values.
+        b = HIRBuilder()
+        p = b.load(b.const(5), "p")
+        b.assume_local_memory(p, b.const(2))
+        q_val = b.load(b.const(6), "q_val")
+        b.store(p, q_val)
+        base_b = b.load(p, "base_b")
+        b.assume_local_memory(base_b, b.const(4))
+        b.store(base_b, b.const(10))
+        b.store(b.add(base_b, b.const(1)), b.const(20))
+        raw = b.load(b.const(7), "raw")
+        idx = b.and_(raw, b.const(3), "idx")
+        picked = b.load(b.add(base_b, idx), "picked")
+        b.store(b.const(30), picked)
+        hir = b.build()
+
+        mem = [0] * 64
+        mem[5] = 40
+        mem[6] = 45          # odd pointer: wrong offset math would misread
+        mem[7] = 1
+        machine = _execute_full(hir, mem)
+        self.assertEqual(machine.mem[30], 20)
 
 
 if __name__ == "__main__":

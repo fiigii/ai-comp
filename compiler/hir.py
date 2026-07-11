@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 
+# The VM reduces every result (const immediates included) mod 2**32.
+WORD_MASK = (1 << 32) - 1
+
+
 @dataclass(frozen=True)
 class SSAValue:
     """An SSA value - assigned exactly once."""

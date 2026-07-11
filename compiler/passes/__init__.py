@@ -22,8 +22,7 @@ from .slp import SLPVectorizationPass
 from .mad_synthesis import MADSynthesisPass
 from .load_elim import LoadElimPass
 from .dse import DSEPass
-from .tree_level_cache import TreeLevelCachePass
-from .local_mem2reg import LocalMem2RegPass
+from .sroa import SROAPass
 from .strip_assume import StripAssumePass
 from .slsr import SLSRPass
 from .lir_to_mir import LIRToMIRPass
@@ -46,8 +45,7 @@ __all__ = [
     'MADSynthesisPass',
     'LoadElimPass',
     'DSEPass',
-    'TreeLevelCachePass',
-    'LocalMem2RegPass',
+    'SROAPass',
     'StripAssumePass',
     'SLSRPass',
     'LIRToMIRPass',

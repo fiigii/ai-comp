@@ -5,7 +5,8 @@ Unrolls ForLoops with static trip counts, either fully or partially.
 """
 
 from ..hir import (
-    SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Variable, Const, Value, Op, Halt, Pause,
+    ForLoop, If, Statement, HIRFunction, WORD_MASK,
 )
 from ..pass_manager import Pass, PassConfig
 from ..range_analysis import RangeAnalysis
@@ -83,7 +84,7 @@ class LoopUnrollPass(Pass):
     def _static_bound(self, value: Value) -> "int | None":
         """Constant loop bound: a literal Const or a range-proven point."""
         if isinstance(value, Const):
-            return value.value & 0xFFFFFFFF
+            return value.value & WORD_MASK
         if isinstance(value, SSAValue):
             if self._ranges is None:
                 self._ranges = RangeAnalysis(self._hir)

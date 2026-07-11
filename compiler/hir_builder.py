@@ -7,9 +7,11 @@ Provides a builder API for constructing HIR in SSA form.
 from typing import Optional, Callable
 
 from .hir import (
-    SSAValue, VectorSSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, Value, Op, Halt, Pause, ForLoop, If,
+    Statement, HIRFunction,
 )
 from .local_memory import LOCAL_MEMORY_OPCODE
+from .object_size import OBJECT_EXTENT_OPCODE
 
 
 class HIRBuilder:
@@ -97,6 +99,38 @@ class HIRBuilder:
     def store(self, addr: Value, value: Value):
         """Store value to memory at address."""
         self._emit(Op("store", None, [addr, value], "store"))
+
+    def memory_view(
+        self, base: SSAValue | Const, length: int | Const
+    ) -> SSAValue | Const:
+        """Attach a statically bounded memory object to ``base``.
+
+        The view is trusted compile-time HIR type/ABI information and emits no
+        runtime or target instruction. Returning the exact base keeps ordinary
+        address-building syntax unchanged while object-size analyses can prove
+        speculative accesses stay within ``[base, base + length)``. Frontends
+        may only create a view from an allocation, typed object, or ABI fact.
+        """
+        if not isinstance(base, (SSAValue, Const)):
+            raise TypeError("memory_view base must be a scalar address")
+        size = length.value if isinstance(length, Const) else length
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise TypeError("memory_view length must be a compile-time integer")
+        if size <= 0 or size > (1 << 32):
+            raise ValueError(
+                "memory_view length must be in [1, 2**32] words, "
+                f"got {size}"
+            )
+        if isinstance(base, Const):
+            if (isinstance(base.value, bool)
+                    or not isinstance(base.value, int)):
+                raise TypeError("constant memory_view base must be an integer")
+            if (base.value & ((1 << 32) - 1)) + size > (1 << 32):
+                raise ValueError("constant memory_view must not wrap")
+        self._emit(Op(
+            OBJECT_EXTENT_OPCODE, None, [base, Const(size)], "meta"
+        ))
+        return base
 
     def assume_local_memory(self, addr: Value, length: Value) -> None:
         """Declare a private, zero-initialized, non-observable memory region.

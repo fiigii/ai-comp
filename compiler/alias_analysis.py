@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from .hir import SSAValue, VectorSSAValue, Const, VectorConst, Value, Op
+from .hir import SSAValue, VectorSSAValue, Const, VectorConst, Value, Op, WORD_MASK
 from .range_analysis import RangeAnalysis
 from .use_def import UseDefContext
 
@@ -30,7 +30,6 @@ class AliasResult(Enum):
 
 _CONST_BASE = object()
 _ADDRESS_SPACE = 1 << 32
-_ADDRESS_MASK = _ADDRESS_SPACE - 1
 
 
 def base_roots(base: object) -> frozenset:
@@ -90,7 +89,7 @@ class AliasAnalysis:
     def normalize(self, val: Value) -> Optional[AddrKey]:
         """Normalize an address expression to (base, offset)."""
         if isinstance(val, Const):
-            return AddrKey(_CONST_BASE, val.value & _ADDRESS_MASK)
+            return AddrKey(_CONST_BASE, val.value & WORD_MASK)
         if isinstance(val, SSAValue):
             return self._normalize_ssa(val)
         # Vector addresses and vector consts are treated as unknown
@@ -119,7 +118,7 @@ class AliasAnalysis:
                 if other_key is not None:
                     key = AddrKey(
                         other_key.base,
-                        (other_key.offset + const_val) & _ADDRESS_MASK,
+                        (other_key.offset + const_val) & WORD_MASK,
                     )
                     self._norm_cache[ssa] = key
                     return key
@@ -138,7 +137,7 @@ class AliasAnalysis:
                         bases = (bases[1], bases[0])
                     key = AddrKey(
                         ("add", bases[0], bases[1]),
-                        (a_key.offset + b_key.offset) & _ADDRESS_MASK,
+                        (a_key.offset + b_key.offset) & WORD_MASK,
                     )
                     self._norm_cache[ssa] = key
                     return key
@@ -150,7 +149,7 @@ class AliasAnalysis:
             if left_key is not None:
                 key = AddrKey(
                     left_key.base,
-                    (left_key.offset - right.value) & _ADDRESS_MASK,
+                    (left_key.offset - right.value) & WORD_MASK,
                 )
                 self._norm_cache[ssa] = key
                 return key
@@ -322,7 +321,7 @@ class AliasAnalysis:
             length = (hi - lo) + width
             if length >= _ADDRESS_SPACE:
                 return None
-            start = (lo + offset) & _ADDRESS_MASK
+            start = (lo + offset) & WORD_MASK
             end = start + length
             if end <= _ADDRESS_SPACE:
                 return ((start, end),)
@@ -345,8 +344,8 @@ class AliasAnalysis:
         if a_width <= 0 or b_width <= 0:
             raise ValueError("memory access widths must be positive")
 
-        a_start = a_key.offset & _ADDRESS_MASK
-        b_start = b_key.offset & _ADDRESS_MASK
+        a_start = a_key.offset & WORD_MASK
+        b_start = b_key.offset & WORD_MASK
         if a_start == b_start and a_width == b_width:
             return AliasResult.MUST_ALIAS
 

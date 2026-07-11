@@ -43,8 +43,9 @@ The current default pipeline contains the following relevant order:
 ```text
 loop-unroll
   -> simplify
-  -> dce / cse / memory optimizations
-  -> tree-level-cache
+  -> dce / cse
+  -> sroa (local promotion + read-only window promotion)
+  -> load-elim / dse
   -> simplify
   -> slsr
   -> dce
@@ -305,22 +306,26 @@ The following development measurement used the default workload
 `forest_height=10`, `rounds=16`, `batch_size=256`, with all unrelated settings
 held constant:
 
-| `assoc_fold` | `mul_dist` | VM cycles | Vector MADs | LIR instructions | Scheduler bundles |
-| --- | --- | ---: | ---: | ---: | ---: |
-| on | on | 1143 | 2432 | 10217 | 1144 |
-| off | on | 1187 | 1920 | 10729 | 1188 |
-| off | off | 1187 | 1920 | 10729 | 1188 |
-| on | off | 1217 | 1408 | 11241 | 1218 |
+| `assoc_fold` | `mul_dist` | VM cycles | Vector MADs | Scheduler bundles |
+| --- | --- | ---: | ---: | ---: |
+| on | on | 1141 | 2432 | 1142 |
+| off | on | 1188 | 1920 | 1189 |
+| off | off | 1182 | 1920 | 1183 |
+| on | off | 1209 | 1408 | 1210 |
 
 With both transforms enabled, the first Simplify run reported 4096
 `assoc_folds` and 4096 `mul_dists`; the second reported another 512
 `assoc_folds`. Compared with disabling both, the complete pipeline formed 512
-additional vector MADs, emitted 512 fewer LIR instructions, and reduced VM
-execution by 44 cycles, or about 3.7 percent relative to the disabled case.
+additional vector MADs and reduced VM execution by 41 cycles, about 3.5
+percent relative to the disabled case. Note that enabling only one of the
+pair is WORSE than disabling both (`mul_dist` alone loses 6 cycles,
+`assoc_fold` alone loses 27): each transform's profitability depends on the
+other unlocking or consuming its output.
 
-These numbers characterize the current pipeline rather than defining a stable
-performance contract. Changes to SLP, scheduling, caching, or the workload can
-change the cycle impact even when the same number of Simplify patterns match.
+These numbers characterize the current pipeline (SROA window promotion, no
+tree-level-cache pass) rather than defining a stable performance contract.
+Changes to SLP, scheduling, window promotion, or the workload can change the
+cycle impact even when the same number of Simplify patterns match.
 
 ## Diagnostics and Tests
 

@@ -27,10 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .hir import SSAValue, Const, Value, Op, Statement
+from .hir import SSAValue, Const, Value, Op, Statement, WORD_MASK
 from .use_def import UseDefContext
-
-_M = 0xFFFFFFFF
 
 
 @dataclass
@@ -61,13 +59,21 @@ class ChainLink:
 
 
 class RecurrenceAnalysis:
-    """Affine evaluation and chain discovery over a flat SSA body."""
+    """Affine evaluation and chain discovery over a flat SSA body.
+
+    When a RangeAnalysis is supplied, selects whose condition is provably
+    constant are looked through (they are copies of the proven arm), so
+    affine forms extend across wrap checks and similar folded-later guards.
+    Without it, selects stay atomic.
+    """
 
     def __init__(self, body: list[Statement], use_def: UseDefContext,
-                 max_terms: int = 6, max_depth: int = 8):
+                 max_terms: int = 6, max_depth: int = 8,
+                 ranges=None):
         self._use_def = use_def
         self._max_terms = max_terms
         self._max_depth = max_depth
+        self._ranges = ranges
         self._def_op: dict[SSAValue, tuple[int, Op]] = {}
         for pos, stmt in enumerate(body):
             if isinstance(stmt, Op) and stmt.result is not None:
@@ -88,7 +94,7 @@ class RecurrenceAnalysis:
         already-recognized chain values stay atomic.
         """
         if isinstance(value, Const):
-            return AffineExpr({}, value.value & _M)
+            return AffineExpr({}, value.value & WORD_MASK)
         if not isinstance(value, SSAValue):
             return None
 
@@ -105,9 +111,21 @@ class RecurrenceAnalysis:
 
     def _expand_op(self, op: Op, stop: Optional[set[SSAValue]],
                    depth: int) -> Optional[AffineExpr]:
-        if op.result is None or len(op.operands) != 2:
+        if op.result is None:
             return None
         opcode = op.opcode
+
+        if (opcode == "select" and len(op.operands) == 3
+                and self._ranges is not None):
+            cond_lo, cond_hi = self._ranges.range_of(op.operands[0])
+            if cond_lo >= 1:
+                return self.affine_of(op.operands[1], stop, depth + 1)
+            if cond_hi == 0:
+                return self.affine_of(op.operands[2], stop, depth + 1)
+            return None
+
+        if len(op.operands) != 2:
+            return None
         a, b = op.operands
 
         if opcode in ("+", "-"):
@@ -120,9 +138,21 @@ class RecurrenceAnalysis:
         if opcode == "*":
             const_side, expr_side = None, None
             if isinstance(b, Const):
-                const_side, expr_side = b.value & _M, a
+                const_side, expr_side = b.value & WORD_MASK, a
             elif isinstance(a, Const):
-                const_side, expr_side = a.value & _M, b
+                const_side, expr_side = a.value & WORD_MASK, b
+            if const_side is None and self._ranges is not None:
+                # Range-refined coefficient: an operand whose interval is a
+                # single point is a constant multiplier (this is how wrap
+                # checks rewritten to select-to-mul form fold through:
+                # next * in_bounds with in_bounds provably 1, or provably 0
+                # at a deterministic wrap).
+                for maybe_const, maybe_expr in ((a, b), (b, a)):
+                    if isinstance(maybe_const, SSAValue):
+                        lo, hi = self._ranges.range_of(maybe_const)
+                        if lo == hi:
+                            const_side, expr_side = lo, maybe_expr
+                            break
             if const_side is None:
                 return None
             e = self.affine_of(expr_side, stop, depth + 1)
@@ -137,7 +167,7 @@ class RecurrenceAnalysis:
             e = self.affine_of(a, stop, depth + 1)
             if e is None:
                 return None
-            return self._scale(e, (1 << b.value) & _M)
+            return self._scale(e, (1 << b.value) & WORD_MASK)
 
         return None
 
@@ -151,7 +181,7 @@ class RecurrenceAnalysis:
                 terms[atom] = new
         if len(terms) > self._max_terms:
             return None
-        return AffineExpr(terms, (ea.const + sign * eb.const) & _M,
+        return AffineExpr(terms, (ea.const + sign * eb.const) & WORD_MASK,
                           ea.interior_op_ids | eb.interior_op_ids)
 
     @staticmethod
@@ -161,7 +191,7 @@ class RecurrenceAnalysis:
             new = (coeff * factor) % (1 << 32)
             if new != 0:
                 terms[atom] = new
-        return AffineExpr(terms, (e.const * factor) & _M,
+        return AffineExpr(terms, (e.const * factor) & WORD_MASK,
                           set(e.interior_op_ids))
 
     @staticmethod

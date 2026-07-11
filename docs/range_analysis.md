@@ -124,7 +124,7 @@ exhaustion the analysis degrades to all-FULL (sound) and sets
   bounded dynamic indices WITHOUT the restrict_ptr contract. The analysis is
   built lazily on the first query that can use it, so passes whose queries
   never reach the shared-root case pay nothing.
-- **LocalMem2Reg out-of-region proof**: `LocalPointerProvenance` reports
+- **SROA out-of-region proof**: `PointerProvenance` reports
   dynamic base-relative offsets with an `offset_range` for the shapes
   `static + unrelated` and `static - unrelated` (only when the interval
   provably does not wrap). A dynamic access whose whole footprint

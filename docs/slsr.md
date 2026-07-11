@@ -155,9 +155,10 @@ help the count but hurt the schedule.
 
 ## Pipeline position and results
 
-SLSR runs after tree-level-cache and the second `simplify` (which exposes
-folded, canonical chains) and immediately before a DCE that deletes the old
-chain computations, followed by SLP vectorization of the new chains. On the
+SLSR runs after read-only window promotion (in SROA) and the
+second `simplify` (which exposes folded, canonical chains) and immediately
+before a DCE that deletes the old chain computations, followed by SLP
+vectorization of the new chains. On the
 default tree_hash build:
 
 ```text

@@ -11,6 +11,7 @@ import heapq
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..hir import WORD_MASK
 from ..pass_manager import LIRToMIRLoweringPass, PassConfig
 from ..lir import LIRFunction, LIROpcode, LIRInst
 from ..mir import MachineInst, MBundle, MachineBasicBlock, MachineFunction
@@ -43,7 +44,6 @@ class MemoryKey:
 
 
 _ADDRESS_SPACE = 1 << 32
-_ADDRESS_MASK = _ADDRESS_SPACE - 1
 
 
 ENGINE_PRIORITY = {
@@ -218,7 +218,7 @@ def _keys_alias(
         return True
 
     def intervals(start: int, width: int) -> tuple[tuple[int, int], ...]:
-        start &= _ADDRESS_MASK
+        start &= WORD_MASK
         if width >= _ADDRESS_SPACE:
             return ((0, _ADDRESS_SPACE),)
         end = start + width
@@ -239,7 +239,7 @@ def _clear_value_info(dest: int, const_val: dict[int, int], addr_expr: dict[int,
 
 
 def _set_const(dest: int, value: int, const_val: dict[int, int], addr_expr: dict[int, AddrExpr]) -> None:
-    const_val[dest] = value & _ADDRESS_MASK
+    const_val[dest] = value & WORD_MASK
     addr_expr.pop(dest, None)
 
 
@@ -247,7 +247,7 @@ def _set_addr(dest: int, base: int, offset: Optional[int],
               const_val: dict[int, int], addr_expr: dict[int, AddrExpr]) -> None:
     addr_expr[dest] = AddrExpr(
         base=base,
-        offset=None if offset is None else offset & _ADDRESS_MASK,
+        offset=None if offset is None else offset & WORD_MASK,
     )
     const_val.pop(dest, None)
 
@@ -318,7 +318,7 @@ def _update_value_info(inst: MachineInst,
     if inst.opcode == LIROpcode.ADD_IMM and isinstance(inst.dest, int):
         src, imm = inst.operands[0], int(inst.operands[1])
         if isinstance(src, int) and src in const_val:
-            _set_const(inst.dest, (const_val[src] + imm) & 0xFFFFFFFF,
+            _set_const(inst.dest, (const_val[src] + imm) & WORD_MASK,
                        const_val, addr_expr)
             return
         if isinstance(src, int) and src in addr_expr:
@@ -1373,7 +1373,7 @@ class InstSchedulingPass(LIRToMIRLoweringPass):
                         elif skipped < const_via_flow_skip:
                             skipped += 1
                         else:
-                            imm = (int(inst.operands[0]) - anchor_val) & 0xFFFFFFFF
+                            imm = (int(inst.operands[0]) - anchor_val) & WORD_MASK
                             converted.append(MachineInst(
                                 opcode=LIROpcode.ADD_IMM,
                                 dest=inst.dest,

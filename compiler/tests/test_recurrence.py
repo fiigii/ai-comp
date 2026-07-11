@@ -3,11 +3,9 @@
 import unittest
 
 from compiler.tests.conftest import HIRBuilder
-from compiler.hir import Const, Op
+from compiler.hir import Const, WORD_MASK
 from compiler.use_def import UseDefContext
 from compiler.recurrence import RecurrenceAnalysis, find_chain_links
-
-_M = 0xFFFFFFFF
 
 
 class TestAffineEvaluation(unittest.TestCase):
@@ -41,7 +39,7 @@ class TestAffineEvaluation(unittest.TestCase):
         e = ra.affine_of(t4)
         self.assertEqual(e.const, 60)
         self.assertEqual(e.terms[x], 12)
-        self.assertEqual(e.terms[y], (-1) & _M)
+        self.assertEqual(e.terms[y], (-1) & WORD_MASK)
 
     def test_shift_amount_must_be_const_right_operand(self):
         b = HIRBuilder()

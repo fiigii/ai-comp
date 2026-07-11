@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from compiler.hir import Const, ForLoop, If, Op, SSAValue
+from compiler.hir import Const, ForLoop, If, Op, SSAValue, WORD_MASK
 from compiler.hir_builder import HIRBuilder
 from compiler.range_analysis import FULL_RANGE, RangeAnalysis
 from compiler.tests.conftest import (
@@ -17,7 +17,6 @@ from compiler.tests.conftest import (
     compile_hir_to_vliw,
 )
 
-_MASK = 0xFFFFFFFF
 
 _INTERP_BINOPS = {
     "+": lambda a, b: a + b,
@@ -46,7 +45,7 @@ def interpret_hir(hir, mem, record=None):
 
     def val(v):
         if isinstance(v, Const):
-            return v.value & _MASK
+            return v.value & WORD_MASK
         return env[v]
 
     def assign(var, value):
@@ -58,7 +57,7 @@ def interpret_hir(hir, mem, record=None):
         for stmt in body:
             if isinstance(stmt, Op):
                 if stmt.opcode == "load":
-                    assign(stmt.result, mem[val(stmt.operands[0])] & _MASK)
+                    assign(stmt.result, mem[val(stmt.operands[0])] & WORD_MASK)
                 elif stmt.opcode == "store":
                     mem[val(stmt.operands[0])] = val(stmt.operands[1])
                 elif stmt.opcode == "select":

@@ -39,9 +39,9 @@ from .hir import (
     Statement,
     Value,
     Variable,
+    WORD_MASK,
 )
 
-WORD_MASK = 0xFFFFFFFF
 FULL_RANGE = (0, WORD_MASK)
 
 _Range = tuple  # (lo, hi), inclusive, always non-empty

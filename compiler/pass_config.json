@@ -5,12 +5,11 @@
     "simplify",
     "dce",
     "cse",
-    "local-mem2reg",
+    "sroa",
     "strip-assume",
     "dce",
     "load-elim",
     "dse",
-    "tree-level-cache",
     "simplify",
     "slsr",
     "dce",
@@ -56,18 +55,6 @@
       "options": {
         "restrict_ptr": true
       }
-    },
-    "tree-level-cache": {
-      "enabled": true,
-      "options": {
-        "levels": 4,
-        "estimate_ops": true,
-        "post_wrap_levels": 4
-      }
-    },
-    "local-mem2reg": {
-      "enabled": true,
-      "options": {}
     },
     "strip-assume": {
       "enabled": true,
@@ -131,6 +118,16 @@
       "enabled": true,
       "options": {
         "min_savings": 1
+      }
+    },
+    "sroa": {
+      "enabled": true,
+      "options": {
+        "table_promotion": true,
+        "restrict_ptr": true,
+        "max_window": 8,
+        "share_window": 4,
+        "repreload_gap": 10000
       }
     }
   }

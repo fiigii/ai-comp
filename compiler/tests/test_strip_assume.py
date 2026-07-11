@@ -8,17 +8,17 @@ import tempfile
 
 from compiler import HIRBuilder, PassConfig, PassManager, compile_hir_to_vliw
 from compiler.hir import If, Op
-from compiler.passes import DCEPass, LocalMem2RegPass, StripAssumePass
+from compiler.passes import DCEPass, SROAPass, StripAssumePass
 from compiler.tests.conftest import DebugInfo, Machine, N_CORES
 
 
 def _cleanup_with_promotion_disabled(hir):
     manager = PassManager()
-    manager.add_pass(LocalMem2RegPass())
+    manager.add_pass(SROAPass())
     manager.add_pass(StripAssumePass())
     manager.add_pass(DCEPass())
-    manager.config["local-mem2reg"] = PassConfig(
-        name="local-mem2reg", enabled=False, options={}
+    manager.config["sroa"] = PassConfig(
+        name="sroa", enabled=False, options={}
     )
     manager.config["strip-assume"] = PassConfig(
         name="strip-assume", enabled=True, options={}
@@ -90,7 +90,7 @@ def _config_with_local_cleanup_disabled():
     )
     with open(config_path) as config_file:
         config = json.load(config_file)
-    config["passes"]["local-mem2reg"]["enabled"] = False
+    config["passes"]["sroa"]["enabled"] = False
     config["passes"]["strip-assume"]["enabled"] = False
     return config
 
@@ -156,12 +156,12 @@ def test_default_pipeline_strips_assumptions_before_cleanup_dce():
     with open(config_path) as config_file:
         pipeline = json.load(config_file)["pipeline"]
 
-    promotion_index = pipeline.index("local-mem2reg")
+    promotion_index = pipeline.index("sroa")
     assert pipeline[promotion_index:promotion_index + 6] == [
-        "local-mem2reg",
+        "sroa",
         "strip-assume",
         "dce",
         "load-elim",
         "dse",
-        "tree-level-cache",
+        "simplify",
     ]

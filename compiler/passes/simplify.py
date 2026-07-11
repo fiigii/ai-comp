@@ -7,7 +7,8 @@ Performs constant folding and algebraic identity simplifications on HIR.
 from typing import Optional
 
 from ..hir import (
-    SSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement, HIRFunction
+    SSAValue, Const, Value, Op, Halt, Pause, ForLoop, If, Statement,
+    HIRFunction, WORD_MASK,
 )
 from ..pass_manager import Pass, PassConfig
 from ..range_analysis import RangeAnalysis
@@ -289,13 +290,13 @@ class SimplifyPass(Pass):
         if isinstance(operand, Const):
             # The VM reduces every value mod 2**32 (const immediates
             # included), so folding must read constants the same way.
-            return operand.value & 0xFFFFFFFF
+            return operand.value & WORD_MASK
         return None
 
     def _is_boolean(self, operand: Value) -> bool:
         """Check if operand is known to be boolean (0 or 1)."""
         if isinstance(operand, Const):
-            return (operand.value & 0xFFFFFFFF) in (0, 1)
+            return (operand.value & WORD_MASK) in (0, 1)
         if isinstance(operand, SSAValue):
             if operand in self._boolean_values:
                 return True
@@ -319,7 +320,7 @@ class SimplifyPass(Pass):
         result = fold_fn(left_val, right_val)
         # Apply 32-bit wrap semantics (VM uses mod 2**32)
         if result is not None:
-            result = result & 0xFFFFFFFF
+            result = result & WORD_MASK
         return result
 
     def _try_simplify_identity(
@@ -413,8 +414,8 @@ class SimplifyPass(Pass):
         return None, None
 
     _ASSOC_COMBINE = {
-        "+": lambda a, b: (a + b) & 0xFFFFFFFF,
-        "*": lambda a, b: (a * b) & 0xFFFFFFFF,
+        "+": lambda a, b: (a + b) & WORD_MASK,
+        "*": lambda a, b: (a * b) & WORD_MASK,
         "^": lambda a, b: a ^ b,
         "&": lambda a, b: a & b,
         "|": lambda a, b: a | b,
@@ -474,8 +475,8 @@ class SimplifyPass(Pass):
             return None, None
         val, amt = op.operands
         if (isinstance(val, SSAValue) and isinstance(amt, Const)
-                and 0 <= (amt.value & 0xFFFFFFFF) < 32):
-            return val, amt.value & 0xFFFFFFFF
+                and 0 <= (amt.value & WORD_MASK) < 32):
+            return val, amt.value & WORD_MASK
         return None, None
 
     def _try_mul_dist(self, op: Op) -> Optional[list[Op]]:
@@ -513,18 +514,18 @@ class SimplifyPass(Pass):
             a, k2 = self._extract_var_const(x_def)
             if a is not None and k2 is not None:
                 mul_src = a
-                mul_k = (k2 * k) & 0xFFFFFFFF
+                mul_k = (k2 * k) & WORD_MASK
         elif x_def is not None and x_def.opcode == "<<":
             a, s2 = self._shift_var_const(x_def)
             if a is not None and s2 is not None:
                 mul_src = a
-                mul_k = ((1 << s2) * k) & 0xFFFFFFFF
+                mul_k = ((1 << s2) * k) & WORD_MASK
 
         self._note_use_removed(v)
         temp = self._new_temp("mdist")
         return [
             Op("*", temp, [mul_src, Const(mul_k)], "alu"),
-            Op("+", op.result, [temp, Const((c1 * k) & 0xFFFFFFFF)], "alu"),
+            Op("+", op.result, [temp, Const((c1 * k) & WORD_MASK)], "alu"),
         ]
 
     def _try_fold_add_mul(self, op: Op) -> Optional[list[Op]]:

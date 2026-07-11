@@ -43,12 +43,11 @@ from __future__ import annotations
 from math import gcd
 from typing import Optional
 
-from ..hir import SSAValue, Const, Value, Op, ForLoop, If, Statement, HIRFunction
+from ..hir import SSAValue, Const, Value, Op, ForLoop, If, Statement, HIRFunction, WORD_MASK
 from ..pass_manager import Pass, PassConfig
 from ..recurrence import ChainLink, find_chain_links
 from ..use_def import UseDefContext
 
-_M = 0xFFFFFFFF
 _MOD = 1 << 32
 
 
@@ -63,8 +62,8 @@ def _solve_fixpoint_k(members: list[ChainLink]) -> Optional[int]:
     """
     k, mod = 0, 1  # running solution set: k (mod mod)
     for link in members:
-        a1 = (link.a - 1) & _M
-        c = link.c & _M
+        a1 = (link.a - 1) & WORD_MASK
+        c = link.c & WORD_MASK
         if a1 == 0:
             return None  # unreachable for A >= 2
         g = gcd(a1, _MOD)
@@ -216,15 +215,15 @@ class SLSRPass(Pass):
             ks: dict[SSAValue, int] = {}
             for l in members:
                 k_prev = ks.get(l.x, k_root)
-                ks[l.y] = (l.a * k_prev - l.c) & _M
+                ks[l.y] = (l.a * k_prev - l.c) & WORD_MASK
             return ks
 
         def use_delta(u: Op, y: SSAValue, k: int) -> int:
             """Signed compensation delta applied to the other operand,
             matching the rewrite exactly: '+' uses o + (-k); '-' uses o + k."""
             if u.opcode == "+":
-                return (-k) & _M
-            return k & _M
+                return (-k) & WORD_MASK
+            return k & WORD_MASK
 
         def chain_comp_pairs(members: list[ChainLink],
                              ks: dict[SSAValue, int],
@@ -235,7 +234,7 @@ class SLSRPass(Pass):
             root materialization (root_value, k_root)."""
             pairs: set[tuple] = set()
             if k_root != 0 and root_value is not None:
-                pairs.add((root_value, k_root & _M))
+                pairs.add((root_value, k_root & WORD_MASK))
             for l in members:
                 k = ks[l.y]
                 for use in use_def.get_uses(l.y):
@@ -403,7 +402,7 @@ class SLSRPass(Pass):
             """o + delta as a hoisted, globally cached op placed after both
             o's def and at_pos (never inside the leading load/const prefix,
             which SLP's entry-broadcast placement relies on)."""
-            delta &= _M
+            delta &= WORD_MASK
             key = (o, delta)
             cached = comp_cache.get(key)
             if cached is not None:
@@ -473,7 +472,7 @@ class SLSRPass(Pass):
                     continue
                 delta = use_delta(u, y, k)
                 if isinstance(other, Const):
-                    new_other: Value = Const((other.value + delta) & _M)
+                    new_other: Value = Const((other.value + delta) & WORD_MASK)
                 elif delta == 0:
                     new_other = other
                 else:
