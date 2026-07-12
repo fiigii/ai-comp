@@ -10,12 +10,13 @@ Uses DDG (Data Dependency Graph) for:
 - Checking legality (no internal dependencies)
 """
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ..hir import (
-    SSAValue, VectorSSAValue, Variable, Const, VectorConst, Value, Op, ForLoop, If,
-    Halt, Pause, Statement, HIRFunction
+    SSAValue, VectorSSAValue, Const, VectorConst, Value, Op, ForLoop, If,
+    Statement, HIRFunction
 )
 from ..alias_analysis import AliasAnalysis, AliasResult
 from ..pass_manager import Pass, PassConfig
@@ -33,33 +34,29 @@ def _make_cache_key(value: Value) -> tuple:
     - Two Const(5) objects have different id()s but represent the same value
     - This leads to cache misses for semantically identical values
 
-    For Const: Use ("const", const.value) as cache key
-    For SSAValue/VectorSSAValue: Use ("ssa", ssa.id) where .id is the semantic SSA identifier
+    Scalar and vector SSA values use separate tags because their numeric ID
+    spaces are independent.
     """
     if isinstance(value, Const):
         return ("const", value.value)
-    elif isinstance(value, (SSAValue, VectorSSAValue)):
-        return ("ssa", value.id)
-    else:
-        # Fallback for other value types
-        return ("id", id(value))
+    if isinstance(value, SSAValue):
+        return ("scalar_ssa", value.id)
+    if isinstance(value, VectorSSAValue):
+        return ("vector_ssa", value.id)
+    if isinstance(value, VectorConst):
+        return ("vector_const", value.values)
+    return ("id", id(value))
 
 # Scalar ALU ops that have vector equivalents
 VECTORIZABLE_ALU_OPS = {
     "+", "-", "*", "//", "%", "^", "&", "|", "<<", ">>", "<", "=="
 }
 
-# Commutative operations (operands can be reordered)
-COMMUTATIVE_OPS = {"+", "*", "^", "&", "|", "=="}
-
 # Scalar to vector opcode mapping
 SCALAR_TO_VECTOR_OP = {
     "+": "v+", "-": "v-", "*": "v*", "//": "v//", "%": "v%",
     "^": "v^", "&": "v&", "|": "v|", "<<": "v<<", ">>": "v>>",
     "<": "v<", "==": "v==",
-    "select": "vselect",
-    "load": "vload",
-    "store": "vstore",
 }
 
 
@@ -73,20 +70,11 @@ class Pack:
     """
     elements: list[Op]  # Exactly VLEN instructions
     opcode: str         # Common opcode
-    is_memory: bool     # True for load/store packs
     is_gather: bool = False  # True for non-consecutive load packs (vgather)
 
     def __post_init__(self):
         assert len(self.elements) == VLEN, f"Pack must have {VLEN} elements"
         assert all(op.opcode == self.opcode for op in self.elements)
-
-    def __hash__(self):
-        return hash(tuple(id(op) for op in self.elements))
-
-    def __eq__(self, other):
-        if not isinstance(other, Pack):
-            return False
-        return all(id(a) == id(b) for a, b in zip(self.elements, other.elements))
 
 
 @dataclass
@@ -94,11 +82,10 @@ class SLPContext:
     """Context for SLP vectorization within a basic block."""
     # Data dependency graph for the block
     ddg: BlockDDGs[Op]
-    # Maps scalar SSA -> (vector SSA, lane index)
-    scalar_to_vector: dict[Variable, tuple[VectorSSAValue, int]] = field(default_factory=dict)
-    # Maps cache_key(scalar_value) to its broadcast vector (for uniform scalars)
-    # Uses stable cache keys via _make_cache_key() to avoid id() misclassification
-    broadcast_cache: dict[tuple, VectorSSAValue] = field(default_factory=dict)
+    # Maps semantic scalar SSA keys -> (vector SSA, lane index).
+    scalar_to_vector: dict[tuple, tuple[VectorSSAValue, int]] = field(default_factory=dict)
+    # Maps a materialization key to a vector already emitted in this op run.
+    materialized_vector_cache: dict[tuple, VectorSSAValue] = field(default_factory=dict)
     # All discovered packs
     packs: list[Pack] = field(default_factory=list)
     # Set of ops that are part of a pack (for deduplication)
@@ -107,18 +94,19 @@ class SLPContext:
     next_vec_ssa_id: int = 0
     # Counter for new scalar SSA values (for extracts)
     next_ssa_id: int = 0
-    # Pending operations to emit (like broadcasts)
+    # Operations generated immediately before the current vector pack.
     pending_ops: list[Op] = field(default_factory=list)
-    # Deferred broadcasts: maps cache_key(scalar_operand) -> broadcast op
-    # Used to place broadcasts after their defining instruction
-    deferred_broadcasts: dict[tuple, Op] = field(default_factory=dict)
-    # Maps cache_key(result) -> op for ops that define values in this block
-    # Used to determine if a value is externally defined
-    result_to_op: dict[tuple, Op] = field(default_factory=dict)
+    # Non-constant broadcasts are placed after their final scalar definition
+    # once scalar ownership decisions have been applied.
+    ssa_broadcasts: dict[tuple, Op] = field(default_factory=dict)
     # Cache for address base/offset analysis (keyed by _make_cache_key(value))
     addr_analysis_cache: dict[tuple, tuple[Optional[tuple], int]] = field(default_factory=dict)
     # Program-order position of each op in the current block (id(op) -> idx)
     op_pos: dict[int, int] = field(default_factory=dict)
+    # Memory ops of the block in program order, with their positions
+    # (parallel lists, positions ascending; used for pack span checks)
+    mem_op_positions: list[int] = field(default_factory=list)
+    mem_ops_in_order: list[Op] = field(default_factory=list)
 
     def get_node(self, op: Op) -> Optional[DDGNode[Op]]:
         """Get DDG node for an op."""
@@ -126,6 +114,16 @@ class SLPContext:
         if op_id in self.ddg.inst_map:
             return self.ddg.inst_map[op_id]
         return None
+
+    def get_vector_mapping(
+        self, value: Value
+    ) -> Optional[tuple[VectorSSAValue, int]]:
+        return self.scalar_to_vector.get(_make_cache_key(value))
+
+    def set_vector_mapping(
+        self, value: SSAValue, vector: VectorSSAValue, lane: int
+    ) -> None:
+        self.scalar_to_vector[_make_cache_key(value)] = (vector, lane)
 
     def get_def_node(self, ssa: SSAValue) -> Optional[DDGNode[Op]]:
         """Get DDG node that defines an SSA value."""
@@ -137,11 +135,6 @@ class SLPContext:
             if isinstance(key, SSAValue) and key.id == ssa.id:
                 return node
         return None
-
-    def all_nodes(self) -> list[DDGNode[Op]]:
-        """Get all DDG nodes."""
-        return list(self.ddg.inst_map.values())
-
 
 class SLPVectorizationPass(Pass):
     """
@@ -161,14 +154,22 @@ class SLPVectorizationPass(Pass):
         super().__init__()
         self._seeds_found = 0
         self._packs_created = 0
+        self._packs_emitted = 0
+        self._packs_rejected_materialization = 0
+        self._scalar_packs_replaced = 0
+        self._scalar_packs_kept_for_early_use = 0
+        self._extracts_emitted = 0
+        self._packs_pruned_for_pressure = 0
+        self._dual_representation_lanes_before_pruning = 0
         self._ops_vectorized = 0
         self._alias: Optional[AliasAnalysis] = None
+        self._use_def: Optional[UseDefContext] = None
         # Global SSA id cursors for new values created during this pass.
         # These must be monotonically increasing across all vectorized blocks
         # in the function to avoid SSA id collisions.
         self._next_vec_ssa_id = 0
         self._next_ssa_id = 0
-        # Broadcasts to hoist to function entry (for values defined outside processed blocks)
+        # Constant broadcasts are safe to hoist to function entry.
         self._entry_broadcasts: list[Op] = []
         # Cache of already-emitted entry broadcasts by stable cache key (via _make_cache_key())
         self._entry_broadcast_cache: dict[tuple, VectorSSAValue] = {}
@@ -181,23 +182,44 @@ class SLPVectorizationPass(Pass):
         self._init_metrics()
         self._seeds_found = 0
         self._packs_created = 0
+        self._packs_emitted = 0
+        self._packs_rejected_materialization = 0
+        self._scalar_packs_replaced = 0
+        self._scalar_packs_kept_for_early_use = 0
+        self._extracts_emitted = 0
+        self._packs_pruned_for_pressure = 0
+        self._dual_representation_lanes_before_pruning = 0
         self._ops_vectorized = 0
         self._next_vec_ssa_id = hir.num_vec_ssa_values
         self._next_ssa_id = hir.num_ssa_values
         self._entry_broadcasts = []
         self._entry_broadcast_cache = {}
-        self._alias = AliasAnalysis(UseDefContext(hir), restrict_ptr=config.options.get("restrict_ptr", False))
+        self._use_def = UseDefContext(hir)
+        self._alias = AliasAnalysis(
+            self._use_def,
+            restrict_ptr=config.options.get("restrict_ptr", False),
+        )
         self._vectorize_memory = config.options.get("vectorize_memory", True)
         self._gather = config.options.get("gather", True)
         self._vectorize_alu = config.options.get("vectorize_alu", True)
+        # A varying VectorConst costs eight entry loads and eight long-lived
+        # scratch words. Keep it opt-in until a target cost model can prove
+        # that the load/register cost is amortized across enough packs.
+        self._vectorize_varying_constants = config.options.get(
+            "vectorize_varying_constants", False)
+        self._dual_representation_prune_threshold = int(config.options.get(
+            "dual_representation_prune_threshold", 512))
+        if self._dual_representation_prune_threshold < 0:
+            raise ValueError(
+                "dual_representation_prune_threshold must be >= 0")
 
         if not config.enabled:
             return hir
 
         # Transform the function body
-        new_body = self._transform_statements(hir.body, hir)
+        new_body = self._transform_statements(hir.body)
 
-        # Insert hoisted broadcasts at function entry (after existing entry ops)
+        # Insert hoisted constant broadcasts after existing entry ops.
         if self._entry_broadcasts:
             # Find the insertion point: after initial loads/consts, before loops
             insert_idx = 0
@@ -217,6 +239,14 @@ class SLPVectorizationPass(Pass):
             self._metrics.custom = {
                 "seeds_found": self._seeds_found,
                 "packs_created": self._packs_created,
+                "packs_emitted": self._packs_emitted,
+                "packs_rejected_materialization": self._packs_rejected_materialization,
+                "scalar_packs_replaced": self._scalar_packs_replaced,
+                "scalar_packs_kept_for_early_use": self._scalar_packs_kept_for_early_use,
+                "extracts_emitted": self._extracts_emitted,
+                "packs_pruned_for_pressure": self._packs_pruned_for_pressure,
+                "dual_representation_lanes_before_pruning": (
+                    self._dual_representation_lanes_before_pruning),
                 "ops_vectorized": self._ops_vectorized,
             }
 
@@ -230,7 +260,6 @@ class SLPVectorizationPass(Pass):
     def _transform_statements(
         self,
         stmts: list[Statement],
-        hir: HIRFunction
     ) -> list[Statement]:
         """Transform a list of statements, vectorizing straight-line Op segments.
 
@@ -241,9 +270,9 @@ class SLPVectorizationPass(Pass):
 
         for stmt in stmts:
             if isinstance(stmt, ForLoop):
-                transformed.append(self._transform_for_loop(stmt, hir))
+                transformed.append(self._transform_for_loop(stmt))
             elif isinstance(stmt, If):
-                transformed.append(self._transform_if(stmt, hir))
+                transformed.append(self._transform_if(stmt))
             else:
                 # Op, Halt, Pause
                 transformed.append(stmt)
@@ -264,7 +293,7 @@ class SLPVectorizationPass(Pass):
 
             op_run = [s for s in transformed[i:j] if isinstance(s, Op)]
             if len(op_run) >= VLEN:
-                vectorized = self._vectorize_block(op_run, hir)
+                vectorized = self._vectorize_block(op_run)
                 if vectorized is not None:
                     out.extend(vectorized)
                 else:
@@ -276,9 +305,9 @@ class SLPVectorizationPass(Pass):
 
         return out
 
-    def _transform_for_loop(self, loop: ForLoop, hir: HIRFunction) -> ForLoop:
+    def _transform_for_loop(self, loop: ForLoop) -> ForLoop:
         """Transform a ForLoop, vectorizing its body."""
-        new_body = self._transform_statements(loop.body, hir)
+        new_body = self._transform_statements(loop.body)
 
         return ForLoop(
             counter=loop.counter,
@@ -292,10 +321,10 @@ class SLPVectorizationPass(Pass):
             pragma_unroll=loop.pragma_unroll
         )
 
-    def _transform_if(self, if_stmt: If, hir: HIRFunction) -> If:
+    def _transform_if(self, if_stmt: If) -> If:
         """Transform an If statement, vectorizing its branches."""
-        new_then = self._transform_statements(if_stmt.then_body, hir)
-        new_else = self._transform_statements(if_stmt.else_body, hir)
+        new_then = self._transform_statements(if_stmt.then_body)
+        new_else = self._transform_statements(if_stmt.else_body)
 
         return If(
             cond=if_stmt.cond,
@@ -309,7 +338,6 @@ class SLPVectorizationPass(Pass):
     def _vectorize_block(
         self,
         ops: list[Op],
-        hir: HIRFunction
     ) -> Optional[list[Statement]]:
         """
         Try to vectorize a flat block of operations using DDG.
@@ -324,20 +352,17 @@ class SLPVectorizationPass(Pass):
         builder = HIRDDGBuilder()
         ddg = builder.build(ops, build_dags=False)
 
-        # Build map from cache_key(result) -> op for ops that define values in this block
-        result_to_op: dict[tuple, Op] = {}
-        for op in ops:
-            if op.result:
-                result_to_op[_make_cache_key(op.result)] = op
-
         # Create SLP context
         ctx = SLPContext(
             ddg=ddg,
             next_vec_ssa_id=self._next_vec_ssa_id,
             next_ssa_id=self._next_ssa_id,
-            result_to_op=result_to_op,
             op_pos={id(op): i for i, op in enumerate(ops)}
         )
+        for i, op in enumerate(ops):
+            if op.opcode in ("load", "vload", "store", "vstore", "vgather"):
+                ctx.mem_op_positions.append(i)
+                ctx.mem_ops_in_order.append(op)
 
         # Phase 1: Find seeds from DDG store roots
         seeds = self._find_seeds_from_ddg(ops, ctx)
@@ -350,23 +375,23 @@ class SLPVectorizationPass(Pass):
         for seed in seeds:
             self._extend_pack_via_ddg(seed, ctx)
 
-        self._packs_created = len(ctx.packs)
+        self._packs_created += len(ctx.packs)
 
         if not ctx.packs:
             return None
 
-        # Phase 3: Check legality
-        legal_packs = [p for p in ctx.packs if self._is_legal_pack(p, ctx)]
+        # Pack registration has already established legality.
+        legal_packs = list(ctx.packs)
 
-        # Phase 3b: Filter packs by config knobs
+        # Phase 3: Filter registered packs by config knobs.
         if not self._vectorize_memory:
             legal_packs = [p for p in legal_packs if p.opcode not in ("store", "load")]
 
         if not legal_packs:
             return None
 
-        # Phase 4: Generate vector code
-        vectorized = self._generate_vector_code(ops, legal_packs, ctx, hir)
+        # Phase 4: Select profitable packs and generate vector code.
+        vectorized = self._generate_vector_code(ops, legal_packs, ctx)
 
         # Advance global SSA cursors to avoid collisions across blocks.
         self._next_vec_ssa_id = max(self._next_vec_ssa_id, ctx.next_vec_ssa_id)
@@ -386,7 +411,7 @@ class SLPVectorizationPass(Pass):
 
         if len(stores) >= VLEN:
             # Group stores by base address pattern and find consecutive groups
-            store_seeds = self._find_consecutive_ops(stores, ctx)
+            store_seeds = self._find_consecutive_store_packs(stores, ctx)
             seeds.extend(store_seeds)
 
         # Gather-load seeds: groups of VLEN loads from the same base with
@@ -418,16 +443,12 @@ class SLPVectorizationPass(Pass):
           loaded value (e.g. pointer chasing): the fused gather reads all
           lanes simultaneously, which would break that dependency.
         """
-        op_pos: dict[int, int] = {id(op): i for i, op in enumerate(ops)}
-        store_positions = [i for i, op in enumerate(ops)
-                           if op.opcode in ("store", "vstore")]
-
         def addr_depends_on_pack(pack_ops: list[Op]) -> bool:
             """True if any element's address chain reaches another element's
             loaded value. Walks def chains, pruned at ops defined before the
             pack's first element (those cannot depend on pack results)."""
             results = {op.result for op in pack_ops if op.result is not None}
-            first_pos = min(op_pos[id(op)] for op in pack_ops)
+            first_pos = min(ctx.op_pos[id(op)] for op in pack_ops)
             seen: set = set()
             stack = [op.operands[0] for op in pack_ops]
             while stack:
@@ -441,33 +462,10 @@ class SLPVectorizationPass(Pass):
                 if def_node is None:
                     continue
                 d = def_node.instruction
-                pos = op_pos.get(id(d))
+                pos = ctx.op_pos.get(id(d))
                 if pos is None or pos < first_pos:
                     continue
                 stack.extend(o for o in d.operands if isinstance(o, SSAValue))
-            return False
-
-        def blocking_store_in_span(lo: int, hi: int, pack_ops: list[Op]) -> bool:
-            """True if any store between the pack's elements may alias any
-            of the pack's loads (crossing it would be illegal)."""
-            from bisect import bisect_left, bisect_right
-            load_keys = None
-            for k in range(bisect_right(store_positions, lo),
-                           bisect_left(store_positions, hi)):
-                store = ops[store_positions[k]]
-                store_key = self._alias.normalize(store.operands[0])
-                if store_key is None:
-                    return True
-                store_width = VLEN if store.opcode == "vstore" else 1
-                if load_keys is None:
-                    load_keys = [self._alias.normalize(op.operands[0])
-                                 for op in pack_ops]
-                for load_key in load_keys:
-                    if load_key is None:
-                        return True
-                    if self._alias.alias_keys(load_key, 1, store_key,
-                                              store_width) != AliasResult.NO_ALIAS:
-                        return True
             return False
 
         candidates: list[tuple[Op, Op]] = []
@@ -519,89 +517,68 @@ class SLPVectorizationPass(Pass):
             groups[key].append(op)
 
         packs: list[Pack] = []
-        for key in group_order:
-            group = groups[key]
-            for start in range(0, len(group) - VLEN + 1, VLEN):
+        for group_key in group_order:
+            group = groups[group_key]
+            start = 0
+            while start + VLEN <= len(group):
                 pack_ops = group[start:start + VLEN]
                 if any(id(op) in ctx.packed_ops for op in pack_ops):
-                    continue
-                positions = [op_pos[id(op)] for op in pack_ops]
-                if blocking_store_in_span(min(positions), max(positions), pack_ops):
+                    start += 1
                     continue
                 if addr_depends_on_pack(pack_ops):
+                    start += 1
                     continue
-                pack = Pack(elements=pack_ops, opcode="load",
-                            is_memory=True, is_gather=True)
-                packs.append(pack)
-                ctx.packs.append(pack)
-                for op in pack_ops:
-                    ctx.packed_ops.add(id(op))
+                pack = Pack(elements=pack_ops, opcode="load", is_gather=True)
+                if self._register_pack(pack, ctx):
+                    packs.append(pack)
+                    start += VLEN
+                else:
+                    start += 1
         return packs
 
-    def _find_consecutive_ops(
+    def _find_consecutive_store_packs(
         self,
         ops: list[Op],
         ctx: SLPContext
     ) -> list[Pack]:
-        """Find groups of VLEN operations with consecutive addresses."""
+        """Find program-order store groups with consecutive addresses.
+
+        Pairing the k-th occurrence of each offset can mix different unrolled
+        iterations after an earlier DSE removes an uneven subset of stores.
+        Instead, scan each normalized-base stream in program order and only
+        register an actual adjacent run of increasing offsets.
+        """
         packs = []
 
         if len(ops) < VLEN:
             return packs
 
-        # Group by base address pattern, then by constant offset.
-        #
-        # Note: With full unrolling (e.g., unrolling an outer "rounds" loop),
-        # the same offset can appear many times for the same base. A naive
-        # "sort-by-offset then take a contiguous window" approach fails because
-        # duplicates cluster as [0,0,0,...,1,1,1,...] and no 0..7 run exists.
-        addr_groups: dict[tuple, dict[int, list[Op]]] = {}  # base -> {offset -> [op, ...]}
+        addr_groups: dict[tuple, list[tuple[int, Op]]] = {}
 
         for op in ops:
             addr = op.operands[0]
             base, offset = self._analyze_address(addr, ctx)
             if base is None:
                 continue
-            by_off = addr_groups.setdefault(base, {})
-            by_off.setdefault(offset, []).append(op)
+            addr_groups.setdefault(base, []).append((offset, op))
 
-        # Find complete groups of VLEN consecutive offsets. If an offset occurs
-        # multiple times, form multiple packs by pairing the k-th occurrence of
-        # each offset together (this matches unrolled loop structure).
-        for _, by_off in addr_groups.items():
-            if sum(len(v) for v in by_off.values()) < VLEN:
-                continue
-
-            offsets = sorted(by_off.keys())
-            offsets_set = set(offsets)
-
-            # Only consider non-overlapping packs. This is important for
-            # performance on large unrolled blocks.
+        for stream in addr_groups.values():
             i = 0
-            while i < len(offsets):
-                start_offset = offsets[i]
-                if not all((start_offset + j) in offsets_set for j in range(VLEN)):
+            while i + VLEN <= len(stream):
+                window = stream[i:i + VLEN]
+                start_offset = window[0][0]
+                if [offset for offset, _ in window] != list(
+                        range(start_offset, start_offset + VLEN)):
                     i += 1
                     continue
 
-                max_packs = min(len(by_off[start_offset + j]) for j in range(VLEN))
-                for k in range(max_packs):
-                    pack_ops = [by_off[start_offset + j][k] for j in range(VLEN)]
-
-                    # Check not already packed
-                    if any(id(op) in ctx.packed_ops for op in pack_ops):
-                        continue
-
-                    opcode = pack_ops[0].opcode
-                    pack = Pack(elements=pack_ops, opcode=opcode, is_memory=True)
+                pack_ops = [op for _, op in window]
+                pack = Pack(elements=pack_ops, opcode=pack_ops[0].opcode)
+                if self._register_pack(pack, ctx):
                     packs.append(pack)
-                    for op in pack_ops:
-                        ctx.packed_ops.add(id(op))
-                    ctx.packs.append(pack)
-
-                # Advance to the next disjoint window start.
-                next_start = start_offset + VLEN
-                while i < len(offsets) and offsets[i] < next_start:
+                    i += VLEN
+                else:
+                    # A rejected window must not hide a legal overlapping run.
                     i += 1
 
         return packs
@@ -660,7 +637,8 @@ class SLPVectorizationPass(Pass):
             for operand_idx in range(num_operands):
                 # Skip address operand for memory ops (except gathers, whose
                 # per-lane address chain is exactly what we want to vectorize)
-                if pack.is_memory and operand_idx == 0 and not pack.is_gather:
+                if (pack.opcode in ("load", "store")
+                        and operand_idx == 0 and not pack.is_gather):
                     continue
 
                 # Collect operand definitions via DDG
@@ -680,12 +658,9 @@ class SLPVectorizationPass(Pass):
                 if None in operand_ops:
                     continue
 
-                # Check if they can form a pack
-                if self._can_form_pack(operand_ops, ctx):
-                    new_pack = self._try_create_pack(operand_ops, ctx)
-                    if new_pack:
-                        ctx.packs.append(new_pack)
-                        worklist.append(new_pack)
+                new_pack = self._try_create_pack(operand_ops, ctx)
+                if new_pack and self._register_pack(new_pack, ctx):
+                    worklist.append(new_pack)
 
     def _can_form_pack(self, ops: list[Optional[Op]], ctx: SLPContext) -> bool:
         """Check if a list of ops can form a valid pack."""
@@ -744,13 +719,11 @@ class SLPVectorizationPass(Pass):
         if not all(b == first_base for b, _ in base_offsets):
             return False
 
-        # Consecutive offsets
-        offsets = sorted(o for _, o in base_offsets)
-        for i in range(len(offsets) - 1):
-            if offsets[i + 1] - offsets[i] != 1:
-                return False
-
-        return True
+        # Lane order matters: vload uses lane 0's address as its base and
+        # returns increasing addresses in lanes 0..VLEN-1. Sorting here would
+        # incorrectly accept a reversed or permuted producer pack.
+        offsets = [offset for _, offset in base_offsets]
+        return offsets == list(range(offsets[0], offsets[0] + VLEN))
 
     def _try_create_pack(self, ops: list[Op], ctx: SLPContext) -> Optional[Pack]:
         """Try to create a pack from the given ops."""
@@ -761,12 +734,24 @@ class SLPVectorizationPass(Pass):
             return None
 
         opcode = ops[0].opcode
-        pack = Pack(elements=list(ops), opcode=opcode, is_memory=False)
+        return Pack(elements=list(ops), opcode=opcode)
 
-        for op in ops:
-            ctx.packed_ops.add(id(op))
+    def _register_pack(self, pack: Pack, ctx: SLPContext) -> bool:
+        """Register a fully legal, non-overlapping pack.
 
-        return pack
+        Keeping validation before the packed_ops update prevents a rejected
+        candidate from hiding a later legal grouping of the same operations.
+        """
+        if any(id(op) in ctx.packed_ops for op in pack.elements):
+            return False
+        if not self._is_legal_pack(pack, ctx):
+            return False
+        if not self._can_materialize_pack(pack):
+            self._packs_rejected_materialization += 1
+            return False
+        ctx.packs.append(pack)
+        ctx.packed_ops.update(id(op) for op in pack.elements)
+        return True
 
     def _pack_elements_interdependent(self, ops: list[Op], ctx: SLPContext) -> bool:
         """True if any element depends (transitively) on another element's
@@ -821,6 +806,67 @@ class SLPVectorizationPass(Pass):
                     if dep and id(dep) in pack_node_ids:
                         return False
 
+        # Memory packs move earlier elements down to the last element's
+        # position, so validate their full memory span before registration.
+        if pack.opcode in ("load", "store"):
+            if not self._mem_pack_span_is_legal(pack.elements, ctx):
+                return False
+
+        return True
+
+    def _mem_pack_span_is_legal(self, pack_ops: list[Op], ctx: SLPContext) -> bool:
+        """Check that fusing memory ops at the last element's position is legal.
+
+        Codegen emits one vector memory op at the LAST element's position, so
+        every earlier element is moved down across the ops in between.
+        Crossing an intervening memory op is illegal when it may touch a
+        moved element's address:
+        - a store pack must not cross may-aliasing loads or stores,
+        - a load pack must not cross may-aliasing stores (loads commute).
+        """
+        assert self._alias is not None
+        positions = [ctx.op_pos.get(id(op)) for op in pack_ops]
+        if any(p is None for p in positions):
+            return False
+        lo, hi = min(positions), max(positions)
+        if hi - lo < 2:
+            return True
+
+        member_ids = {id(op) for op in pack_ops}
+        elem_widths = []
+        elem_keys = []
+        for op in pack_ops:
+            key = self._alias.normalize(op.operands[0])
+            if key is None:
+                return False
+            elem_keys.append(key)
+            elem_widths.append(VLEN if op.opcode in ("vload", "vstore") else 1)
+        is_store_pack = pack_ops[0].opcode in ("store", "vstore")
+        moved = sorted(zip(positions, elem_keys, elem_widths))
+
+        start = bisect_right(ctx.mem_op_positions, lo)
+        end = bisect_left(ctx.mem_op_positions, hi)
+        for idx in range(start, end):
+            q = ctx.mem_op_positions[idx]
+            m = ctx.mem_ops_in_order[idx]
+            if id(m) in member_ids:
+                continue
+            m_is_store = m.opcode in ("store", "vstore")
+            if not (m_is_store or is_store_pack):
+                continue
+            m_key = self._alias.normalize(m.operands[0])
+            if m_key is None:
+                # Unknown address (e.g. a vector-addressed access) inside
+                # the span may touch anything.
+                return False
+            m_width = VLEN if m.opcode in ("vload", "vstore") else 1
+            # Only elements positioned before q are moved across m.
+            for p, key, width in moved:
+                if p >= q:
+                    break
+                if self._alias.alias_keys(key, width, m_key,
+                                          m_width) != AliasResult.NO_ALIAS:
+                    return False
         return True
 
     def _generate_vector_code(
@@ -828,268 +874,371 @@ class SLPVectorizationPass(Pass):
         original_ops: list[Op],
         packs: list[Pack],
         ctx: SLPContext,
-        hir: HIRFunction
     ) -> list[Statement]:
+        """Generate committed vector packs at their last scalar element.
+
+        Store packs replace their scalar stores. Pure/load packs transfer
+        ownership to the vector result when every earlier scalar use is also
+        covered lane-wise by a later vector pack; otherwise their scalar
+        definitions remain in program order. Required non-vector uses receive
+        extracts after the vector definition. A following DCE is useful as
+        cleanup but is no longer responsible for removing whole scalar chains.
+
+        A side-effect-free preflight rejects packs whose operand columns
+        cannot be materialized. Code generation is therefore commit-only:
+        once it starts, it must succeed and may safely update caches/mappings.
         """
-        Generate vectorized code from the packs.
-
-        Strategy:
-        1. Walk through original ops in order
-        2. When we see the LAST element of a pack, emit vector op
-        3. Skip other elements of vectorized packs
-        4. Defer non-pack ops that depend on vectorized values
-
-        Broadcast placement:
-        - Constants: hoisted to function entry (always safe, handled by _get_or_create_broadcast)
-        - SSA defined in this block: placed immediately after the defining instruction
-        - SSA defined outside this block: placed at block start (not function entry, dominance)
-        """
-        pack_results: dict[int, VectorSSAValue] = {}
-        op_index: dict[int, int] = {id(op): i for i, op in enumerate(original_ops)}
-
-        # Treat all discovered packs as candidates; if operand materialization
-        # fails, we fall back to emitting scalars in _generate_vector_code.
-        vectorizable_packs = packs
-
-        if not vectorizable_packs:
+        op_index = {id(op): i for i, op in enumerate(original_ops)}
+        packs, replaceable_pack_ids, scalar_extracts = (
+            self._select_packs_for_emission(packs, op_index)
+        )
+        if not packs:
             return original_ops
 
-        # Collect pack element results
-        pack_element_results: set[int] = set()
-        for pack in vectorizable_packs:
-            for elem in pack.elements:
-                if elem.result:
-                    pack_element_results.add(id(elem.result))
-
-        # Map last element -> pack
         last_element_to_pack: dict[int, Pack] = {}
-        pack_elements: set[int] = set()
-        for pack in vectorizable_packs:
-            elem_ids = [id(elem) for elem in pack.elements]
-            pack_elements.update(elem_ids)
+        for pack in packs:
+            last_element = max(
+                pack.elements,
+                key=lambda elem: op_index.get(id(elem), -1),
+            )
+            if id(last_element) in op_index:
+                if id(last_element) in last_element_to_pack:
+                    raise RuntimeError("overlapping SLP packs share an anchor")
+                last_element_to_pack[id(last_element)] = pack
 
-            last_elem_id = max(elem_ids, key=lambda eid: op_index.get(eid, -1))
-            if op_index.get(last_elem_id, -1) >= 0:
-                last_element_to_pack[last_elem_id] = pack
-
-        # Generate code incrementally, tracking broadcasts for later placement
         result: list[Statement] = []
-        emitted_packs: set[int] = set()
-        defined_values: set[int] = set()
-        deferred_results: set[int] = set()
-        deferred_ops: list[Op] = []
-        emitted_broadcasts: set[tuple] = set()  # Track which broadcasts have been emitted (by cache key)
-
-        def emit_deferred_ops():
-            nonlocal deferred_ops
-            changed = True
-            while changed:
-                changed = False
-                still_deferred = []
-                for deferred_op in deferred_ops:
-                    can_emit = True
-                    for operand in deferred_op.operands:
-                        if isinstance(operand, SSAValue):
-                            op_id = id(operand)
-                            if op_id in pack_element_results and op_id not in defined_values:
-                                can_emit = False
-                                break
-                            if op_id in deferred_results and op_id not in defined_values:
-                                can_emit = False
-                                break
-                    if can_emit:
-                        result.append(deferred_op)
-                        if deferred_op.result:
-                            defined_values.add(id(deferred_op.result))
-                            deferred_results.discard(id(deferred_op.result))
-                        changed = True
-                    else:
-                        still_deferred.append(deferred_op)
-                deferred_ops = still_deferred
-
-        def emit_broadcasts_for_value(value: Value):
-            """Emit any broadcasts that use this value as their scalar operand."""
-            cache_key = _make_cache_key(value)
-            if cache_key in ctx.deferred_broadcasts and cache_key not in emitted_broadcasts:
-                broadcast_op = ctx.deferred_broadcasts[cache_key]
-                result.append(broadcast_op)
-                emitted_broadcasts.add(cache_key)
+        suppressed_store_ids: set[int] = set()
+        suppressed_scalar_ids: set[int] = set()
 
         for op in original_ops:
-            op_id = id(op)
+            result.append(op)
 
-            if op_id in pack_elements:
-                if op_id in last_element_to_pack:
-                    pack = last_element_to_pack[op_id]
-                    pack_hash = hash(pack)
-                    if pack_hash in emitted_packs:
+            pack = last_element_to_pack.get(id(op))
+            if pack is None:
+                continue
+
+            ctx.pending_ops.clear()
+            vec_op = self._generate_pack_code(pack, ctx)
+
+            result.extend(ctx.pending_ops)
+            ctx.pending_ops.clear()
+            result.append(vec_op)
+            self._packs_emitted += 1
+            self._ops_vectorized += VLEN
+
+            if pack.opcode == "store":
+                suppressed_store_ids.update(id(elem) for elem in pack.elements)
+            elif id(pack) in replaceable_pack_ids:
+                suppressed_scalar_ids.update(id(elem) for elem in pack.elements)
+                self._scalar_packs_replaced += 1
+                assert self._use_def is not None
+                for lane, elem in enumerate(pack.elements):
+                    if elem.result is None or elem.result not in scalar_extracts:
                         continue
-                    ctx.pending_ops.clear()
-
-                    vec_op = self._generate_pack_code(pack, ctx, pack_results, hir)
-                    if vec_op:
-                        # Emit pending ops (non-broadcast ops like vextract, vadd, vgather)
-                        while ctx.pending_ops:
-                            result.append(ctx.pending_ops.pop(0))
-
-                        result.append(vec_op)
-                        self._ops_vectorized += VLEN
-                        emitted_packs.add(pack_hash)
-
-                        # Emit vextracts for scalar uses (all packs except store, which has no result)
-                        if pack.opcode != "store":
-                            for lane, pack_op in enumerate(pack.elements):
-                                if pack_op.result:
-                                    has_scalar_use = self._has_scalar_use(pack_op, pack_elements, ctx)
-                                    if has_scalar_use:
-                                        vec_ssa = ctx.scalar_to_vector.get(pack_op.result)
-                                        if vec_ssa:
-                                            vec_val, _ = vec_ssa
-                                            extract_op = Op(
-                                                opcode="vextract",
-                                                result=pack_op.result,
-                                                operands=[vec_val, Const(lane)],
-                                                engine="alu"
-                                            )
-                                            result.append(extract_op)
-                                            defined_values.add(id(pack_op.result))
-
-                        emit_deferred_ops()
-                    else:
-                        ctx.pending_ops.clear()
-                        emitted_packs.add(pack_hash)
-                        # Emit scalar ops
-                        elems_in_order = sorted(
-                            pack.elements,
-                            key=lambda elem: op_index.get(id(elem), -1),
-                        )
-                        for elem in elems_in_order:
-                            result.append(elem)
-                            if elem.result:
-                                defined_values.add(id(elem.result))
-                                # Emit broadcasts for this newly defined value
-                                emit_broadcasts_for_value(elem.result)
+                    result.append(Op(
+                        opcode="vextract",
+                        result=elem.result,
+                        operands=[vec_op.result, Const(lane)],
+                        engine="alu",
+                    ))
+                    self._extracts_emitted += 1
             else:
-                # Non-pack op
-                needs_defer = False
-                for operand in op.operands:
-                    if isinstance(operand, SSAValue):
-                        operand_id = id(operand)
-                        if operand_id in pack_element_results and operand_id not in defined_values:
-                            needs_defer = True
-                            break
-                        if operand_id in deferred_results and operand_id not in defined_values:
-                            needs_defer = True
-                            break
+                self._scalar_packs_kept_for_early_use += 1
 
-                if needs_defer:
-                    deferred_ops.append(op)
-                    if op.result:
-                        deferred_results.add(id(op.result))
-                else:
-                    result.append(op)
-                    if op.result:
-                        defined_values.add(id(op.result))
-                        # Emit broadcasts for this newly defined value
-                        emit_broadcasts_for_value(op.result)
+        suppressed_ids = suppressed_store_ids | suppressed_scalar_ids
+        if suppressed_ids:
+            result = [
+                stmt for stmt in result
+                if id(stmt) not in suppressed_ids
+            ]
 
-        # Emit remaining deferred ops
-        while deferred_ops:
-            prev_len = len(deferred_ops)
-            emit_deferred_ops()
-            if len(deferred_ops) == prev_len:
-                for deferred_op in deferred_ops:
-                    result.append(deferred_op)
+        # Give the scheduler the full def-to-consumer interval. A replaced
+        # scalar pack may move a definition to a generated vextract, so find
+        # definitions in the final result rather than in the original block.
+        def_index = {
+            _make_cache_key(stmt.result): index
+            for index, stmt in enumerate(result)
+            if stmt.result is not None
+        }
+        prefix_ops: list[Op] = []
+        broadcasts_after: dict[int, list[Op]] = {}
+        for scalar_key, broadcast in ctx.ssa_broadcasts.items():
+            index = def_index.get(scalar_key)
+            if index is None:
+                # Region inputs (for example loop counters/body parameters)
+                # are available at the start of this flat op run.
+                prefix_ops.append(broadcast)
+            else:
+                broadcasts_after.setdefault(index, []).append(broadcast)
+
+        if broadcasts_after:
+            placed: list[Statement] = []
+            for index, stmt in enumerate(result):
+                placed.append(stmt)
+                placed.extend(broadcasts_after.get(index, ()))
+            result = placed
+        return [*prefix_ops, *result]
+
+    def _select_packs_for_emission(
+        self,
+        packs: list[Pack],
+        op_index: dict[int, int],
+    ) -> tuple[list[Pack], set[int], set[SSAValue]]:
+        """Apply a pressure bailout to large partial-vectorization regions.
+
+        A pack that cannot own its scalar definitions creates a second live
+        representation. Small cases are left alone because the extra vector
+        work can still be profitable. Once the configured lane budget is
+        exceeded, retain only closed vector components: remove those dual
+        packs and every consumer that would otherwise rebuild a removed pack
+        with a vinsert chain.
+        """
+        replaceable, extracts = self._plan_scalar_pack_replacements(
+            packs, op_index)
+        dual_lanes = sum(
+            VLEN
+            for pack in packs
+            if pack.opcode != "store" and id(pack) not in replaceable
+        )
+        self._dual_representation_lanes_before_pruning += dual_lanes
+        if dual_lanes <= self._dual_representation_prune_threshold:
+            return packs, replaceable, extracts
+
+        original_packs = list(packs)
+        result_owner = {
+            elem.result: pack
+            for pack in original_packs
+            if pack.opcode != "store"
+            for elem in pack.elements
+            if elem.result is not None
+        }
+        selected = list(original_packs)
+
+        while True:
+            replaceable, _ = self._plan_scalar_pack_replacements(
+                selected, op_index)
+            selected_ids = {id(pack) for pack in selected}
+            remove_ids = {
+                id(pack)
+                for pack in selected
+                if pack.opcode != "store" and id(pack) not in replaceable
+            }
+
+            for pack in selected:
+                operand_indices = self._vector_operand_indices(pack) or ()
+                for operand_idx in operand_indices:
+                    column = [
+                        elem.operands[operand_idx]
+                        for elem in pack.elements
+                    ]
+                    owner = result_owner.get(column[0])
+                    if owner is None or id(owner) in selected_ids:
+                        continue
+                    if all(
+                        self._values_equal(
+                            value, owner.elements[lane].result)
+                        for lane, value in enumerate(column)
+                    ):
+                        remove_ids.add(id(pack))
+                        break
+
+            if not remove_ids:
                 break
+            selected = [
+                pack for pack in selected if id(pack) not in remove_ids
+            ]
 
-        # Emit any remaining deferred broadcasts that weren't emitted
-        # (these are for values defined in this block but processed before
-        # the broadcast was created during pack code generation)
-        #
-        # Pre-build an index for O(1) lookup (Issue #5: O(n*m) late insertion performance)
-        result_index: dict[int, int] = {id(stmt): i for i, stmt in enumerate(result) if isinstance(stmt, Op)}
+        self._packs_pruned_for_pressure += len(original_packs) - len(selected)
+        replaceable, extracts = self._plan_scalar_pack_replacements(
+            selected, op_index)
+        return selected, replaceable, extracts
 
-        # Track insertions to adjust positions
-        insertions: list[tuple[int, Op]] = []
+    def _plan_scalar_pack_replacements(
+        self,
+        packs: list[Pack],
+        op_index: dict[int, int],
+    ) -> tuple[set[int], set[SSAValue]]:
+        """Find packs whose vector result may own the scalar definitions.
 
-        for cache_key, broadcast_op in ctx.deferred_broadcasts.items():
-            if cache_key not in emitted_broadcasts:
-                defining_op = ctx.result_to_op.get(cache_key)
-                if defining_op and id(defining_op) in result_index:
-                    # Value defined in this block - insert after defining op
-                    insert_pos = result_index[id(defining_op)] + 1
-                    insertions.append((insert_pos, broadcast_op))
-                    emitted_broadcasts.add(cache_key)
-                # Note: External values (not in result_to_op) are hoisted to function
-                # entry in _get_or_create_broadcast, so they won't be in deferred_broadcasts
+        A use at or after the producer anchor can be preserved by an extract.
+        An earlier use is also safe when it is a lane-wise operand of another
+        pack whose scalar elements will themselves be removed. Compute the
+        greatest fixed point of those mutually vector-owned packs. Uniform or
+        partially matched early consumers keep the producer scalar pack alive.
+        """
+        assert self._use_def is not None
+        op_to_pack = {
+            id(elem): pack
+            for pack in packs
+            for elem in pack.elements
+        }
+        anchors = {
+            id(pack): max(op_index[id(elem)] for elem in pack.elements)
+            for pack in packs
+        }
+        replaceable = {id(pack) for pack in packs if pack.opcode != "store"}
 
-        # Sort insertions by position in descending order to maintain correct indices
-        insertions.sort(key=lambda x: x[0], reverse=True)
-        for insert_pos, broadcast_op in insertions:
-            result.insert(insert_pos, broadcast_op)
+        def use_is_vector_owned(
+            producer: Pack,
+            use_statement: Op,
+            operand_idx: int,
+        ) -> bool:
+            consumer = op_to_pack.get(id(use_statement))
+            if consumer is None:
+                return False
+            if (consumer.opcode != "store"
+                    and id(consumer) not in replaceable):
+                return False
+            if anchors[id(consumer)] <= anchors[id(producer)]:
+                return False
+            if operand_idx < 0:
+                return False
+            producer_results = [elem.result for elem in producer.elements]
+            consumer_column = [
+                elem.operands[operand_idx]
+                for elem in consumer.elements
+                if operand_idx < len(elem.operands)
+            ]
+            return (
+                len(consumer_column) == VLEN
+                and all(
+                    self._values_equal(value, producer_results[lane])
+                    for lane, value in enumerate(consumer_column)
+                )
+            )
 
-        return result if result else original_ops
+        changed = True
+        while changed:
+            changed = False
+            for pack in packs:
+                pack_id = id(pack)
+                if pack_id not in replaceable:
+                    continue
+                anchor_pos = anchors[pack_id]
+                keep_scalars = False
+                for elem in pack.elements:
+                    if elem.result is None:
+                        continue
+                    for use in self._use_def.get_uses(elem.result):
+                        use_pos = op_index.get(id(use.statement))
+                        if use_pos is None or use_pos >= anchor_pos:
+                            continue
+                        if (not isinstance(use.statement, Op)
+                                or not use_is_vector_owned(
+                                    pack, use.statement, use.operand_index)):
+                            keep_scalars = True
+                            break
+                    if keep_scalars:
+                        break
+                if keep_scalars:
+                    replaceable.remove(pack_id)
+                    changed = True
 
-    def _has_scalar_use(self, op: Op, pack_elements: set[int], ctx: SLPContext) -> bool:
-        """Check if an op's result has any scalar (non-vectorized) users."""
-        if not op.result:
-            return False
+        extracts: set[SSAValue] = set()
+        for pack in packs:
+            if id(pack) not in replaceable:
+                continue
+            for elem in pack.elements:
+                if elem.result is None:
+                    continue
+                if any(
+                    not isinstance(use.statement, Op)
+                    or not use_is_vector_owned(
+                        pack, use.statement, use.operand_index)
+                    for use in self._use_def.get_uses(elem.result)
+                ):
+                    extracts.add(elem.result)
 
-        # Check all nodes that use this result
-        op_node = ctx.get_node(op)
-        if op_node:
-            for user_node in op_node.user_nodes:
-                if id(user_node.instruction) not in pack_elements:
-                    return True
-        return False
+        return replaceable, extracts
+
+    def _can_materialize_pack(self, pack: Pack) -> bool:
+        """Return whether every vector operand can be built without effects."""
+        operand_indices = self._vector_operand_indices(pack)
+        return operand_indices is not None and all(
+            self._can_materialize_operand(pack, operand_idx)
+            for operand_idx in operand_indices
+        )
+
+    def _vector_operand_indices(self, pack: Pack) -> Optional[tuple[int, ...]]:
+        """Operand columns materialized as vectors by this pack."""
+        if pack.opcode == "load":
+            return (0,) if pack.is_gather else ()
+        if pack.opcode == "store":
+            return (1,)
+        if pack.opcode in VECTORIZABLE_ALU_OPS:
+            return tuple(range(len(pack.elements[0].operands)))
+        if pack.opcode == "select":
+            return (0, 1, 2)
+        return None
+
+    def _can_materialize_operand(self, pack: Pack, operand_idx: int) -> bool:
+        """Keep this predicate and emission synchronized through one classifier."""
+        kind = self._classify_operand_column(pack, operand_idx)
+        return kind in ("uniform_scalar", "scalar_vector") or (
+            kind == "const_vector" and self._allows_const_vector(pack))
+
+    def _allows_const_vector(self, pack: Pack) -> bool:
+        """Whether a varying constant vector is profitable for this pack."""
+        # Scalar stores already need all lane constants, so vstore saves store
+        # slots without adding constant materialization. ALU packs remain
+        # opt-in because they trade abundant ALU slots for scarce load slots.
+        return pack.opcode == "store" or self._vectorize_varying_constants
+
+    def _classify_operand_column(self, pack: Pack, operand_idx: int) -> Optional[str]:
+        """Classify a lane column without mutating materialization state."""
+        operands = [element.operands[operand_idx] for element in pack.elements]
+        if all(self._values_equal(value, operands[0]) for value in operands):
+            return "uniform_scalar"
+        if all(isinstance(value, Const) for value in operands):
+            return "const_vector"
+        if all(isinstance(value, SSAValue) for value in operands):
+            return "scalar_vector"
+        return None
 
     def _generate_pack_code(
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[Op]:
+    ) -> Op:
         """Generate a vector op for a pack."""
         opcode = pack.opcode
 
         if opcode == "store":
-            return self._generate_vstore(pack, ctx, pack_results, hir)
+            return self._generate_vstore(pack, ctx)
         elif opcode == "load":
             if pack.is_gather:
-                return self._generate_vgather_pack(pack, ctx, pack_results, hir)
-            return self._generate_vload(pack, ctx, pack_results, hir)
+                return self._generate_vgather_pack(pack, ctx)
+            return self._generate_vload(pack, ctx)
         elif opcode in VECTORIZABLE_ALU_OPS:
-            return self._generate_valu_op(pack, ctx, pack_results, hir)
+            return self._generate_valu_op(pack, ctx)
         elif opcode == "select":
-            return self._generate_vselect(pack, ctx, pack_results, hir)
+            return self._generate_vselect(pack, ctx)
 
-        return None
+        raise RuntimeError(f"unsupported registered SLP pack: {opcode}")
 
     def _generate_vload(
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
     ) -> Op:
         """Generate a vload for a load pack."""
         base_addr = pack.elements[0].operands[0]
 
-        # Handle vectorized addresses
+        # Scalar ownership may remove the original address definition. Recover
+        # lane 0 from its vector owner when this pack uses it as a scalar base.
         if isinstance(base_addr, SSAValue):
-            vec_mapping = ctx.scalar_to_vector.get(base_addr)
+            vec_mapping = ctx.get_vector_mapping(base_addr)
             if vec_mapping:
                 vec_addr, lane = vec_mapping
-                extracted_addr = SSAValue(id=ctx.next_ssa_id, name="vload_base_addr")
+                extracted_addr = SSAValue(
+                    id=ctx.next_ssa_id, name="vload_base_addr")
                 ctx.next_ssa_id += 1
-                extract_op = Op(
+                ctx.pending_ops.append(Op(
                     opcode="vextract",
                     result=extracted_addr,
                     operands=[vec_addr, Const(lane)],
-                    engine="alu"
-                )
-                ctx.pending_ops.append(extract_op)
+                    engine="alu",
+                ))
                 base_addr = extracted_addr
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vload_result")
@@ -1097,9 +1246,7 @@ class SLPVectorizationPass(Pass):
 
         for lane, op in enumerate(pack.elements):
             if op.result:
-                ctx.scalar_to_vector[op.result] = (vec_result, lane)
-
-        pack_results[hash(pack)] = vec_result
+                ctx.set_vector_mapping(op.result, vec_result, lane)
 
         return Op(
             opcode="vload",
@@ -1112,27 +1259,21 @@ class SLPVectorizationPass(Pass):
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[Op]:
+    ) -> Op:
         """Generate a vgather for a gather-load pack.
 
         The per-lane addresses resolve to a vector (usually the result of a
         vectorized address-add pack; vinsert fallback otherwise), and the
         gather lowers to VLEN load_offset slots.
         """
-        vec_addrs = self._get_vector_operand(pack, 0, ctx, pack_results, hir)
-        if vec_addrs is None:
-            return None
+        vec_addrs = self._get_vector_operand(pack, 0, ctx)
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vgather_result")
         ctx.next_vec_ssa_id += 1
 
         for lane, op in enumerate(pack.elements):
             if op.result:
-                ctx.scalar_to_vector[op.result] = (vec_result, lane)
-
-        pack_results[hash(pack)] = vec_result
+                ctx.set_vector_mapping(op.result, vec_result, lane)
 
         return Op(
             opcode="vgather",
@@ -1145,31 +1286,27 @@ class SLPVectorizationPass(Pass):
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[Op]:
+    ) -> Op:
         """Generate a vstore for a store pack."""
         base_addr = pack.elements[0].operands[0]
 
-        # Handle vectorized addresses
+        # See _generate_vload: the scalar base may now be vector-owned.
         if isinstance(base_addr, SSAValue):
-            vec_mapping = ctx.scalar_to_vector.get(base_addr)
+            vec_mapping = ctx.get_vector_mapping(base_addr)
             if vec_mapping:
                 vec_addr, lane = vec_mapping
-                extracted_addr = SSAValue(id=ctx.next_ssa_id, name="vstore_base_addr")
+                extracted_addr = SSAValue(
+                    id=ctx.next_ssa_id, name="vstore_base_addr")
                 ctx.next_ssa_id += 1
-                extract_op = Op(
+                ctx.pending_ops.append(Op(
                     opcode="vextract",
                     result=extracted_addr,
                     operands=[vec_addr, Const(lane)],
-                    engine="alu"
-                )
-                ctx.pending_ops.append(extract_op)
+                    engine="alu",
+                ))
                 base_addr = extracted_addr
 
-        vec_value = self._get_vector_operand(pack, 1, ctx, pack_results, hir)
-        if vec_value is None:
-            return None
+        vec_value = self._get_vector_operand(pack, 1, ctx)
 
         return Op(
             opcode="vstore",
@@ -1182,27 +1319,20 @@ class SLPVectorizationPass(Pass):
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[Op]:
+    ) -> Op:
         """Generate a vector ALU op for an ALU pack."""
         vec_opcode = SCALAR_TO_VECTOR_OP[pack.opcode]
 
         vec_operands = []
         for i in range(len(pack.elements[0].operands)):
-            vec_op = self._get_vector_operand(pack, i, ctx, pack_results, hir)
-            if vec_op is None:
-                return None
-            vec_operands.append(vec_op)
+            vec_operands.append(self._get_vector_operand(pack, i, ctx))
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name=f"v{pack.opcode}_result")
         ctx.next_vec_ssa_id += 1
 
         for lane, op in enumerate(pack.elements):
             if op.result:
-                ctx.scalar_to_vector[op.result] = (vec_result, lane)
-
-        pack_results[hash(pack)] = vec_result
+                ctx.set_vector_mapping(op.result, vec_result, lane)
 
         return Op(
             opcode=vec_opcode,
@@ -1215,25 +1345,18 @@ class SLPVectorizationPass(Pass):
         self,
         pack: Pack,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[Op]:
+    ) -> Op:
         """Generate a vselect for a select pack."""
-        vec_cond = self._get_vector_operand(pack, 0, ctx, pack_results, hir)
-        vec_true = self._get_vector_operand(pack, 1, ctx, pack_results, hir)
-        vec_false = self._get_vector_operand(pack, 2, ctx, pack_results, hir)
-
-        if vec_cond is None or vec_true is None or vec_false is None:
-            return None
+        vec_cond = self._get_vector_operand(pack, 0, ctx)
+        vec_true = self._get_vector_operand(pack, 1, ctx)
+        vec_false = self._get_vector_operand(pack, 2, ctx)
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vselect_result")
         ctx.next_vec_ssa_id += 1
 
         for lane, op in enumerate(pack.elements):
             if op.result:
-                ctx.scalar_to_vector[op.result] = (vec_result, lane)
-
-        pack_results[hash(pack)] = vec_result
+                ctx.set_vector_mapping(op.result, vec_result, lane)
 
         return Op(
             opcode="vselect",
@@ -1247,9 +1370,7 @@ class SLPVectorizationPass(Pass):
         pack: Pack,
         operand_idx: int,
         ctx: SLPContext,
-        pack_results: dict[int, VectorSSAValue],
-        hir: HIRFunction
-    ) -> Optional[VectorSSAValue]:
+    ) -> Value:
         """
         Get or create a vector operand for a pack.
 
@@ -1259,33 +1380,34 @@ class SLPVectorizationPass(Pass):
         3. Different SSA values -> build vector with vinsert
         """
         operands = [pack.elements[lane].operands[operand_idx] for lane in range(VLEN)]
+        kind = self._classify_operand_column(pack, operand_idx)
+        if kind is None or (kind == "const_vector"
+                            and not self._allows_const_vector(pack)):
+            raise RuntimeError("registered SLP operand cannot be materialized")
 
         # Check if from same vector pack
-        if all(isinstance(op, (SSAValue, VectorSSAValue)) for op in operands):
-            first_vec = ctx.scalar_to_vector.get(operands[0])
+        if kind == "scalar_vector":
+            first_vec = ctx.get_vector_mapping(operands[0])
             if first_vec:
                 vec_ssa, _ = first_vec
                 all_from_same = all(
-                    ctx.scalar_to_vector.get(op) == (vec_ssa, lane)
+                    ctx.get_vector_mapping(op) == (vec_ssa, lane)
                     for lane, op in enumerate(operands)
                 )
                 if all_from_same:
                     return vec_ssa
 
         # All same (uniform)
-        if all(self._values_equal(operands[i], operands[0]) for i in range(VLEN)):
+        if kind == "uniform_scalar":
             return self._get_or_create_broadcast(operands[0], ctx)
 
-        # All same constants
-        if all(isinstance(op, Const) for op in operands):
-            if all(op.value == operands[0].value for op in operands):
-                return self._get_or_create_broadcast(operands[0], ctx)
+        if kind == "const_vector":
+            return self._build_const_vector(operands)
 
-        # Build vector from different SSA values
-        if all(isinstance(op, SSAValue) for op in operands):
+        if kind == "scalar_vector":
             return self._build_vector_from_scalars(operands, ctx)
 
-        return None
+        raise RuntimeError(f"unknown SLP operand materialization kind: {kind}")
 
     def _build_vector_from_scalars(
         self,
@@ -1295,20 +1417,14 @@ class SLPVectorizationPass(Pass):
         """Build a vector from VLEN different scalar SSA values."""
         assert len(scalars) == VLEN
 
-        cache_key = tuple(id(s) for s in scalars)
-        if cache_key in ctx.broadcast_cache:
-            return ctx.broadcast_cache[cache_key]
-
-        # Try vgather pattern (loads with indexed addresses)
-        gather_result = self._try_generate_vgather(scalars, ctx) if self._gather else None
-        if gather_result is not None:
-            ctx.broadcast_cache[cache_key] = gather_result
-            return gather_result
+        cache_key = tuple(_make_cache_key(s) for s in scalars)
+        if cache_key in ctx.materialized_vector_cache:
+            return ctx.materialized_vector_cache[cache_key]
 
         # Try to detect consecutive offset pattern: [base, base+1, base+2, ..., base+7]
         consecutive = self._try_vectorize_consecutive_offsets(scalars, ctx)
         if consecutive is not None:
-            ctx.broadcast_cache[cache_key] = consecutive
+            ctx.materialized_vector_cache[cache_key] = consecutive
             return consecutive
 
         # Fall back to vinsert chain
@@ -1396,16 +1512,12 @@ class SLPVectorizationPass(Pass):
         if offsets != expected:
             return None
 
-        # Mark the defining + ops as consumed (they'll be replaced by vector code)
-        for def_op in def_ops:
-            if def_op is not None and def_op.opcode == "+":
-                ctx.packed_ops.add(id(def_op))
-
         # Generate vectorized code: v+(vbroadcast(base), const_vec[start, start+1, ...])
         vec_base = self._get_or_create_broadcast(base_value, ctx)
 
         # Build constant vector [start, start+1, ..., start+7]
-        const_vec = self._build_const_vector([Const(start_offset + i) for i in range(VLEN)], ctx)
+        const_vec = self._build_const_vector(
+            [Const(start_offset + i) for i in range(VLEN)])
 
         # Generate v+ operation
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vconsec_result")
@@ -1421,176 +1533,21 @@ class SLPVectorizationPass(Pass):
 
         # Map scalar results to vector lanes
         for lane, scalar in enumerate(scalars):
-            ctx.scalar_to_vector[scalar] = (vec_result, lane)
+            ctx.set_vector_mapping(scalar, vec_result, lane)
 
         return vec_result
-
-    def _vectorize_operands(
-        self,
-        operands: list[Value],
-        ctx: SLPContext
-    ) -> Optional[VectorSSAValue]:
-        """
-        Vectorize a list of operands (one per lane).
-
-        Handles:
-        - Uniform values (all same) -> vbroadcast
-        - From same vector -> use that vector
-        - All constants -> build constant vector
-        - All SSA values -> recursively vectorize
-        """
-        # Check if from same vector pack
-        if all(isinstance(op, SSAValue) for op in operands):
-            first_vec = ctx.scalar_to_vector.get(operands[0])
-            if first_vec:
-                vec_ssa, _ = first_vec
-                all_from_same = all(
-                    ctx.scalar_to_vector.get(op) == (vec_ssa, lane)
-                    for lane, op in enumerate(operands)
-                )
-                if all_from_same:
-                    return vec_ssa
-
-        # All same value -> broadcast
-        if all(self._values_equal(operands[i], operands[0]) for i in range(VLEN)):
-            return self._get_or_create_broadcast(operands[0], ctx)
-
-        # All constants -> build constant vector
-        if all(isinstance(op, Const) for op in operands):
-            return self._build_const_vector(operands, ctx)
-
-        # All SSA values -> try recursive vectorization
-        if all(isinstance(op, SSAValue) for op in operands):
-            return self._build_vector_from_scalars(operands, ctx)
-
-        return None
 
     def _build_const_vector(
         self,
         consts: list[Const],
-        ctx: SLPContext
     ) -> VectorConst:
         """Build a constant vector from constant values.
 
         Returns a VectorConst which is a compile-time constant that can be
         used directly as an operand without generating vbroadcast/vinsert ops.
         """
-        # If all same, just broadcast (more efficient for uniform values)
-        if all(c.value == consts[0].value for c in consts):
-            return self._get_or_create_broadcast(consts[0], ctx)
-
-        # Create VectorConst directly - no ops needed!
         values = tuple(c.value for c in consts)
         return VectorConst(values=values)
-
-    def _try_generate_vgather(
-        self,
-        scalars: list[SSAValue],
-        ctx: SLPContext
-    ) -> Optional[VectorSSAValue]:
-        """
-        Try to generate vgather for gather load pattern.
-
-        Pattern: scalars come from loads with addresses base + offset[i]
-        where offsets come from lanes of the same vector.
-        """
-        # Check if all scalars come from loads
-        load_ops = []
-        for scalar in scalars:
-            def_node = ctx.get_def_node(scalar)
-            if def_node is None or def_node.instruction.opcode != "load":
-                return None
-            load_ops.append(def_node.instruction)
-
-        # Analyze addresses for gather pattern
-        base_value = None
-        offset_vector = None
-        offset_lanes = []
-
-        for i, load_op in enumerate(load_ops):
-            addr = load_op.operands[0]
-
-            if not isinstance(addr, SSAValue):
-                return None
-
-            # Find defining op
-            addr_def_node = ctx.get_def_node(addr)
-            if addr_def_node is None or addr_def_node.instruction.opcode != "+":
-                return None
-            addr_op = addr_def_node.instruction
-
-            left, right = addr_op.operands[0], addr_op.operands[1]
-
-            # Try both orderings
-            found_pattern = False
-            for base_candidate, offset_candidate in [(left, right), (right, left)]:
-                if not isinstance(offset_candidate, SSAValue):
-                    continue
-
-                vec_mapping = ctx.scalar_to_vector.get(offset_candidate)
-                if vec_mapping is None:
-                    continue
-
-                vec_src, lane = vec_mapping
-
-                if i == 0:
-                    base_value = base_candidate
-                    offset_vector = vec_src
-                    offset_lanes.append(lane)
-                    found_pattern = True
-                    break
-                else:
-                    if self._values_equal(base_candidate, base_value) and vec_src == offset_vector:
-                        offset_lanes.append(lane)
-                        found_pattern = True
-                        break
-
-            if not found_pattern:
-                return None
-
-        # Verify lanes are 0..VLEN-1
-        if offset_lanes != list(range(VLEN)):
-            return None
-
-        # Mark the scalar load ops and their address ops as consumed
-        for load_op in load_ops:
-            ctx.packed_ops.add(id(load_op))
-            # Also mark the address calculation op
-            addr = load_op.operands[0]
-            if isinstance(addr, SSAValue):
-                addr_def_node = ctx.get_def_node(addr)
-                if addr_def_node is not None and addr_def_node.instruction.opcode == "+":
-                    ctx.packed_ops.add(id(addr_def_node.instruction))
-
-        # Generate vgather
-        vec_base = self._get_or_create_broadcast(base_value, ctx)
-
-        vec_addrs = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vgather_addrs")
-        ctx.next_vec_ssa_id += 1
-
-        vadd_op = Op(
-            opcode="v+",
-            result=vec_addrs,
-            operands=[vec_base, offset_vector],
-            engine="valu"
-        )
-        ctx.pending_ops.append(vadd_op)
-
-        vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vgather_result")
-        ctx.next_vec_ssa_id += 1
-
-        vgather_op = Op(
-            opcode="vgather",
-            result=vec_result,
-            operands=[vec_addrs],
-            engine="load"
-        )
-        ctx.pending_ops.append(vgather_op)
-
-        for lane, scalar in enumerate(scalars):
-            ctx.scalar_to_vector[scalar] = (vec_result, lane)
-
-        return vec_result
 
     def _build_vector_via_vinsert(
         self,
@@ -1600,16 +1557,13 @@ class SLPVectorizationPass(Pass):
     ) -> VectorSSAValue:
         """Build a vector from scalars using vbroadcast + vinsert chain.
 
-        Note: The broadcast added to pending_ops here is intentionally NOT routed
-        through the deferred_broadcasts mechanism. This is because:
-        1. It's part of a vinsert chain, not a uniform broadcast
-        2. It needs to be emitted immediately before the vinsert sequence
-        3. The scalar operand is already available at this point in code generation
+        The seed broadcast and inserts are emitted together immediately before
+        the consuming pack.
         """
         # Handle scalars from vectorized packs
         actual_scalars = []
         for i, scalar in enumerate(scalars):
-            vec_mapping = ctx.scalar_to_vector.get(scalar)
+            vec_mapping = ctx.get_vector_mapping(scalar)
             if vec_mapping:
                 vec_val, lane = vec_mapping
                 extracted = SSAValue(id=ctx.next_ssa_id, name=f"vinsert_extract_{i}")
@@ -1656,7 +1610,7 @@ class SLPVectorizationPass(Pass):
             ctx.pending_ops.append(insert_op)
             current_vec = insert_result
 
-        ctx.broadcast_cache[cache_key] = vec_result
+        ctx.materialized_vector_cache[cache_key] = vec_result
         return vec_result
 
     def _get_or_create_broadcast(
@@ -1666,27 +1620,23 @@ class SLPVectorizationPass(Pass):
     ) -> VectorSSAValue:
         """Get or create a vbroadcast for a scalar value.
 
-        The broadcast op placement depends on where the scalar is defined:
-        - If defined in the current block: placed after the defining instruction
-        - If defined outside the block (external): hoisted to function entry
-          (This includes Const values and SSA values defined at function level)
+        Constants are cached at function entry. SSA broadcasts are recorded by
+        semantic scalar key and later placed immediately after the final
+        scalar definition, or at the current op-run entry for region inputs.
 
         Uses stable cache keys via _make_cache_key() to ensure semantically identical
         values (e.g., two Const(5) objects) share the same broadcast.
         """
         cache_key = _make_cache_key(scalar_val)
 
-        # Check instance-level entry broadcast cache first (for externally-defined values)
-        if cache_key in self._entry_broadcast_cache:
+        # Only constants are safe to cache and hoist across every region.
+        if (isinstance(scalar_val, Const)
+                and cache_key in self._entry_broadcast_cache):
             return self._entry_broadcast_cache[cache_key]
 
         # Check block-level cache
-        if cache_key in ctx.broadcast_cache:
-            return ctx.broadcast_cache[cache_key]
-
-        # Determine if value is external (not defined in current block)
-        # External values include: Const, function-level SSA values, loop parameters
-        is_external = cache_key not in ctx.result_to_op
+        if cache_key in ctx.materialized_vector_cache:
+            return ctx.materialized_vector_cache[cache_key]
 
         vec_result = VectorSSAValue(id=ctx.next_vec_ssa_id, name="vbroadcast_result")
         ctx.next_vec_ssa_id += 1
@@ -1698,22 +1648,21 @@ class SLPVectorizationPass(Pass):
             engine="valu"
         )
 
-        if is_external:
-            # Hoist to function entry
+        if isinstance(scalar_val, Const):
             self._entry_broadcasts.append(broadcast_op)
             self._entry_broadcast_cache[cache_key] = vec_result
         else:
-            # Store in deferred_broadcasts for later placement after the defining op
-            ctx.deferred_broadcasts[cache_key] = broadcast_op
+            assert isinstance(scalar_val, SSAValue)
+            ctx.ssa_broadcasts[cache_key] = broadcast_op
 
-        ctx.broadcast_cache[cache_key] = vec_result
+        ctx.materialized_vector_cache[cache_key] = vec_result
 
         return vec_result
 
     def _values_equal(self, a: Value, b: Value) -> bool:
         """Check if two values are equal."""
         if isinstance(a, SSAValue) and isinstance(b, SSAValue):
-            return id(a) == id(b)
+            return a.id == b.id
         if isinstance(a, Const) and isinstance(b, Const):
             return a.value == b.value
         return False

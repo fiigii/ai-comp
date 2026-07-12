@@ -13,6 +13,7 @@ from compiler import (
     PassManager,
     PassConfig,
     Const,
+    VectorConst,
     count_statements,
     lower_to_lir,
     eliminate_phis,
@@ -446,6 +447,34 @@ class TestSLPPass(unittest.TestCase):
         self.assertIn("ops_vectorized", metrics.custom)
         print(f"SLP metrics: {metrics.custom}")
         print("SLP metrics reported test passed!")
+
+    def test_slp_packs_created_accumulates_across_op_runs(self):
+        """packs_created must cover every vectorized run in the function."""
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        for block in range(2):
+            for lane in range(VLEN):
+                b.store(b.const(100 + block * VLEN + lane), b.const(block + 1))
+            if block == 0:
+                b.pause()
+
+        slp_pass = SLPVectorizationPass()
+        pm = PassManager()
+        pm.add_pass(slp_pass)
+        transformed = pm.run(b.build())
+
+        self.assertEqual(
+            sum(
+                isinstance(stmt, Op) and stmt.opcode == "vstore"
+                for stmt in transformed.body
+            ),
+            2,
+            "both straight-line runs must vectorize independently",
+        )
+        metrics = slp_pass.get_metrics()
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.custom["packs_created"], 2)
 
     # --- Edge Cases ---
 
@@ -1166,6 +1195,813 @@ class TestSLPPass(unittest.TestCase):
             self.assertEqual(machine.mem[100 + i], i + 1)
 
 
+class TestSLPEmissionSafety(unittest.TestCase):
+    """Correctness tests for pack planning and scalar-ownership emission."""
+
+    def _transform(self, hir, **options):
+        manager = PassManager()
+        manager.add_pass(SLPVectorizationPass())
+        manager.config["slp-vectorization"] = PassConfig(
+            name="slp-vectorization",
+            enabled=True,
+            options={"restrict_ptr": True, **options},
+        )
+        return manager.run(hir)
+
+    def _compile(self, hir):
+        lir = lower_to_lir(hir)
+        eliminate_phis(lir)
+        config = PassConfig(name="test", enabled=True, options={})
+        mir = LIRToMIRPass().run(lir, config)
+        mir = MIRRegisterAllocationPass().run(mir, config)
+        return MIRToVLIWPass().run(mir, config)
+
+    def _run(self, hir, mem):
+        machine = Machine(
+            mem,
+            self._compile(hir),
+            DebugInfo(scratch_map={}),
+            n_cores=N_CORES,
+        )
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
+
+    def _assert_flat_ssa_dominance(self, hir):
+        from compiler.hir import Op, SSAValue, VectorSSAValue
+
+        defined = set()
+        for stmt in hir.body:
+            if not isinstance(stmt, Op):
+                continue
+            for operand in stmt.operands:
+                if isinstance(operand, (SSAValue, VectorSSAValue)):
+                    self.assertIn(operand, defined, f"undefined operand in {stmt!r}")
+            if stmt.result is not None:
+                self.assertNotIn(stmt.result, defined)
+                defined.add(stmt.result)
+
+    @staticmethod
+    def _flat_ops(hir):
+        from compiler.hir import Op
+
+        return [stmt for stmt in hir.body if isinstance(stmt, Op)]
+
+    def test_store_fallback_does_not_cross_aliasing_load(self):
+        b = HIRBuilder()
+        values_base = b.load(b.const(9), "values_base")
+        first_out = b.load(b.const(10), "first_out")
+        second_out = b.load(b.const(11), "second_out")
+        other_values = [
+            b.load(b.add(values_base, b.const(2 * i)), f"value_{i}")
+            for i in range(1, VLEN)
+        ]
+
+        packed_values = [b.xor(b.const(40), b.const(2), "q0")]
+        first_addrs = [
+            b.add(first_out, b.const(i), f"first_addr_{i}")
+            for i in range(VLEN)
+        ]
+        for addr, value in zip(first_addrs, [packed_values[0], *other_values]):
+            b.store(addr, value)
+
+        observed = b.load(first_addrs[0], "observed")
+        b.store(b.const(300), observed)
+
+        for i in range(1, VLEN):
+            packed_values.append(
+                b.xor(b.const(40 + i), b.const(2), f"q{i}")
+            )
+        for i, value in enumerate(packed_values):
+            b.store(b.add(second_out, b.const(i)), value)
+
+        transformed = self._transform(b.build())
+        ops = self._flat_ops(transformed)
+        vstores = [op for op in ops if op.opcode == "vstore"]
+        self.assertEqual(
+            len(vstores),
+            2,
+            "both legal store packs must vectorize",
+        )
+        self.assertTrue(
+            any(op.opcode == "vinsert" for op in ops),
+            "the heterogeneous first store pack must use scalar fallback",
+        )
+        observed_load = next(op for op in ops if op.result == observed)
+        self.assertLess(
+            ops.index(vstores[0]),
+            ops.index(observed_load),
+            "fallback materialization must not move the first store pack "
+            "across its aliasing load",
+        )
+        mem = [0] * 1100
+        mem[9], mem[10], mem[11] = 1000, 100, 200
+        for i in range(1, VLEN):
+            mem[1000 + 2 * i] = 100 + i
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[300], 42)
+
+    def test_uniform_consumer_can_precede_producer_pack_anchor(self):
+        b = HIRBuilder()
+        q_out = b.load(b.const(0), "q_out")
+        c_out = b.load(b.const(1), "c_out")
+        xs = [b.load(b.const(10 + 2 * i), f"x{i}") for i in range(VLEN)]
+
+        q = [b.add(xs[0], b.const(10), "q0")]
+        for i in range(VLEN):
+            c = b.add(q[0], b.const(1), f"c{i}")
+            b.store(b.add(c_out, b.const(i)), c)
+        for i in range(1, VLEN):
+            q.append(b.add(xs[i], b.const(10), f"q{i}"))
+        for i, value in enumerate(q):
+            b.store(b.add(q_out, b.const(i)), value)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        scalar_defs = {op.result for op in ops if op.result is not None}
+        self.assertTrue(
+            all(value in scalar_defs for value in q),
+            "a uniform early use of q0 must retain the whole producer pack",
+        )
+        q0_broadcasts = [
+            op for op in ops
+            if op.opcode == "vbroadcast" and op.operands == [q[0]]
+        ]
+        self.assertEqual(
+            len(q0_broadcasts),
+            1,
+            "the uniform q0 consumer must use a vector broadcast",
+        )
+        self.assertTrue(
+            any(
+                op.opcode == "v+" and q0_broadcasts[0].result in op.operands
+                for op in ops
+            ),
+            "the q0 broadcast must feed the vectorized consumer pack",
+        )
+
+        mem = [0] * 256
+        mem[0], mem[1] = 100, 120
+        for i in range(VLEN):
+            mem[10 + 2 * i] = i + 1
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(11, 19)))
+        self.assertEqual(machine.mem[120:128], [12] * VLEN)
+
+    def test_late_uniform_consumer_broadcast_follows_owner_extract(self):
+        b = HIRBuilder()
+        producer_out = b.load(b.const(20), "producer_out")
+        consumer_out = b.load(b.const(21), "consumer_out")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        producers = [
+            b.add(value, b.const(10), f"producer_{lane}")
+            for lane, value in enumerate(inputs)
+        ]
+        for lane, value in enumerate(producers):
+            b.store(b.add(producer_out, b.const(lane)), value)
+        for lane in range(VLEN):
+            value = b.add(producers[0], b.const(1), f"consumer_{lane}")
+            b.store(b.add(consumer_out, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        owner_extract = next(
+            op for op in ops
+            if op.opcode == "vextract" and op.result == producers[0]
+        )
+        broadcast = next(
+            op for op in ops
+            if op.opcode == "vbroadcast" and op.operands == [producers[0]]
+        )
+        consumer = next(
+            op for op in ops
+            if op.opcode == "v+" and broadcast.result in op.operands
+        )
+        self.assertLess(ops.index(owner_extract), ops.index(broadcast))
+        self.assertLess(ops.index(broadcast), ops.index(consumer))
+
+        mem = list(range(1, VLEN + 1)) + [0] * 220
+        mem[20], mem[21] = 100, 120
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(11, 19)))
+        self.assertEqual(machine.mem[120:128], [12] * VLEN)
+
+    def test_individual_early_use_keeps_producer_scalars(self):
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+
+        values = [b.add(inputs[0], b.const(10), "value_0")]
+        early = b.xor(values[0], b.const(7), "early")
+        b.store(b.const(300), early)
+        for lane in range(1, VLEN):
+            values.append(
+                b.add(inputs[lane], b.const(10), f"value_{lane}")
+            )
+        for lane, value in enumerate(values):
+            b.store(b.add(output, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        scalar_defs = {op.result for op in ops if op.result is not None}
+        self.assertTrue(
+            all(value in scalar_defs for value in values),
+            "one individual use before the pack anchor must retain all lanes",
+        )
+        self.assertTrue(
+            any(op.opcode == "v+" for op in ops),
+            "the retained scalar producer must still have a vector form",
+        )
+        self.assertTrue(any(op.opcode == "vstore" for op in ops))
+
+        mem = list(range(1, VLEN + 1)) + [0] * 320
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(11, 19)))
+        self.assertEqual(machine.mem[300], 11 ^ 7)
+
+    def test_lane_wise_early_users_allow_fixed_point_replacement(self):
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        producers = []
+        consumers = []
+        for lane, value in enumerate(inputs):
+            producer = b.add(value, b.const(10), f"producer_{lane}")
+            producers.append(producer)
+            consumers.append(
+                b.mul(producer, b.const(3), f"consumer_{lane}")
+            )
+        for lane, value in enumerate(consumers):
+            b.store(b.add(output, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        scalar_defs = {op.result for op in ops if op.result is not None}
+        self.assertFalse(
+            any(value in scalar_defs for value in producers + consumers),
+            "lane-wise vector-owned chains should not retain scalar definitions",
+        )
+
+        vector_add = next(op for op in ops if op.opcode == "v+")
+        vector_mul = next(
+            op for op in ops
+            if op.opcode == "v*" and vector_add.result in op.operands
+        )
+        vector_store = next(
+            op for op in ops
+            if op.opcode == "vstore" and vector_mul.result in op.operands
+        )
+        self.assertLess(ops.index(vector_add), ops.index(vector_mul))
+        self.assertLess(ops.index(vector_mul), ops.index(vector_store))
+        self.assertFalse(any(op.opcode == "vextract" for op in ops))
+
+        mem = list(range(1, VLEN + 1)) + [0] * 200
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(
+            machine.mem[100:108],
+            [3 * value for value in range(11, 19)],
+        )
+
+    def test_pressure_budget_prunes_dual_representation_component(self):
+        def build_program():
+            b = HIRBuilder()
+            output = b.load(b.const(20), "output")
+            inputs = [
+                b.load(b.const(i), f"input_{i}") for i in range(VLEN)
+            ]
+            values = [b.add(inputs[0], b.const(10), "value_0")]
+            early = b.xor(values[0], b.const(7), "early")
+            b.store(b.const(300), early)
+            for lane in range(1, VLEN):
+                values.append(
+                    b.add(inputs[lane], b.const(10), f"value_{lane}")
+                )
+            consumers = [
+                b.mul(value, b.const(3), f"consumer_{lane}")
+                for lane, value in enumerate(values)
+            ]
+            for lane, value in enumerate(consumers):
+                b.store(b.add(output, b.const(lane)), value)
+            return b.build(), values
+
+        def transform(limit):
+            hir, values = build_program()
+            slp_pass = SLPVectorizationPass()
+            manager = PassManager()
+            manager.add_pass(slp_pass)
+            manager.config["slp-vectorization"] = PassConfig(
+                name="slp-vectorization",
+                enabled=True,
+                options={
+                    "restrict_ptr": True,
+                    "dual_representation_prune_threshold": limit,
+                },
+            )
+            transformed = manager.run(hir)
+            return transformed, values, slp_pass.get_metrics().custom
+
+        scalar_hir, scalar_values, scalar_metrics = transform(0)
+        scalar_ops = self._flat_ops(scalar_hir)
+        self.assertGreater(
+            scalar_metrics["dual_representation_lanes_before_pruning"], 0)
+        self.assertGreater(scalar_metrics["packs_pruned_for_pressure"], 0)
+        self.assertFalse(
+            any(op.opcode in ("v+", "v*", "vstore") for op in scalar_ops),
+            "the producer, consumer, and store must fall back as one component",
+        )
+        scalar_defs = {
+            op.result for op in scalar_ops if op.result is not None
+        }
+        self.assertTrue(all(value in scalar_defs for value in scalar_values))
+
+        vector_hir, vector_values, vector_metrics = transform(64)
+        self._assert_flat_ssa_dominance(vector_hir)
+        vector_ops = self._flat_ops(vector_hir)
+        self.assertEqual(vector_metrics["packs_pruned_for_pressure"], 0)
+        self.assertGreater(vector_metrics["packs_emitted"], 0)
+        for opcode in ("vload", "v+", "v*", "vstore"):
+            self.assertTrue(any(op.opcode == opcode for op in vector_ops))
+        vector_defs = {
+            op.result for op in vector_ops if op.result is not None
+        }
+        self.assertTrue(
+            all(value in vector_defs for value in vector_values),
+            "the early individual use still requires the scalar producer",
+        )
+
+        expected = [3 * value for value in range(11, 19)]
+        for transformed in (scalar_hir, vector_hir):
+            mem = list(range(1, VLEN + 1)) + [0] * 320
+            mem[20] = 100
+            machine = self._run(transformed, mem)
+            self.assertEqual(machine.mem[100:108], expected)
+            self.assertEqual(machine.mem[300], 11 ^ 7)
+
+    def test_rejected_pack_does_not_pollute_later_materialization(self):
+        from compiler.hir import Op
+
+        b = HIRBuilder()
+        c_out = b.load(b.const(0), "c_out")
+        d_out = b.load(b.const(1), "d_out")
+        common = b.load(b.const(2), "common")
+        xs = [b.load(b.const(10 + 2 * i), f"x{i}") for i in range(VLEN)]
+
+        for i, x in enumerate(xs):
+            rhs = b.const(1) if i < VLEN // 2 else common
+            c = b.add(x, rhs, f"c{i}")
+            b.store(b.add(c_out, b.const(i)), c)
+
+        for i, x in enumerate(xs):
+            d = b.mul(x, b.const(3), f"d{i}")
+            b.store(b.add(d_out, b.const(i)), d)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        self.assertTrue(
+            any(isinstance(stmt, Op) and stmt.opcode == "v*"
+                for stmt in transformed.body),
+            "the pack after the failed candidate should still vectorize",
+        )
+
+        mem = [0] * 256
+        mem[0], mem[1], mem[2] = 100, 120, 7
+        for i in range(VLEN):
+            mem[10 + 2 * i] = 20 + i
+        machine = self._run(transformed, mem)
+        self.assertEqual(
+            machine.mem[100:108],
+            [21, 22, 23, 24, 31, 32, 33, 34],
+        )
+        self.assertEqual(machine.mem[120:128], [60 + 3 * i for i in range(VLEN)])
+
+    def test_reversed_consecutive_loads_preserve_lane_order(self):
+        b = HIRBuilder()
+        source = b.load(b.const(20), "source")
+        dest = b.load(b.const(21), "dest")
+        for lane in range(VLEN):
+            value = b.load(b.add(source, b.const(7 - lane)), f"value_{lane}")
+            b.store(b.add(dest, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        ops = self._flat_ops(transformed)
+        self.assertNotIn(
+            "vload",
+            [op.opcode for op in ops],
+            "a reversed load sequence must not become a forward vload",
+        )
+        self.assertTrue(
+            any(op.opcode == "vstore" for op in ops),
+            "the output store pack must still vectorize",
+        )
+        mem = list(range(150))
+        mem[20], mem[21] = 32, 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(39, 31, -1)))
+
+    def test_loop_counter_broadcast_stays_inside_loop_body(self):
+        from compiler.hir import ForLoop, Op
+
+        b = HIRBuilder()
+
+        def body(counter, _params):
+            for lane in range(VLEN):
+                value = b.add(counter, Const(1), f"value_{lane}")
+                b.store(b.add(b.const(100), Const(lane)), value)
+            return []
+
+        b.for_loop(Const(0), Const(3), [], body, pragma_unroll=1)
+        transformed = self._transform(b.build())
+        loop = next(stmt for stmt in transformed.body if isinstance(stmt, ForLoop))
+        self.assertFalse(
+            any(
+                isinstance(stmt, Op)
+                and stmt.opcode == "vbroadcast"
+                and stmt.operands == [loop.counter]
+                for stmt in transformed.body
+            ),
+            "loop counter broadcast must not be hoisted before the loop",
+        )
+        counter_broadcasts = [
+            stmt for stmt in loop.body
+            if isinstance(stmt, Op)
+            and stmt.opcode == "vbroadcast"
+            and stmt.operands == [loop.counter]
+        ]
+        self.assertEqual(
+            len(counter_broadcasts),
+            1,
+            "the vectorized loop-body pack must broadcast its counter locally",
+        )
+        self.assertTrue(
+            any(
+                isinstance(stmt, Op)
+                and stmt.opcode == "v+"
+                and counter_broadcasts[0].result in stmt.operands
+                for stmt in loop.body
+            ),
+            "the local counter broadcast must feed a vector add",
+        )
+        self.assertTrue(
+            any(isinstance(stmt, Op) and stmt.opcode == "vstore"
+                for stmt in loop.body),
+            "the loop-body store pack must vectorize",
+        )
+
+        machine = self._run(transformed, [0] * 200)
+        self.assertEqual(machine.mem[100:108], [3] * VLEN)
+
+    def test_scalar_and_vector_ssa_ids_do_not_collide_for_broadcasts(self):
+        """A later vec0 must not steal scalar v0's broadcast placement."""
+        b = HIRBuilder()
+        uniform = b.load(b.const(0), "uniform")  # scalar SSA id 0
+        output = b.load(b.const(20), "output")
+        inputs = [
+            b.load(b.const(1 + lane), f"input_{lane}")
+            for lane in range(VLEN)
+        ]
+        for lane, value in enumerate(inputs):
+            result = b.add(value, uniform, f"result_{lane}")
+            b.store(b.add(output, b.const(lane)), result)
+
+        # Vector and scalar SSA values use independent id spaces. Keeping this
+        # vector definition after the scalar pack specifically exercises id 0
+        # in both spaces and the broadcast-placement lookup.
+        later_vector = b.vload(b.const(200), "later_vector")  # vector SSA id 0
+        self.assertEqual(uniform.id, later_vector.id)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        broadcasts = [
+            op for op in ops
+            if op.opcode == "vbroadcast" and op.operands == [uniform]
+        ]
+        self.assertEqual(len(broadcasts), 1)
+        consumers = [
+            op for op in ops
+            if op.opcode == "v+" and broadcasts[0].result in op.operands
+        ]
+        self.assertEqual(
+            len(consumers),
+            1,
+            "the uniform scalar must feed a vectorized add pack",
+        )
+        self.assertLess(ops.index(broadcasts[0]), ops.index(consumers[0]))
+
+        mem = [0] * 256
+        mem[0] = 10
+        mem[1:1 + VLEN] = list(range(1, VLEN + 1))
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:100 + VLEN], list(range(11, 19)))
+
+    def test_consecutive_load_pack_does_not_cross_aliasing_store(self):
+        """A regular vload cannot move earlier lanes below an aliasing store."""
+        b = HIRBuilder()
+        source = b.load(b.const(20), "source")
+        dest = b.load(b.const(21), "dest")
+        values = []
+        for lane in range(VLEN):
+            addr = b.add(source, b.const(lane), f"source_addr_{lane}")
+            values.append(b.load(addr, f"value_{lane}"))
+            if lane == 3:
+                b.store(b.add(source, b.const(2)), b.const(999))
+        for lane, value in enumerate(values):
+            b.store(b.add(dest, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        opcodes = [op.opcode for op in self._flat_ops(transformed)]
+        self.assertNotIn(
+            "vload",
+            opcodes,
+            "the load pack must be rejected instead of crossing the store",
+        )
+        self.assertIn(
+            "vstore",
+            opcodes,
+            "the independent output store pack must still vectorize",
+        )
+
+        mem = [0] * 256
+        mem[20], mem[21] = 32, 100
+        mem[32:32 + VLEN] = list(range(10, 10 + VLEN))
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:100 + VLEN], list(range(10, 18)))
+        self.assertEqual(machine.mem[34], 999)
+
+    def test_store_pack_does_not_cross_existing_vector_load(self):
+        """Width-8 aliases from existing vector memory ops block fusion."""
+        b = HIRBuilder()
+        base = b.load(b.const(20), "base")
+        observed = None
+        store_addrs = []
+        for lane in range(VLEN):
+            addr = b.add(base, b.const(lane), f"addr_{lane}")
+            store_addrs.append(addr)
+            b.store(addr, b.const(100 + lane))
+            if lane == 3:
+                observed = b.vload(base, "observed")
+        b.vstore(b.const(200), observed)
+
+        transformed = self._transform(b.build())
+        ops = self._flat_ops(transformed)
+        self.assertEqual(
+            sum(
+                op.opcode == "store" and op.operands[0] in store_addrs
+                for op in ops
+            ),
+            VLEN,
+            "the scalar stores must not move below the overlapping vload",
+        )
+
+        mem = [0] * 256
+        mem[20] = 32
+        mem[32:40] = list(range(10, 18))
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[32:40], list(range(100, 108)))
+        self.assertEqual(machine.mem[200:208], [100, 101, 102, 103, 14, 15, 16, 17])
+
+    def test_replaced_result_used_in_next_op_run_gets_dominating_extract(self):
+        from compiler.hir import Op, Pause
+
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        values = [
+            b.add(value, b.const(10), f"value_{lane}")
+            for lane, value in enumerate(inputs)
+        ]
+        for lane, value in enumerate(values):
+            b.store(b.add(output, b.const(lane)), value)
+        b.pause()
+        doubled = b.mul(values[3], b.const(2), "doubled_after_pause")
+        b.store(b.const(300), doubled)
+
+        transformed = self._transform(b.build())
+        self._assert_flat_ssa_dominance(transformed)
+        pause_index = next(
+            i for i, stmt in enumerate(transformed.body)
+            if isinstance(stmt, Pause)
+        )
+        extracted = next(
+            stmt for stmt in transformed.body
+            if isinstance(stmt, Op) and stmt.result == values[3]
+        )
+        self.assertEqual(extracted.opcode, "vextract")
+        self.assertLess(transformed.body.index(extracted), pause_index)
+        for lane, value in enumerate(values):
+            defs = [
+                stmt for stmt in transformed.body
+                if isinstance(stmt, Op) and stmt.result == value
+            ]
+            if lane == 3:
+                self.assertEqual(defs, [extracted])
+            else:
+                self.assertEqual(defs, [])
+
+        mem = list(range(1, VLEN + 1)) + [0] * 320
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(11, 19)))
+        self.assertEqual(machine.mem[300], 28)
+
+    def test_replaced_result_used_as_loop_yield_gets_extract(self):
+        from compiler.hir import ForLoop, Op
+
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        captured = {}
+
+        def body(_counter, params):
+            values = [
+                b.add(value, params[0], f"loop_value_{lane}")
+                for lane, value in enumerate(inputs)
+            ]
+            captured["values"] = values
+            for lane, value in enumerate(values):
+                b.store(b.add(output, b.const(lane)), value)
+            return [values[0]]
+
+        results = b.for_loop(
+            b.const(0), b.const(2), [b.const(10)], body, pragma_unroll=1
+        )
+        b.store(b.const(300), results[0])
+        values = captured["values"]
+
+        transformed = self._transform(b.build())
+        loop = next(
+            stmt for stmt in transformed.body if isinstance(stmt, ForLoop)
+        )
+        self.assertEqual(loop.yields, [values[0]])
+        extracted = next(
+            stmt for stmt in loop.body
+            if isinstance(stmt, Op) and stmt.result == values[0]
+        )
+        self.assertEqual(extracted.opcode, "vextract")
+        self.assertTrue(
+            all(
+                not any(
+                    isinstance(stmt, Op)
+                    and stmt.result == value
+                    and stmt.opcode == "+"
+                    for stmt in loop.body
+                )
+                for value in values
+            ),
+            "the scalar loop-body producer pack must be replaced",
+        )
+        vector_def = next(
+            stmt for stmt in loop.body
+            if isinstance(stmt, Op) and stmt.result == extracted.operands[0]
+        )
+        self.assertLess(loop.body.index(vector_def), loop.body.index(extracted))
+
+        mem = list(range(1, VLEN + 1)) + [0] * 320
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(12, 20)))
+        self.assertEqual(machine.mem[300], 12)
+
+    def test_replaced_result_used_as_if_yield_gets_extract(self):
+        from compiler.hir import If, Op
+
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        condition = b.load(b.const(30), "condition")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        captured = {}
+
+        def then_body():
+            values = [
+                b.add(value, b.const(10), f"then_value_{lane}")
+                for lane, value in enumerate(inputs)
+            ]
+            captured["values"] = values
+            for lane, value in enumerate(values):
+                b.store(b.add(output, b.const(lane)), value)
+            return [values[3]]
+
+        results = b.if_stmt(condition, then_body, lambda: [b.const(77)])
+        b.store(b.const(300), results[0])
+        values = captured["values"]
+
+        transformed = self._transform(b.build())
+        branch = next(stmt for stmt in transformed.body if isinstance(stmt, If))
+        self.assertEqual(branch.then_yields, [values[3]])
+        extracted = next(
+            stmt for stmt in branch.then_body
+            if isinstance(stmt, Op) and stmt.result == values[3]
+        )
+        self.assertEqual(extracted.opcode, "vextract")
+        self.assertTrue(
+            all(
+                not any(
+                    isinstance(stmt, Op)
+                    and stmt.result == value
+                    and stmt.opcode == "+"
+                    for stmt in branch.then_body
+                )
+                for value in values
+            ),
+            "the scalar branch producer pack must be replaced",
+        )
+        vector_def = next(
+            stmt for stmt in branch.then_body
+            if isinstance(stmt, Op) and stmt.result == extracted.operands[0]
+        )
+        self.assertLess(
+            branch.then_body.index(vector_def),
+            branch.then_body.index(extracted),
+        )
+
+        mem = list(range(1, VLEN + 1)) + [0] * 320
+        mem[20], mem[30] = 100, 1
+        machine = self._run(transformed, mem)
+        self.assertEqual(machine.mem[100:108], list(range(11, 19)))
+        self.assertEqual(machine.mem[300], 14)
+
+    def test_varying_constants_are_not_vectorized_by_default(self):
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        values = [
+            b.xor(value, b.const(0x10 + lane), f"value_{lane}")
+            for lane, value in enumerate(inputs)
+        ]
+        for lane, value in enumerate(values):
+            b.store(b.add(output, b.const(lane)), value)
+
+        transformed = self._transform(b.build())
+        ops = self._flat_ops(transformed)
+        self.assertFalse(any(op.opcode == "v^" for op in ops))
+        self.assertFalse(
+            any(
+                isinstance(operand, VectorConst)
+                for op in ops
+                for operand in op.operands
+            )
+        )
+        scalar_defs = {op.result for op in ops if op.result is not None}
+        self.assertTrue(all(value in scalar_defs for value in values))
+        self.assertTrue(any(op.opcode == "vstore" for op in ops))
+
+        mem = list(range(1, VLEN + 1)) + [0] * 200
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(
+            machine.mem[100:108],
+            [(lane + 1) ^ (0x10 + lane) for lane in range(VLEN)],
+        )
+
+    def test_varying_constants_vectorize_with_explicit_opt_in(self):
+        b = HIRBuilder()
+        output = b.load(b.const(20), "output")
+        inputs = [b.load(b.const(i), f"input_{i}") for i in range(VLEN)]
+        values = [
+            b.xor(value, b.const(0x10 + lane), f"value_{lane}")
+            for lane, value in enumerate(inputs)
+        ]
+        for lane, value in enumerate(values):
+            b.store(b.add(output, b.const(lane)), value)
+
+        transformed = self._transform(
+            b.build(), vectorize_varying_constants=True
+        )
+        self._assert_flat_ssa_dominance(transformed)
+        ops = self._flat_ops(transformed)
+        vector_xor = next(op for op in ops if op.opcode == "v^")
+        varying_operand = next(
+            operand for operand in vector_xor.operands
+            if isinstance(operand, VectorConst)
+        )
+        self.assertEqual(
+            varying_operand.values,
+            tuple(0x10 + lane for lane in range(VLEN)),
+        )
+        scalar_defs = {op.result for op in ops if op.result is not None}
+        self.assertFalse(any(value in scalar_defs for value in values))
+        self.assertTrue(
+            any(op.opcode == "vstore" and vector_xor.result in op.operands
+                for op in ops)
+        )
+
+        mem = list(range(1, VLEN + 1)) + [0] * 200
+        mem[20] = 100
+        machine = self._run(transformed, mem)
+        self.assertEqual(
+            machine.mem[100:108],
+            [(lane + 1) ^ (0x10 + lane) for lane in range(VLEN)],
+        )
+
+
 class TestSLPGatherSeeding(unittest.TestCase):
     """Tests for gather-load seed packs (_find_gather_seeds).
 
@@ -1427,6 +2263,131 @@ class TestSLPGatherSeeding(unittest.TestCase):
             "loads must not be hoisted past a may-aliasing same-root store")
         # The store itself must still land.
         self.assertEqual(machine.mem[34], 1000)
+
+
+class TestSLPMixedIterationDuplicateStores(unittest.TestCase):
+    """Duplicate same-address stores with non-uniform survivors.
+
+    When several unrolled iterations all store to the same addresses and an
+    upstream pass removed some but not all of the duplicates (this happens
+    in the real pipeline with dse restrict_ptr=false: only rounds without
+    intervening may-alias loads lose their stores), the k-th-occurrence
+    pairing in the old store seed finder used to group stores from DIFFERENT
+    iterations into one pack. Two distinct miscompiles followed:
+
+    - the pack's value operands mixed iterations, so the extension-formed
+      value pack had a far-future last element; a pack consuming a subset
+      of those values emitted EARLIER, found no scalar_to_vector mapping,
+      and built a vinsert chain over scalar SSAs whose defs were deleted
+      when the producer pack finally emitted (dangling refs -> the VM
+      reads stale scratch; observed as 7 lanes collapsing to one value);
+    - emitting the mixed vstore at its last element's position moved the
+      earlier iteration's stores across the later iteration's same-address
+      stores (store order flip).
+
+    The fix makes memory-pack fusion span-checked (_mem_pack_span_is_legal)
+    and uses a scalar-ownership fixed point: early unmapped uses retain their
+    scalar definitions, while post-anchor uses are rebuilt with extracts.
+    """
+
+    BATCH = 16
+    A = 100
+    B = 200
+    K = 0xABCDEF
+
+    def _build(self):
+        b = HIRBuilder()
+        a_base = b.const(self.A)
+        b_base = b.const(self.B)
+        k = b.const(self.K)
+        consts = [(b.const(0x9E3779B9 + r), b.const(5 + 2 * r))
+                  for r in range(3)]
+
+        vals = [b.load(b.const(i), "in_%d" % i) for i in range(self.BATCH)]
+
+        # Round 0 stores all but A[15]: offset 15 then has fewer
+        # occurrences than offsets 8..14, so occurrence pairing would mix
+        # round-0 stores with the round-1 store to A[15].
+        c1, c2 = consts[0]
+        r0 = []
+        for i in range(self.BATCH):
+            t1 = b.xor(vals[i], c1, "r0_x_%d" % i)
+            t2 = b.mul(t1, c2, "r0_m_%d" % i)
+            r0.append(t2)
+            if i != self.BATCH - 1:
+                b.store(b.add(a_base, b.const(i), "r0_a_%d" % i), t2)
+
+        # Side chain consuming round-0 values 8..15: its pack emits before
+        # the mixed value pack (whose last element sits in round 1), which
+        # is exactly the emission-order inversion that dangled.
+        for j in range(8):
+            w = b.xor(r0[8 + j], k, "w_%d" % j)
+            b.store(b.add(b_base, b.const(j), "w_a_%d" % j), w)
+
+        prev = r0
+        for r in (1, 2):
+            c1, c2 = consts[r]
+            cur = []
+            for i in range(self.BATCH):
+                t1 = b.xor(prev[i], c1, "r%d_x_%d" % (r, i))
+                t2 = b.mul(t1, c2, "r%d_m_%d" % (r, i))
+                cur.append(t2)
+                b.store(b.add(a_base, b.const(i), "r%d_a_%d" % (r, i)), t2)
+            prev = cur
+        return b.build()
+
+    def _expected(self):
+        mask = (1 << 32) - 1
+        vals = list(range(self.BATCH))
+        rounds = []
+        for r in range(3):
+            vals = [(((v ^ (0x9E3779B9 + r)) * (5 + 2 * r)) & mask)
+                    for v in vals]
+            rounds.append(list(vals))
+        want_a = rounds[2]
+        want_b = [(rounds[0][8 + j] ^ self.K) & mask for j in range(8)]
+        return want_a, want_b
+
+    def test_no_dangling_refs_and_correct_values(self):
+        from compiler.hir import Op, SSAValue, VectorSSAValue
+
+        hir = self._build()
+        pm = PassManager()
+        pm.add_pass(SLPVectorizationPass())
+        transformed = pm.run(hir)
+
+        # Structural: SSA dominance must hold in the flat body. The bug
+        # emitted vinsert chains over scalars whose defs no longer existed.
+        defined = set()
+        for stmt in transformed.body:
+            if not isinstance(stmt, Op):
+                continue
+            for operand in stmt.operands:
+                if isinstance(operand, (SSAValue, VectorSSAValue)):
+                    self.assertIn(
+                        operand, defined,
+                        "use of %r before (or without) its def in %r"
+                        % (operand, stmt))
+            if stmt.result is not None:
+                defined.add(stmt.result)
+
+        # Semantic: run and compare against the scalar computation.
+        instrs = compile_hir_to_vliw(transformed)
+        mem = list(range(self.BATCH)) + [0] * 300
+        machine = self._run_program(instrs, mem)
+        want_a, want_b = self._expected()
+        self.assertEqual(machine.mem[self.A:self.A + self.BATCH], want_a,
+                         "same-address store order was not preserved")
+        self.assertEqual(machine.mem[self.B:self.B + 8], want_b,
+                         "side-chain values corrupted (dangling scalar refs)")
+
+    def _run_program(self, instrs, mem):
+        machine = Machine(mem, instrs, DebugInfo(scratch_map={}),
+                          n_cores=N_CORES)
+        machine.enable_pause = False
+        machine.enable_debug = False
+        machine.run()
+        return machine
 
 
 class TestSLPTreeHashSmallBatch(unittest.TestCase):

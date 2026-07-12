@@ -750,7 +750,8 @@ class TestStreamStaggerEffect(unittest.TestCase):
             b.store(b.add(out, b.const(i)), t[i])
         return b.build()
 
-    def _run(self, stagger, bidirectional=False, **scheduler_options):
+    def _run(self, stagger, bidirectional=False, return_metrics=False,
+             **scheduler_options):
         default_path = os.path.join(os.path.dirname(__file__), "..",
                                     "pass_config.json")
         with open(default_path) as f:
@@ -764,9 +765,23 @@ class TestStreamStaggerEffect(unittest.TestCase):
                                          delete=False) as f:
             json.dump(config, f)
             config_path = f.name
+        scheduler_metrics = {}
+        original_run = InstSchedulingPass.run
+
+        def capture_metrics(scheduler, *args, **kwargs):
+            result = original_run(scheduler, *args, **kwargs)
+            scheduler_metrics.update(scheduler.get_metrics().custom)
+            return result
+
         try:
-            instrs = compile_hir_to_vliw(self._build(),
-                                         pass_config=config_path)
+            if return_metrics:
+                from unittest.mock import patch
+                with patch.object(InstSchedulingPass, "run", capture_metrics):
+                    instrs = compile_hir_to_vliw(
+                        self._build(), pass_config=config_path)
+            else:
+                instrs = compile_hir_to_vliw(
+                    self._build(), pass_config=config_path)
         finally:
             os.unlink(config_path)
         mem = [0] * 512
@@ -781,7 +796,10 @@ class TestStreamStaggerEffect(unittest.TestCase):
         machine.enable_pause = False
         machine.enable_debug = False
         machine.run()
-        return machine.cycle, list(machine.mem[300:300 + self.LANES])
+        result = (machine.cycle, list(machine.mem[300:300 + self.LANES]))
+        if return_metrics:
+            return (*result, scheduler_metrics)
+        return result
 
     def test_stagger_overlaps_eras_and_preserves_semantics(self):
         base_cycles, base_out = self._run(stagger=0)
@@ -793,8 +811,15 @@ class TestStreamStaggerEffect(unittest.TestCase):
                         "compute era with the load-bound gather era")
 
     def test_auto_stagger_finds_profitable_wavefront(self):
+        # min_gap_pct=0 keeps the search-skip gate out of this test: the
+        # gate compares the baseline against a per-engine floor that moves
+        # with unrelated tuning (e.g. const_via_flow_skip shifts CONST work
+        # between the load and flow engines), and this test is about the
+        # search finding the profitable strength, not about gate
+        # calibration (covered by the controls test below).
         base_cycles, base_out = self._run(stagger=0)
-        auto_cycles, auto_out = self._run(stagger="auto")
+        auto_cycles, auto_out = self._run(
+            stagger="auto", stream_stagger_auto_min_gap_pct=0)
         tuned_cycles, tuned_out = self._run(stagger=2, bidirectional=True)
 
         self.assertEqual(auto_out, base_out)
@@ -808,20 +833,31 @@ class TestStreamStaggerEffect(unittest.TestCase):
 
     def test_auto_stagger_search_controls_are_effective(self):
         base_cycles, base_out = self._run(stagger=0)
+        # min_gap_pct=0 so the candidate limit is what gets exercised (the
+        # skip gate would otherwise mask it when unrelated tuning moves the
+        # baseline within the gate's margin); the gate itself is covered by
+        # the disabled run below.
         limited_cycles, limited_out = self._run(
             stagger="auto",
             stream_stagger_auto_candidate_max=1,
+            stream_stagger_auto_min_gap_pct=0,
         )
-        disabled_cycles, disabled_out = self._run(
+        disabled_cycles, disabled_out, disabled_metrics = self._run(
             stagger="auto",
             stream_stagger_auto_min_gap_pct=1000,
             stream_stagger_auto_pressure_headroom=0,
+            return_metrics=True,
         )
 
         self.assertEqual(limited_out, base_out)
         self.assertEqual(disabled_out, base_out)
         self.assertGreater(limited_cycles, 135)
         self.assertEqual(disabled_cycles, base_cycles)
+        self.assertEqual(
+            disabled_metrics["auto_stagger_candidates"],
+            1,
+            "the resource-gap gate must skip all stagger candidates",
+        )
 
 
 if __name__ == "__main__":
