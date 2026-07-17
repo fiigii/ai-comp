@@ -18,12 +18,19 @@ from ..use_def import UseDefContext
 class CSEContext:
     """Context for CSE value numbering."""
 
-    # Maps value_number (tuple) -> first SSA computing it (SSAValue or VectorSSAValue)
-    expr_to_ssa: dict[tuple, Variable] = field(default_factory=dict)
+    # Maps value_number (int) -> first SSA computing it (SSAValue or VectorSSAValue)
+    expr_to_ssa: dict[int, Variable] = field(default_factory=dict)
 
-    # Maps SSA value -> its value number (tuple)
+    # Maps SSA value -> its value number (int)
     # Uses SSAValue/VectorSSAValue objects directly as keys
-    ssa_to_value_number: dict[Variable, tuple] = field(default_factory=dict)
+    ssa_to_value_number: dict[Variable, int] = field(default_factory=dict)
+
+    # Hash-cons table: structural key (opcode, operand-id-tuple, [epoch]) -> int id.
+    # Int value numbers keep dict keys O(1) to hash (nested tuples were O(depth)).
+    _struct_to_id: dict = field(default_factory=dict)
+
+    # Shared id counter so sibling scopes get distinct ids (no cross-scope aliasing)
+    _id_counter: list = field(default_factory=lambda: [1])
 
     # Memory epoch counter (increments on store operations)
     # Enables finer-grained load CSE: loads with same address and epoch can be merged
@@ -32,7 +39,20 @@ class CSEContext:
     # Parent context for nested scopes
     parent: Optional['CSEContext'] = None
 
-    def lookup(self, value_number: tuple) -> Optional[Variable]:
+    def intern(self, struct_key: tuple) -> int:
+        """Return the int value-number id for struct_key, allocating one if new."""
+        ctx = self
+        while ctx is not None:
+            existing = ctx._struct_to_id.get(struct_key)
+            if existing is not None:
+                return existing
+            ctx = ctx.parent
+        nxt = self._id_counter[0]
+        self._id_counter[0] = nxt + 1
+        self._struct_to_id[struct_key] = nxt
+        return nxt
+
+    def lookup(self, value_number: int) -> Optional[Variable]:
         """Look up a value number in this context or parent contexts."""
         if value_number in self.expr_to_ssa:
             return self.expr_to_ssa[value_number]
@@ -40,7 +60,7 @@ class CSEContext:
             return self.parent.lookup(value_number)
         return None
 
-    def get_value_number(self, ssa: Variable) -> Optional[tuple]:
+    def get_value_number(self, ssa: Variable) -> Optional[int]:
         """Get the value number for an SSA value from this context or parents."""
         if ssa in self.ssa_to_value_number:
             return self.ssa_to_value_number[ssa]
@@ -58,14 +78,14 @@ class CSEContext:
         """Increment memory epoch (called on store)."""
         self.mem_epoch += 1
 
-    def record(self, value_number: tuple, ssa: Variable):
+    def record(self, value_number: int, ssa: Variable):
         """Record a new expression -> SSA mapping."""
         self.expr_to_ssa[value_number] = ssa
         self.ssa_to_value_number[ssa] = value_number
 
     def child_context(self) -> 'CSEContext':
         """Create a child context for nested scopes."""
-        return CSEContext(parent=self)
+        return CSEContext(parent=self, _id_counter=self._id_counter)
 
 
 # Operations that are safe for CSE
@@ -209,7 +229,7 @@ class CSEPass(Pass):
             # Still keep the op and record its value number if possible
             if op.result is not None:
                 # Create a fresh value number based on the result SSA
-                fresh_vn = ("ssa", id(op.result))
+                fresh_vn = ctx.intern(("ssa", id(op.result)))
                 ctx.record(fresh_vn, op.result)
             return op
 
@@ -252,7 +272,7 @@ class CSEPass(Pass):
 
         # Give body_params fresh value numbers (they're unique per iteration)
         for param in loop.body_params:
-            fresh_vn = ("loop_param", id(param))
+            fresh_vn = child_ctx.intern(("loop_param", id(param)))
             child_ctx.record(fresh_vn, param)
 
         # Transform loop body
@@ -300,7 +320,7 @@ class CSEPass(Pass):
             results=if_stmt.results
         )
 
-    def _make_value_number_key(self, op: Op, ctx: CSEContext) -> Optional[tuple]:
+    def _make_value_number_key(self, op: Op, ctx: CSEContext) -> Optional[int]:
         """
         Compute the value number key for an operation.
 
@@ -323,18 +343,21 @@ class CSEPass(Pass):
         # Include memory epoch for load operations
         # This enables loads with same address but different epochs to have different value numbers
         if op.opcode in LOAD_OPS:
-            return (op.opcode, tuple(operand_vns), ctx.get_mem_epoch())
-
-        return (op.opcode, tuple(operand_vns))
+            struct_key = (op.opcode, tuple(operand_vns), ctx.get_mem_epoch())
+        else:
+            struct_key = (op.opcode, tuple(operand_vns))
+        # Intern the structural key to a small int id so dict hashing stays O(1)
+        # (nested-tuple vns grow O(depth) on long chains, making hashing O(N)).
+        return ctx.intern(struct_key)
 
     def _get_operand_value_number(
         self,
         operand: Value,
         ctx: CSEContext
-    ) -> Optional[tuple]:
+    ) -> Optional[int]:
         """Get the value number for an operand."""
         if isinstance(operand, Const):
-            return ("const", operand.value)
+            return ctx.intern(("const", operand.value))
 
         if isinstance(operand, (SSAValue, VectorSSAValue)):
             # Look up in context using SSA object directly
@@ -342,6 +365,6 @@ class CSEPass(Pass):
             if vn is not None:
                 return vn
             # Unknown SSA - use Python object id as value number
-            return ("ssa", id(operand))
+            return ctx.intern(("ssa", id(operand)))
 
         return None
